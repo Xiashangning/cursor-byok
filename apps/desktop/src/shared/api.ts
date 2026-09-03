@@ -462,12 +462,13 @@ export const api = {
   deleteModel: (hash: string) => request<void>(`/models/${hash}`, { method: "DELETE" }),
   testModel: (hash: string, testId: string, signal?: AbortSignal) => request<ModelConnectivityResult>(`/models/${encodeURIComponent(hash)}/test/${encodeURIComponent(testId)}`, { method: "POST", signal }),
   cancelModelTest: (hash: string, testId: string) => request<void>(`/models/${encodeURIComponent(hash)}/test/${encodeURIComponent(testId)}`, { method: "DELETE" }),
-  overview: (filter?: { startMs: number; endMs: number; modelHashes?: string[] }) => {
+  overview: (filter?: { startMs: number; endMs: number; modelHashes?: string[]; bucketMs?: number }) => {
     const params = new URLSearchParams();
     if (filter) {
       params.set("start_ms", String(filter.startMs));
       params.set("end_ms", String(filter.endMs));
       if (filter.modelHashes?.length) params.set("model_hashes", JSON.stringify(filter.modelHashes));
+      if (filter.bucketMs) params.set("bucket_ms", String(filter.bucketMs));
     }
     const query = params.toString();
     return request<Overview>(`/overview${query ? `?${query}` : ""}`);
