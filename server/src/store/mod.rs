@@ -1,4 +1,5 @@
 //! Exposes the local persistence interface.
+mod background_completions;
 mod cas;
 mod checkpoints;
 mod conversations;

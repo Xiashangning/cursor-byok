@@ -57,9 +57,8 @@ pub(super) async fn start(
 
     match normalized(&call.name).as_str() {
         "shell" | "bash" | "read" | "delete" | "grep" | "glob" | "readlints" | "task"
-        | "callmcptool" | "fetchmcpresource" | "getmcptools" => {
-            exec::start(runtime, call, context).await
-        }
+        | "createagent" | "sendmessagetoagent" | "await" | "callmcptool" | "fetchmcpresource"
+        | "getmcptools" => exec::start(runtime, call, context).await,
         "write" | "strreplace" | "editnotebook" => edit::start(runtime, call, context).await,
         "askquestion" | "websearch" | "webfetch" | "switchmode" | "createplan"
         | "generateimage" => interaction::start(runtime, call).await,
@@ -153,4 +152,91 @@ pub(super) fn normalized(name: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "call-1".into(),
+            model_call_id: "model-call-1".into(),
+            name: name.into(),
+            arguments_text: arguments.to_string(),
+            arguments,
+            argument_error: None,
+        }
+    }
+
+    #[test]
+    fn shell_accepts_integer_valued_float_timeout() {
+        let call = tool(
+            "Shell",
+            serde_json::json!({"command": "echo ok", "block_until_ms": 45_000.0}),
+        );
+
+        let call = normalize_block_until_ms(&call).unwrap().unwrap();
+
+        assert_eq!(call.arguments["block_until_ms"].as_i64(), Some(45_000));
+    }
+
+    #[test]
+    fn bash_accepts_integer_valued_float_timeout() {
+        let call = tool(
+            "Bash",
+            serde_json::json!({"command": "echo ok", "block_until_ms": 45_000.0}),
+        );
+
+        let call = normalize_block_until_ms(&call).unwrap().unwrap();
+
+        assert_eq!(call.arguments["block_until_ms"].as_i64(), Some(45_000));
+    }
+
+    #[test]
+    fn shell_rejects_fractional_timeout() {
+        let call = tool(
+            "Shell",
+            serde_json::json!({"command": "echo ok", "block_until_ms": 30_000.5}),
+        );
+
+        let error = normalize_block_until_ms(&call).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "protocol error: Shell block_until_ms must be an integer"
+        );
+    }
+
+    #[test]
+    fn shell_rejects_negative_timeout_instead_of_defaulting() {
+        let call = tool(
+            "Shell",
+            serde_json::json!({"command": "echo ok", "block_until_ms": -1}),
+        );
+
+        let error = normalize_block_until_ms(&call).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "protocol error: Shell block_until_ms is out of range"
+        );
+    }
+
+    #[test]
+    fn arbitrary_unknown_tool_does_not_become_a_protocol_error() {
+        let call = tool(
+            "AwaitShell",
+            serde_json::json!({"shell_id": "legacy-shell", "block_until_ms": 30_000}),
+        );
+        let started = unavailable_tool(&call);
+        let completion = started.completion.expect("compatibility completion");
+
+        assert!(started.messages.is_empty());
+        assert!(completion.result().is_error);
+        assert!(completion
+            .result()
+            .content
+            .contains("current advertised tool set"));
+    }
 }

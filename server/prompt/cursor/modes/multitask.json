@@ -3,6 +3,7 @@
     "AskQuestion", "CallMcpTool", "Delete", "FetchMcpResource", "Glob", "Grep",
     "Read", "ReadLints", "Shell", "StrReplace", "SwitchMode", "Task",
     "TodoWrite", "WebFetch", "WebSearch", "Write", "GenerateImage",
-    "SembleSearch", "SembleFindRelated"
+    "create-agent", "send-message-to-agent", "AWAIT", "SembleSearch",
+    "SembleFindRelated"
   ]
 }

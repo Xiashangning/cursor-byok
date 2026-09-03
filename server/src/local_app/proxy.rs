@@ -193,6 +193,42 @@ fn should_route_locally(path: &str, tab_mode: TabMode) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn proxy_listener_falls_back_when_configured_port_is_busy() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let requested_port = occupied.local_addr().unwrap().port();
+        let listener = bind_proxy_listener(requested_port).await.unwrap();
+        assert_ne!(listener.local_addr().unwrap().port(), requested_port);
+    }
+
+    #[test]
+    fn limits_interception_to_cursor_hosts_and_local_paths() {
+        assert!(is_cursor_host("api2.cursor.sh"));
+        assert!(is_cursor_host("repo42.cursor.sh"));
+        assert!(!is_cursor_host("example.com"));
+        assert!(is_local_path("/agent.v1.AgentService/RunSSE"));
+        assert!(is_local_path(
+            "/aiserver.v1.AnalyticsService/BootstrapStatsig"
+        ));
+        assert!(is_local_path("/aiserver.v1.AiService/KnowledgeBaseAdd"));
+        assert!(is_local_path("/aiserver.v1.AiService/KnowledgeBaseList"));
+        assert!(is_local_path("/aiserver.v1.AiService/KnowledgeBaseUpdate"));
+        assert!(is_local_path("/aiserver.v1.AiService/KnowledgeBaseRemove"));
+        assert!(!is_local_path("/unrelated"));
+        assert!(should_route_locally(
+            "/aiserver.v1.AiService/StreamCpp",
+            TabMode::Public
+        ));
+        assert!(should_route_locally(
+            "/aiserver.v1.AiService/StreamCpp",
+            TabMode::Custom
+        ));
+        assert!(!should_route_locally(
+            "/aiserver.v1.AiService/StreamCpp",
+            TabMode::Direct
+        ));
+    }
+
     #[test]
     fn cursor_cli_transport_and_model_metadata_routes_stay_local() {
         for path in [

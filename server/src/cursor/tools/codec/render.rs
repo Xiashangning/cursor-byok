@@ -223,7 +223,9 @@ pub fn tool_placeholder(name: &str, call_id: &str) -> Result<pb::ToolCall> {
         }
         "createplan" => Tool::CreatePlanToolCall(pb::CreatePlanToolCall::default()),
         "websearch" => Tool::WebSearchToolCall(pb::WebSearchToolCall::default()),
-        "task" => Tool::TaskToolCall(pb::TaskToolCall::default()),
+        "task" | "createagent" | "sendmessagetoagent" => {
+            Tool::TaskToolCall(pb::TaskToolCall::default())
+        }
         "fetchmcpresource" => Tool::ReadMcpResourceToolCall(pb::ReadMcpResourceToolCall::default()),
         "askquestion" => Tool::AskQuestionToolCall(pb::AskQuestionToolCall::default()),
         "webfetch" => Tool::WebFetchToolCall(pb::WebFetchToolCall::default()),
@@ -232,6 +234,7 @@ pub fn tool_placeholder(name: &str, call_id: &str) -> Result<pb::ToolCall> {
         "updatecurrentstep" => {
             Tool::CommunicateUpdateToolCall(pb::CommunicateUpdateToolCall::default())
         }
+        "await" => Tool::AwaitToolCall(pb::AwaitToolCall::default()),
         "getmcptools" => Tool::GetMcpToolsToolCall(pb::GetMcpToolsToolCall::default()),
         _ => return Err(Error::Protocol(format!("unsupported tool: {name}"))),
     };
@@ -423,12 +426,22 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
             })
         }
         Some(pb::tool_call::Tool::TaskToolCall(tool)) => {
+            let description = optional("description")
+                .or_else(|| optional("title"))
+                .unwrap_or_default();
+            let resume = optional("resume")
+                .or_else(|| optional("agent_id"))
+                .or_else(|| optional("agentId"));
             tool.args = Some(pb::TaskArgs {
-                description: string("description"),
+                description,
                 prompt: string("prompt"),
-                subagent_type: Some(subagent_type(&string("subagent_type"))),
+                subagent_type: Some(subagent_type(
+                    &optional("subagent_type")
+                        .or_else(|| optional("subagentType"))
+                        .unwrap_or_default(),
+                )),
                 model: optional("model"),
-                resume: optional("resume"),
+                resume,
                 agent_id: None,
                 attachments: call
                     .arguments
@@ -498,6 +511,21 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
                     .and_then(Value::as_u64)
                     .unwrap_or_default() as u32,
                 chars: string("chars"),
+            })
+        }
+        Some(pb::tool_call::Tool::AwaitToolCall(tool)) => {
+            tool.args = Some(pb::AwaitArgs {
+                task_id: optional("shell_id")
+                    .or_else(|| optional("task_id"))
+                    .or_else(|| optional("agent_id"))
+                    .unwrap_or_default(),
+                block_until_ms: call
+                    .arguments
+                    .get("block_until_ms")
+                    .or_else(|| call.arguments.get("timeout_ms"))
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+                regex: optional("pattern"),
             })
         }
         Some(pb::tool_call::Tool::GetMcpToolsToolCall(tool)) => {

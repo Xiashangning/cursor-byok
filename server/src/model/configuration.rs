@@ -100,6 +100,10 @@ pub struct ModelConfigInput {
     pub model_id: String,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default = "default_effort_options")]
+    pub effort_options: Vec<String>,
+    #[serde(default = "default_context_options")]
+    pub context_options: Vec<String>,
     #[serde(default)]
     pub openai_endpoint: String,
     #[serde(default)]
@@ -136,6 +140,8 @@ pub struct ModelConfig {
     pub tooltip_data: String,
     pub model_id: String,
     pub reasoning_effort: Option<String>,
+    pub effort_options: Vec<String>,
+    pub context_options: Vec<String>,
     pub openai_endpoint: String,
     pub openai_extra_params_enabled: bool,
     pub openai_extra_params: serde_json::Value,
@@ -250,6 +256,8 @@ pub fn normalize_model_input(input: &ModelConfigInput) -> Result<ModelConfigInpu
         reasoning_effort: (input.model_type == ModelType::OpenAi)
             .then_some(reasoning_effort)
             .flatten(),
+        effort_options: input.effort_options.clone(),
+        context_options: input.context_options.clone(),
         openai_endpoint,
         openai_extra_params_enabled: input.model_type == ModelType::OpenAi
             && input.openai_extra_params_enabled,
@@ -430,6 +438,23 @@ fn empty_object() -> serde_json::Value {
     serde_json::json!({})
 }
 
+pub const DEFAULT_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub const DEFAULT_CONTEXT_OPTIONS: &[&str] = &["200k", "356k", "800k", "1m"];
+
+fn default_effort_options() -> Vec<String> {
+    DEFAULT_EFFORT_OPTIONS
+        .iter()
+        .map(|value| (*value).into())
+        .collect()
+}
+
+fn default_context_options() -> Vec<String> {
+    DEFAULT_CONTEXT_OPTIONS
+        .iter()
+        .map(|value| (*value).into())
+        .collect()
+}
+
 fn empty_object_ref() -> &'static serde_json::Value {
     static EMPTY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
     EMPTY.get_or_init(empty_object)
@@ -475,5 +500,181 @@ impl ModelSpec {
             supports_image_generation: false,
             extra_params: serde_json::json!({}),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input() -> ModelConfigInput {
+        ModelConfigInput {
+            sort_order: 1,
+            display_name: "Model A".into(),
+            group_name: None,
+            model_type: ModelType::OpenAi,
+            base_url: "https://example.com/custom/generate".into(),
+            use_full_url: true,
+            api_key: "secret".into(),
+            tooltip_data: "Model A".into(),
+            model_id: "model-a".into(),
+            reasoning_effort: Some("high".into()),
+            effort_options: default_effort_options(),
+            context_options: default_context_options(),
+            openai_endpoint: OPENAI_RESPONSES_ENDPOINT.into(),
+            openai_extra_params_enabled: false,
+            openai_extra_params: empty_object(),
+            custom_headers_enabled: false,
+            custom_headers: empty_object(),
+            anthropic_extra_params_enabled: false,
+            anthropic_extra_params: empty_object(),
+            context_window_tokens: Some(200_000),
+            max_completion_tokens: None,
+            anthropic_max_tokens: None,
+            anthropic_thinking_effort: None,
+            thinking_budget_tokens: None,
+        }
+    }
+
+    #[test]
+    fn hash_matches_the_v0049_channel_identity() {
+        let input = input();
+        let expected = Sha256::digest(
+            "https://example.com/custom/generate\nmodel-a\nsecret\nModel A\n/v1/responses"
+                .as_bytes(),
+        );
+        assert_eq!(model_hash(&input).unwrap(), hex::encode(&expected[..8]));
+    }
+
+    #[test]
+    fn request_url_is_exact_and_protocol_does_not_depend_on_its_path() {
+        assert_eq!(
+            resolve_request_url(
+                ModelType::OpenAi,
+                "https://example.com/custom/generate?api-version=2026-01-01",
+                OPENAI_RESPONSES_ENDPOINT,
+                true,
+            )
+            .unwrap(),
+            "https://example.com/custom/generate?api-version=2026-01-01"
+        );
+        assert_eq!(
+            resolve_request_url(
+                ModelType::OpenAi,
+                "https://example.com/another/arbitrary/path",
+                OPENAI_CHAT_ENDPOINT,
+                true,
+            )
+            .unwrap(),
+            "https://example.com/another/arbitrary/path"
+        );
+        assert_eq!(
+            resolve_request_url(ModelType::Anthropic, "https://example.com/claude", "", true)
+                .unwrap(),
+            "https://example.com/claude"
+        );
+        assert_eq!(
+            resolve_request_url(
+                ModelType::Anthropic,
+                "https://example.com/claude/",
+                "",
+                true
+            )
+            .unwrap(),
+            "https://example.com/claude/"
+        );
+        assert_eq!(
+            resolve_request_url(
+                ModelType::OpenAi,
+                "https://example.com/v1",
+                OPENAI_RESPONSES_ENDPOINT,
+                false,
+            )
+            .unwrap(),
+            "https://example.com/v1/responses"
+        );
+        assert_eq!(
+            resolve_request_url(ModelType::Anthropic, "https://example.com/v1", "", false).unwrap(),
+            "https://example.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn configured_context_window_does_not_override_the_client_request() {
+        let input = input();
+        let config = ModelConfig {
+            model_hash: "hash".into(),
+            sort_order: input.sort_order,
+            display_name: input.display_name,
+            group_name: None,
+            model_type: input.model_type,
+            base_url: input.base_url,
+            use_full_url: input.use_full_url,
+            api_key: input.api_key,
+            tooltip_data: input.tooltip_data,
+            model_id: input.model_id,
+            reasoning_effort: input.reasoning_effort,
+            effort_options: input.effort_options.clone(),
+            context_options: input.context_options.clone(),
+            openai_endpoint: input.openai_endpoint,
+            openai_extra_params_enabled: input.openai_extra_params_enabled,
+            openai_extra_params: input.openai_extra_params,
+            custom_headers_enabled: input.custom_headers_enabled,
+            custom_headers: input.custom_headers,
+            anthropic_extra_params_enabled: input.anthropic_extra_params_enabled,
+            anthropic_extra_params: input.anthropic_extra_params,
+            context_window_tokens: Some(350_000),
+            max_completion_tokens: input.max_completion_tokens,
+            anthropic_max_tokens: input.anthropic_max_tokens,
+            anthropic_thinking_effort: input.anthropic_thinking_effort,
+            thinking_budget_tokens: input.thinking_budget_tokens,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let mut requested = super::super::ModelSpec::new("model-a");
+        requested.context_window_tokens = Some(200_000);
+
+        config.configure(&mut requested);
+
+        assert_eq!(requested.context_window_tokens, Some(200_000));
+    }
+
+    #[test]
+    fn configured_context_window_fills_missing_client_value() {
+        let input = input();
+        let config = ModelConfig {
+            model_hash: "hash".into(),
+            sort_order: input.sort_order,
+            display_name: input.display_name,
+            group_name: None,
+            model_type: input.model_type,
+            base_url: input.base_url,
+            use_full_url: input.use_full_url,
+            api_key: input.api_key,
+            tooltip_data: input.tooltip_data,
+            model_id: input.model_id,
+            reasoning_effort: input.reasoning_effort,
+            effort_options: input.effort_options.clone(),
+            context_options: input.context_options.clone(),
+            openai_endpoint: input.openai_endpoint,
+            openai_extra_params_enabled: input.openai_extra_params_enabled,
+            openai_extra_params: input.openai_extra_params,
+            custom_headers_enabled: input.custom_headers_enabled,
+            custom_headers: input.custom_headers,
+            anthropic_extra_params_enabled: input.anthropic_extra_params_enabled,
+            anthropic_extra_params: input.anthropic_extra_params,
+            context_window_tokens: Some(350_000),
+            max_completion_tokens: input.max_completion_tokens,
+            anthropic_max_tokens: input.anthropic_max_tokens,
+            anthropic_thinking_effort: input.anthropic_thinking_effort,
+            thinking_budget_tokens: input.thinking_budget_tokens,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let mut requested = super::super::ModelSpec::new("model-a");
+
+        config.configure(&mut requested);
+
+        assert_eq!(requested.context_window_tokens, Some(350_000));
     }
 }

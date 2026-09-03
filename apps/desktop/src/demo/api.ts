@@ -193,6 +193,8 @@ function createModel({ hash, order, name, type, url, modelId, endpoint = "/v1/re
     tooltip_data: `${name} Mock 通道`,
     model_id: modelId,
     reasoning_effort: type === "openai" ? "high" : null,
+    effort_options: ["low", "medium", "high"],
+    context_options: ["200k"],
     openai_endpoint: type === "openai" ? endpoint : "",
     openai_extra_params_enabled: false,
     openai_extra_params: {},

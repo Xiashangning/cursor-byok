@@ -1093,6 +1093,8 @@ async fn injected_user_context_interrupts_automatic_compaction() {
             tooltip_data: "Test Model".into(),
             model_id: "test-model".into(),
             reasoning_effort: None,
+            effort_options: Vec::new(),
+            context_options: Vec::new(),
             openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
             openai_extra_params_enabled: false,
             openai_extra_params: serde_json::json!({}),

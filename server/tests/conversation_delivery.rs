@@ -261,6 +261,65 @@ async fn retrying_one_background_completion_reuses_its_runtime_message() {
 }
 
 #[tokio::test]
+async fn completion_already_consumed_by_await_does_not_start_another_parent_turn() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = TransportRegistry::new(
+        store.clone(),
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+    let handle = registry.get_or_create("consumed-completion").await.unwrap();
+    let state = pb::ConversationStateStructure {
+        subagent_runs_by_parent_tool_call_id: HashMap::from([(
+            "task-call".into(),
+            pb::SubagentRunState {
+                parent_tool_call_id: "task-call".into(),
+                subagent_id: Some("consumed-child".into()),
+                status: pb::SubagentRunStatus::Success as i32,
+                completion_reason: Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+
+    drive_ignored_completion(
+        &handle,
+        completion_run("consumed-child", "consumed-parent-run", state),
+    )
+    .await;
+    let retry = registry
+        .get_or_create("consumed-completion-retry")
+        .await
+        .unwrap();
+    drive_ignored_completion(
+        &retry,
+        completion_run(
+            "consumed-child",
+            "consumed-parent-run-retry",
+            pb::ConversationStateStructure::default(),
+        ),
+    )
+    .await;
+
+    assert!(provider.requests().is_empty());
+    let run_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM runs WHERE conversation_id = 'parent-conversation'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(run_count, 0);
+}
+
+#[tokio::test]
 async fn background_shell_completion_wakes_the_parent_with_the_captured_notification() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();
@@ -343,6 +402,29 @@ async fn background_shell_completion_wakes_the_parent_with_the_captured_notifica
         Some("Start Python HTTP server on 9000")
     );
     assert_eq!(metadata.task_id.as_deref(), Some("977679"));
+}
+
+async fn drive_ignored_completion(handle: &TransportHandle, message: pb::AgentClientMessage) {
+    let mut output = handle.subscribe();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(message),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        if flags & connect::END_STREAM_FLAG != 0 {
+            assert_eq!(payload.as_ref(), b"{}");
+            return;
+        }
+    }
 }
 
 async fn drive_completion(

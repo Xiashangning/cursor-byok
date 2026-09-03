@@ -29,6 +29,7 @@ pub(super) struct Projection {
 pub(super) fn project(
     action: &pb::BackgroundTaskCompletionAction,
     mode: i32,
+    state: Option<&pb::ConversationStateStructure>,
 ) -> Result<Projection> {
     if action.completions.is_empty() {
         return Err(Error::Protocol(
@@ -59,6 +60,9 @@ pub(super) fn project(
         if reason != pb::BackgroundTaskCompletionReason::TaskFinished {
             // Progress and reparenting notifications are informational; the
             // client batches them together with the real finish notification.
+            continue;
+        }
+        if completion_consumed(completion, state) {
             continue;
         }
         if completion.task_id.is_empty() || completion.title.is_empty() {
@@ -141,6 +145,64 @@ pub(super) fn project(
     })
 }
 
+pub(super) fn fully_consumed(
+    action: &pb::BackgroundTaskCompletionAction,
+    state: Option<&pb::ConversationStateStructure>,
+) -> bool {
+    let finished = action.completions.iter().filter(|completion| {
+        completion.reason == pb::BackgroundTaskCompletionReason::TaskFinished as i32
+    });
+    let mut count = 0;
+    for completion in finished {
+        count += 1;
+        if !completion_consumed(completion, state) {
+            return false;
+        }
+    }
+    count > 0
+}
+
+fn completion_consumed(
+    completion: &pb::BackgroundTaskCompletion,
+    state: Option<&pb::ConversationStateStructure>,
+) -> bool {
+    if completion.kind != pb::BackgroundTaskKind::Subagent as i32 {
+        return false;
+    }
+    let (Some(agent_id), Some(tool_call_id), Some(state)) = (
+        completion
+            .subagent_id
+            .as_deref()
+            .filter(|id| !id.is_empty()),
+        completion
+            .tool_call_id
+            .as_deref()
+            .filter(|id| !id.is_empty()),
+        state,
+    ) else {
+        return false;
+    };
+    let Some(run) = state.subagent_runs_by_parent_tool_call_id.get(tool_call_id) else {
+        return false;
+    };
+    if run.subagent_id.as_deref() != Some(agent_id)
+        || run.completion_reason != Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32)
+    {
+        return false;
+    }
+    matches!(
+        pb::SubagentRunStatus::try_from(run.status),
+        Ok(pb::SubagentRunStatus::Success
+            | pb::SubagentRunStatus::Error
+            | pb::SubagentRunStatus::Aborted)
+    ) && matches!(
+        pb::BackgroundTaskStatus::try_from(completion.status),
+        Ok(pb::BackgroundTaskStatus::Success
+            | pb::BackgroundTaskStatus::Error
+            | pb::BackgroundTaskStatus::Aborted)
+    )
+}
+
 fn status(completion: &pb::BackgroundTaskCompletion) -> Result<pb::BackgroundTaskStatus> {
     let status = pb::BackgroundTaskStatus::try_from(completion.status).map_err(|_| {
         Error::Protocol(format!(
@@ -206,5 +268,81 @@ fn status_name(status: pb::BackgroundTaskStatus) -> &'static str {
         pb::BackgroundTaskStatus::Error => "error",
         pb::BackgroundTaskStatus::Aborted => "aborted",
         pb::BackgroundTaskStatus::Unspecified => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn completion(agent_id: &str, tool_call_id: &str) -> pb::BackgroundTaskCompletion {
+        pb::BackgroundTaskCompletion {
+            task_id: agent_id.into(),
+            kind: pb::BackgroundTaskKind::Subagent as i32,
+            status: pb::BackgroundTaskStatus::Success as i32,
+            title: format!("Agent {agent_id}"),
+            reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
+            subagent_id: Some(agent_id.into()),
+            tool_call_id: Some(tool_call_id.into()),
+            ..Default::default()
+        }
+    }
+
+    fn state(agent_id: &str, tool_call_id: &str) -> pb::ConversationStateStructure {
+        pb::ConversationStateStructure {
+            subagent_runs_by_parent_tool_call_id: HashMap::from([(
+                tool_call_id.into(),
+                pb::SubagentRunState {
+                    parent_tool_call_id: tool_call_id.into(),
+                    subagent_id: Some(agent_id.into()),
+                    status: pb::SubagentRunStatus::Success as i32,
+                    completion_reason: Some(
+                        pb::BackgroundTaskCompletionReason::TaskFinished as i32,
+                    ),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn terminal_result_consumed_by_await_suppresses_the_follow_up_action() {
+        let action = pb::BackgroundTaskCompletionAction {
+            completions: vec![completion("agent-1", "task-call-1")],
+        };
+        let state = state("agent-1", "task-call-1");
+
+        assert!(fully_consumed(&action, Some(&state)));
+    }
+
+    #[test]
+    fn mixed_batch_keeps_only_unconsumed_completions() {
+        let action = pb::BackgroundTaskCompletionAction {
+            completions: vec![
+                completion("agent-1", "task-call-1"),
+                completion("agent-2", "task-call-2"),
+            ],
+        };
+        let state = state("agent-1", "task-call-1");
+
+        assert!(!fully_consumed(&action, Some(&state)));
+        let projection = project(&action, pb::AgentMode::Agent as i32, Some(&state)).unwrap();
+        assert!(!projection.context.contains("agent-1"));
+        assert!(projection.context.contains("agent-2"));
+        assert!(!projection.turn_user.message_id.contains("agent-1"));
+        assert!(projection.turn_user.message_id.contains("agent-2"));
+    }
+
+    #[test]
+    fn consumed_terminal_result_suppresses_a_later_terminal_status() {
+        let mut action = pb::BackgroundTaskCompletionAction {
+            completions: vec![completion("agent-1", "task-call-1")],
+        };
+        action.completions[0].status = pb::BackgroundTaskStatus::Error as i32;
+        let state = state("agent-1", "task-call-1");
+
+        assert!(fully_consumed(&action, Some(&state)));
     }
 }

@@ -10,7 +10,7 @@ use crate::{
         services::blob_sync::BlobSynchronizer,
         transport::TransportHandle,
     },
-    model::{CanonicalMessage, ToolCall, ToolDefinition, ToolRoundAssistant},
+    model::{CanonicalMessage, ConversationId, ToolCall, ToolDefinition, ToolRoundAssistant},
     store::Store,
     Result,
 };
@@ -20,6 +20,7 @@ use super::{derived, roots::RootFrontier, turns::TurnFrontier};
 #[derive(Clone)]
 pub struct CheckpointBuilder {
     pub(super) store: Store,
+    pub(super) conversation_id: ConversationId,
     pub(super) sync: BlobSynchronizer,
     pub(super) parent_tool_call_id: Option<String>,
     pub(super) base: pb::ConversationStateStructure,
@@ -38,12 +39,14 @@ pub struct CheckpointBuilder {
 impl CheckpointBuilder {
     pub fn new(
         store: Store,
+        conversation_id: ConversationId,
         sync: BlobSynchronizer,
         parent_tool_call_id: Option<String>,
         base: Option<pb::ConversationStateStructure>,
     ) -> Self {
         Self {
             store,
+            conversation_id,
             sync,
             parent_tool_call_id,
             base: base.unwrap_or_default(),
@@ -119,6 +122,7 @@ impl CheckpointBuilder {
         started_at_ms: u64,
         presentation: &PendingSteps,
     ) -> Result<pb::ConversationStateStructure> {
+        reset_resumed_subagent_runs(&mut self.base, calls);
         let pending = messages::staged_tool_round(
             assistant,
             calls,
@@ -158,6 +162,16 @@ impl CheckpointBuilder {
         presentation: &PendingSteps,
     ) -> Result<pb::ConversationStateStructure> {
         self.record_background_subagents(presentation);
+        let consumed = self.record_consumed_subagent_completions(presentation);
+        for (subagent_id, parent_tool_call_id) in consumed {
+            self.store
+                .record_consumed_subagent_completion(
+                    &self.conversation_id,
+                    &subagent_id,
+                    &parent_tool_call_id,
+                )
+                .await?;
+        }
         let root_ids = self.project_roots(messages).await?;
         let turn_ids = self.project_turns(mode, presentation).await?;
         let (todo_ids, plan_id) = self.build_derived_state(messages).await?;
@@ -260,6 +274,36 @@ impl CheckpointBuilder {
         }
     }
 
+    fn record_consumed_subagent_completions(
+        &mut self,
+        presentation: &PendingSteps,
+    ) -> Vec<(String, String)> {
+        let mut consumed = Vec::new();
+        for step in &presentation.steps {
+            let Some(pb::conversation_step::Message::ToolCall(call)) = step.message.as_ref() else {
+                continue;
+            };
+            let Some((agent_id, status)) = consumed_subagent_completion(call) else {
+                continue;
+            };
+            let Some(state) = self
+                .base
+                .subagent_runs_by_parent_tool_call_id
+                .values_mut()
+                .find(|state| state.subagent_id.as_deref() == Some(agent_id))
+            else {
+                continue;
+            };
+            state.status = status as i32;
+            state.completed_timestamp_ms = call
+                .completed_at_ms
+                .or_else(|| Some(crate::cursor::tools::runtime::now_ms()));
+            state.completion_reason = Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32);
+            consumed.push((agent_id.to_owned(), state.parent_tool_call_id.clone()));
+        }
+        consumed
+    }
+
     pub async fn publish(
         &self,
         handle: &TransportHandle,
@@ -294,6 +338,240 @@ impl CheckpointBuilder {
     }
 }
 
+fn reset_resumed_subagent_runs(state: &mut pb::ConversationStateStructure, calls: &[ToolCall]) {
+    for call in calls {
+        let normalized = call
+            .name
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        if !matches!(normalized.as_str(), "task" | "sendmessagetoagent") {
+            continue;
+        }
+        let Some(subagent_id) = call
+            .arguments
+            .get("resume")
+            .or_else(|| call.arguments.get("agent_id"))
+            .or_else(|| call.arguments.get("agentId"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty() && *id != "self")
+        else {
+            continue;
+        };
+        let Some(previous) = state
+            .subagent_runs_by_parent_tool_call_id
+            .values()
+            .find(|run| run.subagent_id.as_deref() == Some(subagent_id))
+            .cloned()
+        else {
+            continue;
+        };
+        state
+            .subagent_runs_by_parent_tool_call_id
+            .retain(|_, run| run.subagent_id.as_deref() != Some(subagent_id));
+        state.subagent_runs_by_parent_tool_call_id.insert(
+            call.call_id.clone(),
+            pb::SubagentRunState {
+                parent_tool_call_id: call.call_id.clone(),
+                subagent_id: Some(subagent_id.to_owned()),
+                environment: previous.environment,
+                status: pb::SubagentRunStatus::Running as i32,
+                title: call
+                    .arguments
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|title| !title.is_empty())
+                    .map(str::to_owned)
+                    .or(previous.title),
+                detail: None,
+                transcript_path: None,
+                output_path: None,
+                completed_timestamp_ms: None,
+                completion_reason: None,
+            },
+        );
+    }
+}
+
+fn consumed_subagent_completion(call: &pb::ToolCall) -> Option<(&str, pb::SubagentRunStatus)> {
+    match call.tool.as_ref()? {
+        pb::tool_call::Tool::AwaitToolCall(tool) => {
+            let agent_id = tool.args.as_ref()?.task_id.as_str();
+            let status = match tool.result.as_ref()?.result.as_ref()? {
+                pb::await_result::Result::Complete(_) => pb::SubagentRunStatus::Success,
+                pb::await_result::Result::Error(_) => pb::SubagentRunStatus::Error,
+                pb::await_result::Result::StillRunning(_) => return None,
+                pb::await_result::Result::Success(success) => {
+                    match success.await_result.as_ref()? {
+                        pb::await_success::AwaitResult::Complete(_) => {
+                            pb::SubagentRunStatus::Success
+                        }
+                        pb::await_success::AwaitResult::StillRunning(_) => return None,
+                    }
+                }
+            };
+            (!agent_id.is_empty()).then_some((agent_id, status))
+        }
+        pb::tool_call::Tool::TaskToolCall(tool) => {
+            let args = tool.args.as_ref()?;
+            let result = tool.result.as_ref()?.result.as_ref()?;
+            let (agent_id, status) = match result {
+                pb::task_result::Result::Success(success) if !success.is_background => (
+                    success.agent_id.as_deref().or(args.resume.as_deref())?,
+                    pb::SubagentRunStatus::Success,
+                ),
+                pb::task_result::Result::Error(_) => return None,
+                pb::task_result::Result::Success(_) => return None,
+            };
+            (!agent_id.is_empty()).then_some((agent_id, status))
+        }
+        _ => None,
+    }
+}
+
 fn context_limit(selected: Option<u64>, previous: Option<u64>) -> Option<u64> {
     selected.or(previous.filter(|tokens| *tokens != 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resumed_subagent_starts_a_new_running_lifecycle() {
+        let mut state = pb::ConversationStateStructure {
+            subagent_runs_by_parent_tool_call_id: std::collections::HashMap::from([(
+                "old-task-call".into(),
+                pb::SubagentRunState {
+                    parent_tool_call_id: "old-task-call".into(),
+                    subagent_id: Some("agent-1".into()),
+                    status: pb::SubagentRunStatus::Error as i32,
+                    title: Some("Old title".into()),
+                    detail: Some("stopped".into()),
+                    completed_timestamp_ms: Some(42),
+                    completion_reason: Some(
+                        pb::BackgroundTaskCompletionReason::TaskFinished as i32,
+                    ),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let calls = vec![ToolCall {
+            index: 0,
+            call_id: "resume-task-call".into(),
+            model_call_id: "model-call".into(),
+            name: "Task".into(),
+            arguments_text: "{}".into(),
+            arguments: serde_json::json!({
+                "resume": "agent-1",
+                "description": "Continue inspection",
+            }),
+            argument_error: None,
+        }];
+
+        reset_resumed_subagent_runs(&mut state, &calls);
+
+        assert!(!state
+            .subagent_runs_by_parent_tool_call_id
+            .contains_key("old-task-call"));
+        let resumed = &state.subagent_runs_by_parent_tool_call_id["resume-task-call"];
+        assert_eq!(resumed.subagent_id.as_deref(), Some("agent-1"));
+        assert_eq!(resumed.status, pb::SubagentRunStatus::Running as i32);
+        assert_eq!(resumed.title.as_deref(), Some("Continue inspection"));
+        assert_eq!(resumed.detail, None);
+        assert_eq!(resumed.completed_timestamp_ms, None);
+        assert_eq!(resumed.completion_reason, None);
+    }
+
+    #[test]
+    fn completed_await_consumes_the_subagent_terminal_result() {
+        let call = pb::ToolCall {
+            tool: Some(pb::tool_call::Tool::AwaitToolCall(pb::AwaitToolCall {
+                args: Some(pb::AwaitArgs {
+                    task_id: "agent-1".into(),
+                    ..Default::default()
+                }),
+                result: Some(pb::AwaitResult {
+                    result: Some(pb::await_result::Result::Complete(
+                        pb::AwaitTaskComplete::default(),
+                    )),
+                }),
+            })),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            consumed_subagent_completion(&call),
+            Some(("agent-1", pb::SubagentRunStatus::Success))
+        );
+    }
+
+    #[test]
+    fn still_running_await_does_not_consume_the_terminal_result() {
+        let call = pb::ToolCall {
+            tool: Some(pb::tool_call::Tool::AwaitToolCall(pb::AwaitToolCall {
+                args: Some(pb::AwaitArgs {
+                    task_id: "agent-1".into(),
+                    ..Default::default()
+                }),
+                result: Some(pb::AwaitResult {
+                    result: Some(pb::await_result::Result::StillRunning(
+                        pb::AwaitTaskStillRunning::default(),
+                    )),
+                }),
+            })),
+            ..Default::default()
+        };
+
+        assert_eq!(consumed_subagent_completion(&call), None);
+    }
+
+    #[test]
+    fn foreground_resume_consumes_the_existing_background_subagent_result() {
+        let call = pb::ToolCall {
+            tool: Some(pb::tool_call::Tool::TaskToolCall(pb::TaskToolCall {
+                args: Some(pb::TaskArgs {
+                    resume: Some("agent-1".into()),
+                    ..Default::default()
+                }),
+                result: Some(pb::TaskResult {
+                    result: Some(pb::task_result::Result::Success(pb::TaskSuccess {
+                        agent_id: Some("agent-1".into()),
+                        is_background: false,
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            consumed_subagent_completion(&call),
+            Some(("agent-1", pb::SubagentRunStatus::Success))
+        );
+    }
+
+    #[test]
+    fn failed_resume_call_does_not_consume_the_background_subagent_terminal_result() {
+        let call = pb::ToolCall {
+            tool: Some(pb::tool_call::Tool::TaskToolCall(pb::TaskToolCall {
+                args: Some(pb::TaskArgs {
+                    resume: Some("agent-1".into()),
+                    ..Default::default()
+                }),
+                result: Some(pb::TaskResult {
+                    result: Some(pb::task_result::Result::Error(pb::TaskError {
+                        error: "resume request failed".into(),
+                    })),
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        assert_eq!(consumed_subagent_completion(&call), None);
+    }
 }

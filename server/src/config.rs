@@ -16,6 +16,10 @@ const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 
 pub fn managed_data_dir() -> Result<PathBuf> {
     let home_dir = dirs::home_dir()
         .ok_or_else(|| Error::Config("cannot resolve user home directory".into()))?;
+    managed_data_dir_in(&home_dir)
+}
+
+fn managed_data_dir_in(home_dir: &std::path::Path) -> Result<PathBuf> {
     let data_dir = home_dir.join(DATA_DIR_NAME);
     fs::create_dir_all(&data_dir)?;
     #[cfg(unix)]

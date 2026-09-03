@@ -16,6 +16,7 @@ use cursor_server::{
     model::{ContentPart, ProjectedContent},
     provider::{FinishReason, ModelEvent},
 };
+use prost::Message;
 
 #[tokio::test]
 async fn local_markdown_rules_land_in_the_request_context_message() {
@@ -58,17 +59,29 @@ async fn local_markdown_rules_land_in_the_request_context_message() {
         .await
         .unwrap();
 
+    let mut append_seqno = 1;
     loop {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
             .await
             .expect("run finishes within timeout")
             .expect("output stays open until EndStream");
-        let ended = connect::decode_frames(&frame)
-            .unwrap()
-            .iter()
-            .any(|(flags, _)| flags & connect::END_STREAM_FLAG != 0);
-        if ended {
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        if flags & connect::END_STREAM_FLAG != 0 {
             break;
+        }
+        // The Run waits for the client to confirm every conversation Blob write,
+        // so the stream only advances once each KvServerMessage is acknowledged.
+        if let Some(pb::agent_server_message::Message::KvServerMessage(kv)) =
+            pb::AgentServerMessage::decode(payload).unwrap().message
+        {
+            handle
+                .command(TransportCommand::Append {
+                    seqno: append_seqno,
+                    message: Box::new(set_blob_result(kv.id)),
+                })
+                .await
+                .unwrap();
+            append_seqno += 1;
         }
     }
 
@@ -100,6 +113,19 @@ async fn local_markdown_rules_land_in_the_request_context_message() {
     );
 
     registry.shutdown().await;
+}
+
+fn set_blob_result(id: u32) -> pb::AgentClientMessage {
+    pb::AgentClientMessage {
+        message: Some(pb::agent_client_message::Message::KvClientMessage(
+            pb::KvClientMessage {
+                id,
+                message: Some(pb::kv_client_message::Message::SetBlobResult(
+                    pb::SetBlobResult { error: None },
+                )),
+            },
+        )),
+    }
 }
 
 fn user_run() -> pb::AgentClientMessage {

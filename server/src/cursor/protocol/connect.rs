@@ -1,4 +1,8 @@
 //! Encodes and decodes Connect protocol frames.
+use axum::{
+    body::Body,
+    http::{header, HeaderValue, Response},
+};
 use bytes::{BufMut, Bytes, BytesMut};
 use prost::Message;
 use serde::Serialize;
@@ -90,6 +94,20 @@ fn encode_end_stream_payload(payload: &[u8]) -> Bytes {
     output.put_u32(payload.len() as u32);
     output.extend_from_slice(payload);
     output.freeze()
+}
+
+/// Unary Connect response: a raw protobuf body with an application/proto content type.
+pub fn proto_response<M: Message>(message: &M) -> Response<Body> {
+    proto_bytes(message.encode_to_vec())
+}
+
+pub fn proto_bytes(body: Vec<u8>) -> Response<Body> {
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/proto"),
+    );
+    response
 }
 
 pub fn decode_unary<M: Message + Default>(body: &[u8]) -> Result<M> {

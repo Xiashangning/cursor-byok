@@ -39,8 +39,10 @@ impl StaticEmbedder {
         let dimensions = tensor.shape()[1];
         let embeddings = tensor
             .data()
-            .chunks_exact(2)
-            .map(|value| f16::from_le_bytes([value[0], value[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|value| f16::from_le_bytes(*value))
             .collect();
         let tokenizer =
             Tokenizer::from_file(tokenizer).map_err(|error| Error::Model(error.to_string()))?;

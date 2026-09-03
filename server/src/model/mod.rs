@@ -11,6 +11,7 @@ mod run;
 mod token_count;
 mod tool;
 mod tool_result_replay;
+mod truncation;
 
 pub use checkpoint::*;
 pub use configuration::*;
@@ -23,3 +24,4 @@ pub use run::*;
 pub(crate) use token_count::*;
 pub use tool::*;
 pub(crate) use tool_result_replay::limit_tool_result_text;
+pub(crate) use truncation::*;

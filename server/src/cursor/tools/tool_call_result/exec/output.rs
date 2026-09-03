@@ -408,17 +408,19 @@ fn read_mcp(value: &pb::ReadMcpResourceExecResult) -> Result<(String, bool)> {
 fn task(value: &pb::SubagentResult, call: &ToolCall) -> Result<(String, bool)> {
     use pb::subagent_result::Result as R;
     match value.result.as_ref().ok_or_else(|| missing("subagent"))? {
-        R::Success(value) if creates_subagent(call) => {
-            let name = call
+        R::Success(value) => {
+            if value.agent_id.is_empty() {
+                return Err(Error::Protocol("Task result is missing agent_id".into()));
+            }
+            let identity = call
                 .arguments
                 .get("description")
                 .and_then(serde_json::Value::as_str)
                 .filter(|name| !name.is_empty())
-                .ok_or_else(|| Error::Protocol("Task call is missing description".into()))?;
-            if value.agent_id.is_empty() {
-                return Err(Error::Protocol("Task result is missing agent_id".into()));
-            }
-            let identity = format!("Subagent name: {name}\nSubagent ID: {}", value.agent_id);
+                .map_or_else(
+                    || format!("Subagent ID: {}", value.agent_id),
+                    |name| format!("Subagent name: {name}\nSubagent ID: {}", value.agent_id),
+                );
             let content = value
                 .final_message
                 .as_deref()
@@ -428,18 +430,8 @@ fn task(value: &pb::SubagentResult, call: &ToolCall) -> Result<(String, bool)> {
                 });
             Ok((content, false))
         }
-        R::Success(value) => Ok((value.final_message.clone().unwrap_or_default(), false)),
         R::Error(value) => Ok((value.error.clone(), true)),
     }
-}
-
-fn creates_subagent(call: &ToolCall) -> bool {
-    matches!(
-        call.arguments
-            .get("resume")
-            .and_then(serde_json::Value::as_str),
-        None | Some("self")
-    )
 }
 
 fn missing(name: &str) -> Error {
@@ -450,6 +442,36 @@ fn missing(name: &str) -> Error {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn backgrounded_resume_result_keeps_the_subagent_identity() {
+        let call = ToolCall {
+            index: 0,
+            call_id: "resume-call".into(),
+            model_call_id: "model-call".into(),
+            name: "Task".into(),
+            arguments_text: "{}".into(),
+            arguments: serde_json::json!({
+                "description": "Continue inspection",
+                "resume": "agent-1",
+                "run_in_background": true,
+            }),
+            argument_error: None,
+        };
+        let result = pb::SubagentResult {
+            result: Some(pb::subagent_result::Result::Success(pb::SubagentSuccess {
+                agent_id: "agent-1".into(),
+                background_reason: pb::SubagentBackgroundReason::UserRequest as i32,
+                ..Default::default()
+            })),
+        };
+
+        let (content, is_error) = task(&result, &call).unwrap();
+
+        assert!(!is_error);
+        assert!(content.contains("Subagent name: Continue inspection"));
+        assert!(content.contains("Subagent ID: agent-1"));
+    }
 
     fn read_lints(paths: serde_json::Value) -> ToolCall {
         ToolCall {

@@ -90,7 +90,7 @@ pub(crate) fn failure_with_message(call: &ToolCall, error: String) -> ToolComple
 
 fn failure_message(name: &str) -> String {
     if normalized(name) == "awaitshell" {
-        return "Tool \"AwaitShell\" is no longer available in this Cursor BYOK version. The model emitted a tool name that is not part of the current advertised tool set. Treat the tool call as failed and continue using only tools advertised in the current prompt; for background shell work, use the current Shell/background completion flow.".into();
+        return "Tool \"AwaitShell\" is no longer available in this Cursor BYOK version. The model emitted a tool name that is not part of the current advertised tool set. Treat the tool call as failed and continue using a tool advertised in the current prompt; for background shell work, use the current Shell/background completion flow.".into();
     }
     format!(
         "Tool \"{name}\" is not available in this Cursor BYOK version. The model emitted a tool name that is not part of the current advertised tool set. Treat the tool call as failed and continue using a tool advertised in the current prompt."
@@ -102,4 +102,41 @@ fn normalized(name: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(name: &str) -> ToolCall {
+        let arguments = serde_json::json!({"shell_id": "runtime-shell", "block_until_ms": 30000});
+        ToolCall {
+            index: 0,
+            call_id: "call-1".into(),
+            model_call_id: "model-call-1".into(),
+            name: name.into(),
+            arguments_text: arguments.to_string(),
+            arguments,
+            argument_error: None,
+        }
+    }
+
+    #[test]
+    fn arbitrary_unknown_tool_is_a_model_visible_failure() {
+        let completion = failure(&tool("OldTool"));
+        assert!(completion.result().is_error);
+        assert!(completion.result().content.contains("not available"));
+        assert_eq!(
+            completion
+                .tool_call()
+                .tool
+                .as_ref()
+                .and_then(|tool| match tool {
+                    pb::tool_call::Tool::McpToolCall(tool) => tool.args.as_ref(),
+                    _ => None,
+                })
+                .map(|args| args.tool_name.as_str()),
+            Some("OldTool")
+        );
+    }
 }

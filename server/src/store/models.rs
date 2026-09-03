@@ -12,7 +12,7 @@ use super::{now_ms, Store};
 
 const MODEL_COLUMNS: &str = r#"
     model_hash, sort_order, display_name, group_name, model_type, base_url, use_full_url, api_key, tooltip_data,
-    model_id, reasoning_effort, openai_endpoint, openai_extra_params_enabled,
+    model_id, reasoning_effort, effort_options_json, context_options_json, openai_endpoint, openai_extra_params_enabled,
     openai_extra_params_json, custom_headers_enabled, custom_headers_json,
     anthropic_extra_params_enabled, anthropic_extra_params_json, context_window_tokens,
     max_completion_tokens, anthropic_max_tokens, anthropic_thinking_effort,
@@ -39,6 +39,63 @@ impl Store {
             .await?
             .map(model_from_row)
             .transpose()
+    }
+
+    /// Resolve a requested model key to a configured model. Cursor runs identify
+    /// models by hash, but Task subagent requests may carry a model id (slug)
+    /// or display name instead; exact matches win over case-insensitive ones.
+    pub async fn resolve_model(&self, key: &str) -> Result<Option<ModelConfig>> {
+        let query = format!(
+            "SELECT {MODEL_COLUMNS} FROM model_configs
+             WHERE model_hash = ? OR model_id = ? OR display_name = ?
+                OR model_id = ? COLLATE NOCASE OR display_name = ? COLLATE NOCASE"
+        );
+        let candidates = sqlx::query(&query)
+            .bind(key)
+            .bind(key)
+            .bind(key)
+            .bind(key)
+            .bind(key)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(model_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        if !candidates.is_empty() {
+            return Ok(candidates.into_iter().min_by_key(|model| {
+                if model.model_hash == key {
+                    0
+                } else if model.model_id == key || model.display_name == key {
+                    1
+                } else {
+                    2
+                }
+            }));
+        }
+        Ok(self
+            .models()
+            .await?
+            .into_iter()
+            .find(|model| Self::model_variant_slug_matches(key, model)))
+    }
+
+    fn model_variant_slug_matches(key: &str, model: &ModelConfig) -> bool {
+        let Some(suffix) = key.strip_prefix(&format!("{}-", model.model_hash)) else {
+            return false;
+        };
+        let mut contexts = model.context_options.clone();
+        if let Some(tokens) = model.context_window_tokens {
+            let bare = tokens.to_string();
+            if !contexts.iter().any(|value| value == &bare) {
+                contexts.push(bare);
+            }
+        }
+        contexts.iter().any(|context| {
+            model.effort_options.iter().any(|effort| {
+                suffix == format!("{context}-{effort}")
+                    || suffix == format!("{context}-{effort}-fast")
+            })
+        })
     }
 
     pub async fn create_model(&self, input: &ModelConfigInput) -> Result<ModelConfig> {
@@ -125,7 +182,8 @@ impl Store {
             r#"UPDATE model_configs SET
                 model_hash = ?, sort_order = ?, display_name = ?, group_name = ?, model_type = ?, base_url = ?,
                 use_full_url = ?, api_key = ?, tooltip_data = ?, model_id = ?, reasoning_effort = ?,
-                openai_endpoint = ?, openai_extra_params_enabled = ?, openai_extra_params_json = ?,
+                effort_options_json = ?, context_options_json = ?, openai_endpoint = ?,
+                openai_extra_params_enabled = ?, openai_extra_params_json = ?,
                 custom_headers_enabled = ?, custom_headers_json = ?,
                 anthropic_extra_params_enabled = ?, anthropic_extra_params_json = ?,
                 context_window_tokens = ?, max_completion_tokens = ?, anthropic_max_tokens = ?,
@@ -143,6 +201,8 @@ impl Store {
         .bind(&input.tooltip_data)
         .bind(&input.model_id)
         .bind(&input.reasoning_effort)
+        .bind(serde_json::to_string(&input.effort_options)?)
+        .bind(serde_json::to_string(&input.context_options)?)
         .bind(&input.openai_endpoint)
         .bind(input.openai_extra_params_enabled)
         .bind(serde_json::to_string(&input.openai_extra_params)?)
@@ -244,12 +304,12 @@ async fn insert_model_with_conflict(
     let mut statement = String::from(
         r#"INSERT INTO model_configs(
             model_hash, sort_order, display_name, group_name, model_type, base_url, use_full_url, api_key, tooltip_data,
-            model_id, reasoning_effort, openai_endpoint, openai_extra_params_enabled,
+            model_id, reasoning_effort, effort_options_json, context_options_json, openai_endpoint, openai_extra_params_enabled,
             openai_extra_params_json, custom_headers_enabled, custom_headers_json,
             anthropic_extra_params_enabled, anthropic_extra_params_json, context_window_tokens,
             max_completion_tokens, anthropic_max_tokens, anthropic_thinking_effort,
             thinking_budget_tokens, created_at_ms, updated_at_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     );
     if ignore_existing {
         statement.push_str(" ON CONFLICT(model_hash) DO NOTHING");
@@ -266,6 +326,8 @@ async fn insert_model_with_conflict(
         .bind(&input.tooltip_data)
         .bind(&input.model_id)
         .bind(&input.reasoning_effort)
+        .bind(serde_json::to_string(&input.effort_options)?)
+        .bind(serde_json::to_string(&input.context_options)?)
         .bind(&input.openai_endpoint)
         .bind(input.openai_extra_params_enabled)
         .bind(serde_json::to_string(&input.openai_extra_params)?)
@@ -298,6 +360,12 @@ fn model_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ModelConfig> {
         tooltip_data: row.try_get("tooltip_data")?,
         model_id: row.try_get("model_id")?,
         reasoning_effort: row.try_get("reasoning_effort")?,
+        effort_options: serde_json::from_str(
+            row.try_get::<String, _>("effort_options_json")?.as_str(),
+        )?,
+        context_options: serde_json::from_str(
+            row.try_get::<String, _>("context_options_json")?.as_str(),
+        )?,
         openai_endpoint: row.try_get("openai_endpoint")?,
         openai_extra_params_enabled: row.try_get("openai_extra_params_enabled")?,
         openai_extra_params: serde_json::from_str(
@@ -351,6 +419,8 @@ mod tests {
             tooltip_data: "Test Model".into(),
             model_id: "test-model".into(),
             reasoning_effort: None,
+            effort_options: Vec::new(),
+            context_options: Vec::new(),
             openai_endpoint: crate::model::OPENAI_CHAT_ENDPOINT.into(),
             openai_extra_params_enabled: false,
             openai_extra_params: serde_json::json!({}),
@@ -397,5 +467,125 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.model_hash, created.model_hash);
         assert_eq!(cleared.group_name, None);
+    }
+    fn input(name: &str) -> ModelConfigInput {
+        ModelConfigInput {
+            sort_order: 1,
+            display_name: name.into(),
+            group_name: None,
+            model_type: ModelType::OpenAi,
+            base_url: "https://example.com/v1/responses".into(),
+            use_full_url: true,
+            api_key: "secret".into(),
+            tooltip_data: "Example model".into(),
+            model_id: "model-a".into(),
+            reasoning_effort: Some("high".into()),
+            effort_options: vec!["low".into(), "high".into()],
+            context_options: vec!["200k".into(), "1m".into()],
+            openai_endpoint: "/v1/responses".into(),
+            openai_extra_params_enabled: true,
+            openai_extra_params: serde_json::json!({"service_tier":"priority"}),
+            custom_headers_enabled: true,
+            custom_headers: serde_json::json!({"x-client":"cursor-byok"}),
+            anthropic_extra_params_enabled: false,
+            anthropic_extra_params: serde_json::json!({}),
+            context_window_tokens: Some(200_000),
+            max_completion_tokens: Some(8_192),
+            anthropic_max_tokens: None,
+            anthropic_thinking_effort: None,
+            thinking_budget_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn model_configuration_round_trips_and_updates_identity() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let created = store.create_model(&input("Model A")).await.unwrap();
+        assert_eq!(created.model_hash.len(), 16);
+        assert_eq!(created.custom_headers["x-client"], "cursor-byok");
+        assert_eq!(store.models().await.unwrap().len(), 1);
+
+        let updated = store
+            .update_model(&created.model_hash, &input("Renamed"))
+            .await
+            .unwrap();
+        assert_ne!(updated.model_hash, created.model_hash);
+        assert!(store.model(&created.model_hash).await.unwrap().is_none());
+
+        store.delete_model(&updated.model_hash).await.unwrap();
+        assert!(store.models().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolves_models_by_hash_model_id_or_display_name() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let mut model_input = input("Model A");
+        model_input.display_name = "Model A".into();
+        let saved = store.create_model(&model_input).await.unwrap();
+
+        for key in [
+            saved.model_hash.as_str(),
+            "model-a",
+            "Model A",
+            "MODEL-A",
+            "model A",
+        ] {
+            let resolved = store.resolve_model(key).await.unwrap();
+            assert_eq!(
+                resolved.as_ref().map(|model| model.model_hash.as_str()),
+                Some(saved.model_hash.as_str()),
+                "key {key} must resolve"
+            );
+        }
+        let variant = format!("{}-1m-low", saved.model_hash);
+        let resolved = store.resolve_model(&variant).await.unwrap();
+        assert_eq!(
+            resolved.as_ref().map(|model| model.model_hash.as_str()),
+            Some(saved.model_hash.as_str())
+        );
+        assert!(store
+            .resolve_model("unknown-model")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_creation_is_atomic() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let duplicate = input("Model A");
+        assert!(store
+            .create_models(&[duplicate.clone(), duplicate])
+            .await
+            .is_err());
+        assert!(store.models().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_order_is_replaced_atomically() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let first = store.create_model(&input("First")).await.unwrap();
+        let mut second_input = input("Second");
+        second_input.model_id = "model-b".into();
+        second_input.sort_order = 2;
+        let second = store.create_model(&second_input).await.unwrap();
+
+        let reordered = store
+            .reorder_models(&[second.model_hash.clone(), first.model_hash.clone()])
+            .await
+            .unwrap();
+        assert_eq!(reordered[0].model_hash, second.model_hash);
+        assert_eq!(reordered[0].sort_order, 1);
+        assert_eq!(reordered[1].model_hash, first.model_hash);
+        assert_eq!(reordered[1].sort_order, 2);
+
+        assert!(store
+            .reorder_models(std::slice::from_ref(&first.model_hash))
+            .await
+            .is_err());
+        assert_eq!(
+            store.models().await.unwrap()[0].model_hash,
+            second.model_hash
+        );
     }
 }

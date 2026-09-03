@@ -153,14 +153,12 @@ fn token_usage_buckets(
     if let (Some(start_ms), Some(end_ms)) = (start_ms, end_ms) {
         let duration_ms = end_ms.saturating_sub(start_ms).max(1);
         let explicit_bucket_ms = requested_bucket_ms.filter(|bucket_ms| *bucket_ms >= MINUTE_MS);
-        let bucket_ms = explicit_bucket_ms.unwrap_or_else(|| {
-            if duration_ms <= HOUR_MS {
-                MINUTE_MS
-            } else if duration_ms <= MAX_RANGE_BUCKETS * HOUR_MS {
-                HOUR_MS
-            } else {
-                DAY_MS
-            }
+        let bucket_ms = explicit_bucket_ms.unwrap_or(if duration_ms <= HOUR_MS {
+            MINUTE_MS
+        } else if duration_ms <= MAX_RANGE_BUCKETS * HOUR_MS {
+            HOUR_MS
+        } else {
+            DAY_MS
         });
         let granularity = if bucket_ms < HOUR_MS {
             TokenUsageGranularity::Minute
@@ -176,8 +174,8 @@ fn token_usage_buckets(
         };
         let last_bucket_ms = end_ms.saturating_sub(1).div_euclid(bucket_ms) * bucket_ms;
         let first_bucket_ms = start_ms.div_euclid(bucket_ms) * bucket_ms;
-        let bucket_count = ((last_bucket_ms - first_bucket_ms).div_euclid(bucket_ms) + 1)
-            .clamp(1, max_buckets);
+        let bucket_count =
+            ((last_bucket_ms - first_bucket_ms).div_euclid(bucket_ms) + 1).clamp(1, max_buckets);
         let series_start_ms =
             last_bucket_ms.saturating_sub((bucket_count - 1).saturating_mul(bucket_ms));
         return (granularity, bucket_ms, series_start_ms, bucket_count);
@@ -218,4 +216,163 @@ fn saturating_sum(values: &[i64]) -> i64 {
     values
         .iter()
         .fold(0_i64, |total, value| total.saturating_add(*value))
+}
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, Utc};
+
+    use super::*;
+
+    #[test]
+    fn one_hour_range_uses_sixty_minute_buckets() {
+        let start_ms = 1_800_000_000_000;
+        let (granularity, bucket_ms, series_start_ms, bucket_count) =
+            token_usage_buckets(Some(start_ms), Some(start_ms + HOUR_MS), None);
+
+        assert_eq!(granularity, TokenUsageGranularity::Minute);
+        assert_eq!(bucket_ms, MINUTE_MS);
+        assert_eq!(series_start_ms, start_ms);
+        assert_eq!(bucket_count, 60);
+    }
+
+    #[test]
+    fn short_range_crossing_a_minute_boundary_uses_two_buckets() {
+        let minute_start_ms = 1_800_000_000_000;
+        let (granularity, bucket_ms, series_start_ms, bucket_count) = token_usage_buckets(
+            Some(minute_start_ms + MINUTE_MS - 1_000),
+            Some(minute_start_ms + MINUTE_MS + 1_000),
+            None,
+        );
+
+        assert_eq!(granularity, TokenUsageGranularity::Minute);
+        assert_eq!(bucket_ms, MINUTE_MS);
+        assert_eq!(series_start_ms, minute_start_ms);
+        assert_eq!(bucket_count, 2);
+    }
+
+    #[tokio::test]
+    async fn overview_aggregates_llm_calls_and_normalizes_token_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("overview.db").display()
+        ))
+        .await
+        .unwrap();
+        let now = Utc::now().timestamp_millis();
+        insert_call(&store, "openai", "openai-responses", now, [100, 20, 80, 0]).await;
+        insert_call(&store, "anthropic", "anthropic", now, [30, 10, 50, 5]).await;
+        sqlx::query("UPDATE llm_calls SET status = 'error' WHERE call_id = 'anthropic'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        insert_call(
+            &store,
+            "old",
+            "openai-chat",
+            (Utc::now() - Duration::days(400)).timestamp_millis(),
+            [10, 5, 0, 0],
+        )
+        .await;
+
+        let overview = store.overview(None, None, None, None).await.unwrap();
+        assert_eq!(overview.metrics.llm_calls, 3);
+        assert_eq!(overview.metrics.successful_calls, 2);
+        assert_eq!(overview.metrics.failed_calls, 1);
+        assert_eq!(overview.metrics.input_tokens, 60);
+        assert_eq!(overview.metrics.cache_read_tokens, 130);
+        assert_eq!(overview.metrics.cache_write_tokens, 5);
+        assert_eq!(overview.metrics.output_tokens, 35);
+        assert_eq!(overview.metrics.prompt_tokens, 195);
+        assert_eq!(overview.metrics.token_usage, 230);
+        assert_eq!(overview.token_usage_granularity, TokenUsageGranularity::Day);
+        assert_eq!(overview.token_usage_series.len(), OVERVIEW_DAYS as usize);
+        let today = overview.token_usage_series.last().unwrap();
+        assert_eq!(today.input_tokens, 50);
+        assert_eq!(today.cache_read_tokens, 130);
+        assert_eq!(today.cache_write_tokens, 5);
+        assert_eq!(today.output_tokens, 30);
+        assert_eq!(today.total_tokens(), 215);
+    }
+
+    #[tokio::test]
+    async fn overview_filters_metrics_and_usage_by_time_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("ranged-overview.db").display()
+        ))
+        .await
+        .unwrap();
+        let now = 1_800_000_030_000;
+        insert_call(&store, "inside", "anthropic", now, [20, 5, 10, 2]).await;
+        insert_call(
+            &store,
+            "outside",
+            "anthropic",
+            now - Duration::hours(2).num_milliseconds(),
+            [100, 50, 40, 20],
+        )
+        .await;
+
+        let overview = store
+            .overview(Some(now - 1_000), Some(now + 1_000), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(overview.metrics.llm_calls, 1);
+        assert_eq!(overview.metrics.input_tokens, 20);
+        assert_eq!(overview.metrics.cache_read_tokens, 10);
+        assert_eq!(overview.metrics.cache_write_tokens, 2);
+        assert_eq!(overview.metrics.output_tokens, 5);
+        assert_eq!(
+            overview.token_usage_granularity,
+            TokenUsageGranularity::Minute
+        );
+        assert_eq!(overview.token_usage_series.len(), 1);
+        assert_eq!(overview.token_usage_series[0].total_tokens(), 37);
+
+        let filtered = store
+            .overview(
+                Some(now - 1_000),
+                Some(now + 1_000),
+                Some(r#"["missing-model"]"#),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.metrics.llm_calls, 0);
+        assert_eq!(filtered.metrics.token_usage, 0);
+        assert_eq!(filtered.token_usage_series[0].total_tokens(), 0);
+    }
+
+    async fn insert_call(
+        store: &Store,
+        call_id: &str,
+        request_type: &str,
+        created_at_ms: i64,
+        usage: [i64; 4],
+    ) {
+        let [input_tokens, output_tokens, cache_read_tokens, cache_write_tokens] = usage;
+        sqlx::query(
+            "INSERT INTO llm_calls(
+                call_id, run_id, conversation_id, provider_call_index, provider_type,
+                provider_url, request_type, request_url, model_id, display_name, status,
+                created_at_ms, input_tokens, output_tokens, cache_read_tokens,
+                cache_write_tokens, message_count, tool_count, detailed)
+             VALUES (?, 'completed', 'conversation', 0, ?, '', ?, '', 'model', 'Model',
+                'completed', ?, ?, ?, ?, ?, 0, 0, 0)",
+        )
+        .bind(call_id)
+        .bind(request_type)
+        .bind(request_type)
+        .bind(created_at_ms)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(cache_read_tokens)
+        .bind(cache_write_tokens)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
 }

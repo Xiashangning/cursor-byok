@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import type { AdRuntime } from "../shell/ads/types";
 import type { Locale } from "../i18n/runtime";
 
@@ -15,6 +16,8 @@ export interface Model {
   tooltip_data: string;
   model_id: string;
   reasoning_effort: string | null;
+  effort_options: string[];
+  context_options: string[];
   openai_endpoint: string;
   openai_extra_params_enabled: boolean;
   openai_extra_params: Record<string, unknown>;
@@ -42,6 +45,8 @@ export interface ModelInput {
   tooltip_data: string;
   model_id: string;
   reasoning_effort: string | null;
+  effort_options: string[];
+  context_options: string[];
   openai_endpoint: string;
   openai_extra_params_enabled: boolean;
   openai_extra_params: Record<string, unknown>;
@@ -489,7 +494,6 @@ export const api = {
   cancelPluginRuntimeInitialization: () => request<PluginRuntimeStatus>("/plugins/runtime", { method: "DELETE" }),
   openCursorCaInstallTerminal: async (command: string) => {
     if (!packagedDesktop) throw new Error(t("请在桌面应用中打开终端安装 CA"));
-    const { invoke } = await import("@tauri-apps/api/core");
     await invoke("open_terminal_with_command", { command });
   },
   copyCursorText: async (text: string) => {

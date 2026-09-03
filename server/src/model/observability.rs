@@ -29,8 +29,72 @@ mod usage {
         }
     }
 
+    /// Adds two optional counts, treating an unreported count as zero.
+    /// The result is only unknown when neither side reported the field.
     fn sum(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-        left?.checked_add(right?)
+        if left.is_none() && right.is_none() {
+            return None;
+        }
+        Some(
+            left.unwrap_or_default()
+                .saturating_add(right.unwrap_or_default()),
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_record_without_cache_details_keeps_the_counts_already_accumulated() {
+            let mut total = Usage {
+                input_tokens: Some(1_000),
+                output_tokens: Some(20),
+                total_tokens: Some(1_020),
+                cache_read_tokens: Some(900),
+                ..Default::default()
+            };
+            // A second provider call that omits `prompt_tokens_details`.
+            total += Usage {
+                input_tokens: Some(1_200),
+                output_tokens: Some(30),
+                total_tokens: Some(1_230),
+                ..Default::default()
+            };
+            assert_eq!(total.input_tokens, Some(2_200));
+            assert_eq!(total.output_tokens, Some(50));
+            assert_eq!(total.total_tokens, Some(2_250));
+            assert_eq!(total.cache_read_tokens, Some(900));
+        }
+
+        #[test]
+        fn a_late_reported_count_is_not_discarded() {
+            let mut total = Usage {
+                input_tokens: Some(1_000),
+                ..Default::default()
+            };
+            total += Usage {
+                input_tokens: Some(1_200),
+                cache_read_tokens: Some(900),
+                reasoning_tokens: Some(64),
+                ..Default::default()
+            };
+            assert_eq!(total.cache_read_tokens, Some(900));
+            assert_eq!(total.reasoning_tokens, Some(64));
+        }
+
+        #[test]
+        fn a_field_no_call_reported_stays_unknown() {
+            let mut total = Usage {
+                input_tokens: Some(1_000),
+                ..Default::default()
+            };
+            total += Usage {
+                input_tokens: Some(1_200),
+                ..Default::default()
+            };
+            assert_eq!(total.cache_write_tokens, None);
+        }
     }
 }
 pub use usage::*;

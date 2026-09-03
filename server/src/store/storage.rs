@@ -137,3 +137,84 @@ impl Store {
         Ok(())
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ModelConfigInput, ModelType, OPENAI_CHAT_ENDPOINT};
+
+    #[tokio::test]
+    async fn clears_detail_storage_without_removing_configuration() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .create_model(&ModelConfigInput {
+                sort_order: 0,
+                display_name: "Model".into(),
+                group_name: None,
+                model_type: ModelType::OpenAi,
+                base_url: "https://example.com/v1/chat/completions".into(),
+                use_full_url: true,
+                api_key: "secret".into(),
+                tooltip_data: "Model".into(),
+                model_id: "model".into(),
+                reasoning_effort: None,
+                effort_options: crate::model::DEFAULT_EFFORT_OPTIONS
+                    .iter()
+                    .map(|value| (*value).into())
+                    .collect(),
+                context_options: crate::model::DEFAULT_CONTEXT_OPTIONS
+                    .iter()
+                    .map(|value| (*value).into())
+                    .collect(),
+                openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
+                openai_extra_params_enabled: false,
+                openai_extra_params: serde_json::json!({}),
+                custom_headers_enabled: false,
+                custom_headers: serde_json::json!({}),
+                anthropic_extra_params_enabled: false,
+                anthropic_extra_params: serde_json::json!({}),
+                context_window_tokens: None,
+                max_completion_tokens: None,
+                anthropic_max_tokens: None,
+                anthropic_thinking_effort: None,
+                thinking_budget_tokens: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO llm_calls(call_id, run_id, conversation_id, provider_call_index, provider_type, provider_url, request_type, request_url, model_id, display_name, status, created_at_ms, message_count, tool_count, detailed) VALUES ('call-1', 'run-1', 'conversation-1', 0, 'openai-chat', 'https://example.com', 'openai-chat', 'https://example.com/v1/chat/completions', 'model', 'Model', 'completed', 1, 1, 0, 0)")
+            .execute(store.pool()).await.unwrap();
+
+        assert!(store.statistics_storage().await.unwrap().bytes > 0);
+        let cleared = store.clear_statistics_storage().await.unwrap();
+        assert_eq!(cleared.call_count, 1);
+        assert_eq!(cleared.trace_count, 0);
+        assert!(cleared.bytes > 0);
+        assert!(store.llm_call_request("call-1").await.unwrap().is_none());
+        assert!(store.llm_call_chunks("call-1").await.unwrap().is_empty());
+        let model_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_configs")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(model_count, 1);
+
+        store
+            .record_llm_request(
+                "call-1",
+                &serde_json::json!({}),
+                &serde_json::json!({"model": "model"}),
+                true,
+            )
+            .await
+            .unwrap();
+        store
+            .record_llm_chunk("call-1", 0, 1, b"data", true)
+            .await
+            .unwrap();
+
+        assert!(store.llm_call_request("call-1").await.unwrap().is_some());
+        assert_eq!(store.llm_call_chunks("call-1").await.unwrap().len(), 1);
+        let cleared = store.clear_all_statistics_storage().await.unwrap();
+        assert_eq!(cleared.bytes, 0);
+        assert_eq!(cleared.call_count, 0);
+    }
+}

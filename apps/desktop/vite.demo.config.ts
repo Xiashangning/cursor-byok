@@ -15,6 +15,8 @@ export default defineConfig({
   build: {
     outDir: demoOutput,
     emptyOutDir: true,
+    // Monaco's editor.api chunk is lazy-loaded and intentionally large.
+    chunkSizeWarningLimit: 2700,
     rollupOptions: {
       input: demoInput,
     },

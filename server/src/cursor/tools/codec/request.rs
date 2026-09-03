@@ -117,36 +117,108 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                 .into(),
             tool_call_id: call.call_id.clone(),
         }),
-        "task" => Message::SubagentArgs(pb::SubagentArgs {
+        "task" => {
+            let model_parameters = task_model_parameters(call)?;
+            let model_id = string("model")?;
+            Message::SubagentArgs(pb::SubagentArgs {
+                tool_call_id: call.call_id.clone(),
+                subagent_type: optional_string("subagent_type").unwrap_or_default(),
+                model_id,
+                prompt: string("prompt")?,
+                readonly: false,
+                resume_agent_id: optional_string("resume"),
+                run_in_background: call
+                    .arguments
+                    .get("run_in_background")
+                    .and_then(Value::as_bool),
+                continuation_config: None,
+                parent_conversation_id: Some(context.conversation_id.clone()),
+                interrupt: call.arguments.get("interrupt").and_then(Value::as_bool),
+                mode: 0,
+                fork_agent_id: None,
+                root_parent_conversation_id: Some(context.root_conversation_id.clone()),
+                selected_context: task_attachments(call),
+                direct_meta_parent_child_subagent: None,
+                environment: match optional_string("environment").as_deref() {
+                    Some("cloud") => pb::SubagentExecutionEnvironment::Cloud as i32,
+                    Some("local") | None => pb::SubagentExecutionEnvironment::Local as i32,
+                    Some(value) => {
+                        return Err(Error::Protocol(format!(
+                            "unknown Task environment: {value}"
+                        )))
+                    }
+                },
+                cloud_base_branch: optional_string("cloud_base_branch"),
+                model_parameters,
+                credentials: None,
+            })
+        }
+        "createagent" => Message::ForceBackgroundSubagentArgs(pb::ForceBackgroundSubagentArgs {
             tool_call_id: call.call_id.clone(),
-            subagent_type: optional_string("subagent_type").unwrap_or_default(),
-            model_id: string("model")?,
-            prompt: string("prompt")?,
-            readonly: false,
-            resume_agent_id: optional_string("resume"),
-            run_in_background: call
-                .arguments
-                .get("run_in_background")
-                .and_then(Value::as_bool),
-            continuation_config: None,
-            parent_conversation_id: Some(context.conversation_id.clone()),
-            interrupt: call.arguments.get("interrupt").and_then(Value::as_bool),
-            mode: 0,
-            fork_agent_id: None,
-            root_parent_conversation_id: Some(context.root_conversation_id.clone()),
-            selected_context: task_attachments(call),
-            direct_meta_parent_child_subagent: None,
-            environment: match optional_string("environment").as_deref() {
-                Some("cloud") => pb::SubagentExecutionEnvironment::Cloud as i32,
-                Some("local") | None => pb::SubagentExecutionEnvironment::Local as i32,
-                Some(value) => {
-                    return Err(Error::Protocol(format!(
-                        "unknown Task environment: {value}"
-                    )))
+        }),
+        "sendmessagetoagent" => {
+            let prompt = string("prompt")?;
+            let agent_id = optional_string("agent_id").or_else(|| optional_string("agentId"));
+            let requested_model = optional_string("model").filter(|model| !model.is_empty());
+            let subagent_type = optional_string("subagent_type")
+                .or_else(|| optional_string("subagentType"))
+                .unwrap_or_default();
+            let model_id = match context.subagent_model_for(&subagent_type) {
+                Some(crate::cursor::tools::runtime::SubagentModel::Model(model)) => model.clone(),
+                Some(crate::cursor::tools::runtime::SubagentModel::Inherit) => {
+                    context.default_subagent_model.clone()
                 }
-            },
-            cloud_base_branch: optional_string("cloud_base_branch"),
-            credentials: None,
+                Some(crate::cursor::tools::runtime::SubagentModel::Disabled) => {
+                    return Err(Error::Protocol(
+                        "send-message-to-agent is disabled by the subagent model override".into(),
+                    ))
+                }
+                None => requested_model.unwrap_or_else(|| context.default_subagent_model.clone()),
+            };
+            let readonly = call
+                .arguments
+                .get("readonly")
+                .or_else(|| call.arguments.get("readOnly"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Message::SubagentArgs(pb::SubagentArgs {
+                tool_call_id: call.call_id.clone(),
+                subagent_type,
+                model_id,
+                prompt,
+                readonly,
+                resume_agent_id: agent_id,
+                run_in_background: None,
+                continuation_config: None,
+                parent_conversation_id: Some(context.conversation_id.clone()),
+                interrupt: None,
+                mode: if readonly {
+                    pb::TaskMode::Plan as i32
+                } else {
+                    pb::TaskMode::Agent as i32
+                },
+                fork_agent_id: None,
+                root_parent_conversation_id: Some(context.root_conversation_id.clone()),
+                selected_context: None,
+                direct_meta_parent_child_subagent: None,
+                environment: pb::SubagentExecutionEnvironment::Local as i32,
+                cloud_base_branch: None,
+                model_parameters: Vec::new(),
+                credentials: None,
+            })
+        }
+        "await" => Message::SubagentAwaitArgs(pb::SubagentAwaitArgs {
+            agent_id: optional_string("task_id")
+                .or_else(|| optional_string("agent_id"))
+                .or_else(|| optional_string("agentId"))
+                .ok_or_else(|| Error::Protocol("AWAIT is missing task_id".into()))?,
+            timeout_ms: call
+                .arguments
+                .get("block_until_ms")
+                .or_else(|| call.arguments.get("timeout_ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or(30_000)
+                .min(u32::MAX as u64) as u32,
         }),
         "fetchmcpresource" => Message::ReadMcpResourceExecArgs(pb::ReadMcpResourceExecArgs {
             server: string("server")?,
@@ -457,6 +529,43 @@ fn shell_notification(call: &ToolCall) -> Result<Option<pb::ShellOutputNotificat
     }))
 }
 
+fn task_model_parameters(call: &ToolCall) -> Result<Vec<pb::requested_model::ModelParameterValue>> {
+    let Some(value) = call.arguments.get("model_parameters") else {
+        return Ok(Vec::new());
+    };
+    let parameters: Vec<&Value> = match value {
+        Value::Array(parameters) => parameters.iter().collect(),
+        Value::Object(_) => vec![value],
+        _ => {
+            return Err(Error::Protocol(
+                "Task model_parameters must be an object or array".into(),
+            ))
+        }
+    };
+    parameters
+        .iter()
+        .map(|parameter| {
+            let object = parameter.as_object().ok_or_else(|| {
+                Error::Protocol("Task model_parameters entries must be objects".into())
+            })?;
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| matches!(*id, "effort" | "context"))
+                .ok_or_else(|| {
+                    Error::Protocol("Task model_parameters id must be effort or context".into())
+                })?;
+            let value = object.get("value").and_then(Value::as_str).ok_or_else(|| {
+                Error::Protocol(format!("Task model parameter {id} is missing value"))
+            })?;
+            Ok(pb::requested_model::ModelParameterValue {
+                id: id.into(),
+                value: value.into(),
+            })
+        })
+        .collect()
+}
+
 fn task_attachments(call: &ToolCall) -> Option<pb::SelectedContext> {
     let paths = call.arguments.get("file_attachments")?.as_array()?;
     let mut context = pb::SelectedContext::default();
@@ -523,33 +632,86 @@ fn prost_value(value: &Value) -> prost_types::Value {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use serde_json::json;
 
-    use super::request;
-    use crate::cursor::protocol::proto::agent::v1 as pb;
-    use crate::cursor::tools::runtime::ExecContext;
-    use crate::model::ToolCall;
+    fn call(name: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "call-1".into(),
+            model_call_id: "model-1".into(),
+            name: name.into(),
+            arguments_text: arguments.to_string(),
+            arguments,
+            argument_error: None,
+        }
+    }
+
+    fn message(call: &ToolCall) -> pb::exec_server_message::Message {
+        let server = request(
+            7,
+            call,
+            &crate::cursor::tools::runtime::ExecContext {
+                conversation_id: "conversation-1".into(),
+                root_conversation_id: "root-1".into(),
+                default_subagent_model: "model-1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let Some(pb::agent_server_message::Message::ExecServerMessage(server)) = server.message
+        else {
+            panic!("expected ExecServerMessage")
+        };
+        server.message.unwrap()
+    }
+
+    #[test]
+    fn task_model_parameters_accepts_single_object_parameter() {
+        let parameters = task_model_parameters(&call(
+            "Task",
+            json!({
+                "model_parameters": {"id": "effort", "value": "low"}
+            }),
+        ))
+        .unwrap();
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(parameters[0].id, "effort");
+        assert_eq!(parameters[0].value, "low");
+    }
+
+    #[test]
+    fn orchestration_tools_encode_to_client_exec_messages() {
+        assert!(matches!(
+            message(&call("create-agent", json!({"title":"Inspect","prompt":"inspect"}))),
+            pb::exec_server_message::Message::ForceBackgroundSubagentArgs(args)
+                if args.tool_call_id == "call-1"
+        ));
+        assert!(matches!(
+            message(&call(
+                "send-message-to-agent",
+                json!({"agent_id":"agent-1","prompt":"continue","readonly":true})
+            )),
+            pb::exec_server_message::Message::SubagentArgs(args)
+                if args.resume_agent_id.as_deref() == Some("agent-1")
+                    && args.parent_conversation_id.as_deref() == Some("conversation-1")
+                    && args.mode == pb::TaskMode::Plan as i32
+        ));
+        assert!(matches!(
+            message(&call("AWAIT", json!({"task_id":"agent-1","block_until_ms":5000}))),
+            pb::exec_server_message::Message::SubagentAwaitArgs(args)
+                if args.agent_id == "agent-1" && args.timeout_ms == 5000
+        ));
+    }
 
     #[test]
     fn bash_is_encoded_as_a_shell_exec_request() {
         // The dispatcher routes `bash`/`Bash` to the shell executor, so the
         // request codec must encode it as a Shell stream instead of erroring
         // with `tool bash is not executed through ExecServerMessage`.
-        let call = ToolCall {
-            index: 0,
-            call_id: "call-1".into(),
-            model_call_id: "model-1".into(),
-            name: "Bash".into(),
-            arguments_text: String::new(),
-            arguments: json!({ "command": "ls -la" }),
-            argument_error: None,
-        };
-        let message = request(1, &call, &ExecContext::default()).unwrap();
-        let Some(pb::agent_server_message::Message::ExecServerMessage(exec)) = message.message
+        let pb::exec_server_message::Message::ShellStreamArgs(args) =
+            message(&call("Bash", json!({ "command": "ls -la" })))
         else {
-            panic!("expected an ExecServerMessage");
-        };
-        let Some(pb::exec_server_message::Message::ShellStreamArgs(args)) = exec.message else {
             panic!("expected ShellStreamArgs");
         };
         assert_eq!(args.command, "ls -la");

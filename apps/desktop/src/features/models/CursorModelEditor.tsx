@@ -1,5 +1,5 @@
 import type { ModelInput, ModelType } from "../../shared/api";
-import { defaultCustomHeadersText } from "../../shared/utils/modelDefaults";
+import { defaultContextOptions, defaultCustomHeadersText, defaultEffortOptions, formatTokenCount, parseTokenCount } from "../../shared/utils/modelDefaults";
 import { modelPresets, presetEndpoint, trimTrailingSlash, type ModelPreset } from "../../shared/utils/modelPresets";
 import { Button } from "../../shared/ui/Button";
 import { Checkbox } from "../../shared/ui/Checkbox";
@@ -10,6 +10,10 @@ import { Switch } from "../../shared/ui/Switch";
 import { claudeIcon, openAiIcon } from "../../shared/ui/icons";
 import { CursorPresetChips } from "./CursorPresetChips";
 import styles from "./CursorSettings.module.scss";
+
+function parseOptions(value: string): string[] {
+  return [...new Set(value.split(",").map((item) => item.trim()).filter(Boolean))];
+}
 
 export type CursorModelDraft = {
   providerId: string;
@@ -32,6 +36,8 @@ export const emptyCursorModelDraft = (): CursorModelDraft => ({
     tooltip_data: "",
     model_id: "",
     reasoning_effort: null,
+    effort_options: [...defaultEffortOptions],
+    context_options: [...defaultContextOptions],
     openai_endpoint: "/v1/responses",
     openai_extra_params_enabled: false,
     openai_extra_params: {},
@@ -92,6 +98,8 @@ export function CursorModelEditor({ draft, modelOptions, discovering, onChange, 
   const applyPreset = (preset: ModelPreset) => {
     const endpoint = presetEndpoint(preset, draft.model.type);
     const first = preset.models[0];
+    // 上下文窗口不再是独立输入：预设窗口转为 Context 选项的第一项（保存时取第一项作为默认值）
+    const presetContext = first?.context_window_tokens ?? null;
     // 切到别家服务商时清空 API Key（不同家的 Key 不能串用）；同一家内切换协议则保留
     const currentBase = trimTrailingSlash(draft.model.base_url.trim());
     const sameProvider = [preset.endpoints.anthropic, preset.endpoints.openai]
@@ -109,7 +117,9 @@ export function CursorModelEditor({ draft, modelOptions, discovering, onChange, 
         model_id: first?.model_id ?? draft.model.model_id,
         display_name: first?.display_name ?? draft.model.display_name,
         tooltip_data: !draft.model.tooltip_data.trim() || draft.model.tooltip_data === t("备注") ? preset.name : draft.model.tooltip_data,
-        context_window_tokens: first?.context_window_tokens ?? draft.model.context_window_tokens,
+        context_options: presetContext !== null
+          ? [formatTokenCount(presetContext), ...draft.model.context_options.filter((value) => parseTokenCount(value) !== presetContext)]
+          : draft.model.context_options,
         ...(draft.model.type === "openai"
           ? { max_completion_tokens: first?.max_output_tokens ?? draft.model.max_completion_tokens }
           : { anthropic_max_tokens: first?.max_output_tokens ?? draft.model.anthropic_max_tokens }),
@@ -155,7 +165,8 @@ export function CursorModelEditor({ draft, modelOptions, discovering, onChange, 
       <FormField label={t("显示名称")} hint={t("仅用于界面展示，不会改变发送给模型服务的模型名称。")}> <TextInput placeholder={t("例如：主力模型")} value={draft.model.display_name} onChange={(event) => setModel({ display_name: event.target.value })} /></FormField>
       <FormField className={styles.fullWidth} label={t("备注")} hint={t("显示在 Cursor 模型说明中。")}> <TextInput placeholder={t("请输入模型备注")} value={draft.model.tooltip_data} onChange={(event) => setModel({ tooltip_data: event.target.value })} /></FormField>
 
-      <FormField label={t("上下文窗口 Token")} hint={t("留空时使用默认值。")}> <TextInput type="number" min={1} step={1} placeholder={t("留空使用默认值")} value={draft.model.context_window_tokens ?? ""} onChange={(event) => setModel({ context_window_tokens: numberValue(event.target.value) })} /></FormField>
+      <FormField label={t("Effort 选项")} hint={t("用逗号分隔模型可用的 effort 值。")}> <TextInput aria-label={t("Effort 选项")} value={draft.model.effort_options.join(", ")} onChange={(event) => setModel({ effort_options: parseOptions(event.target.value) })} /></FormField>
+      <FormField label={t("Context 选项")} hint={t("用逗号分隔模型可用的 context 值，例如 200k, 1m。")}> <TextInput aria-label={t("Context 选项")} value={draft.model.context_options.join(", ")} onChange={(event) => setModel({ context_options: parseOptions(event.target.value) })} /></FormField>
       {draft.model.type === "openai" ? <>
         <FormField label={t("最大输出 Token")} hint={t("留空时使用默认值。")}> <TextInput type="number" min={1} step={1} placeholder={t("留空使用默认值")} value={draft.model.max_completion_tokens ?? ""} onChange={(event) => setModel({ max_completion_tokens: numberValue(event.target.value) })} /></FormField>
         <FormField label={t("推理强度")}> <Select ariaLabel={t("推理强度")} value={draft.model.reasoning_effort ?? ""} options={effortOptions(true)} onChange={(value) => setModel({ reasoning_effort: value || null })} /></FormField>

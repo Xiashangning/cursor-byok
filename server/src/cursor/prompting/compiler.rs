@@ -22,12 +22,39 @@ impl PromptCompiler {
         render(&self.assets.mode(mode).runtime, values)
     }
 
+    /// Whether the mode's tool descriptions reference {{AVAILABLE_SUBAGENT_MODELS}}.
+    /// Modes without orchestration tools (subagent, compaction, ...) skip the lookup.
+    pub fn needs_available_subagent_models(&self, mode: Mode) -> bool {
+        self.assets
+            .mode(mode)
+            .tools
+            .iter()
+            .any(|tool| tool.description.contains("{{AVAILABLE_SUBAGENT_MODELS}}"))
+    }
+
     pub fn prompt_spec(
         &self,
         mode: Mode,
         model: &ModelSpec,
         dynamic_tools: &[ToolDefinition],
         suppress_subagent_progress: bool,
+    ) -> Result<PromptSpec> {
+        self.prompt_spec_with_available_subagent_models(
+            mode,
+            model,
+            dynamic_tools,
+            suppress_subagent_progress,
+            "",
+        )
+    }
+
+    pub fn prompt_spec_with_available_subagent_models(
+        &self,
+        mode: Mode,
+        model: &ModelSpec,
+        dynamic_tools: &[ToolDefinition],
+        suppress_subagent_progress: bool,
+        available_subagent_models: &str,
     ) -> Result<PromptSpec> {
         let mut tools = self.tools(mode, suppress_subagent_progress);
         let mut dynamic_tools = dynamic_tools.to_vec();
@@ -40,12 +67,18 @@ impl PromptCompiler {
             .display_name
             .as_deref()
             .unwrap_or(model.model_id.as_str());
+        let instructions = self
+            .assets
+            .mode(mode)
+            .prompt
+            .replace("{{FAKE_MODEL_NAME}}", fake_model_name);
+        for tool in &mut tools {
+            tool.description = tool
+                .description
+                .replace("{{AVAILABLE_SUBAGENT_MODELS}}", available_subagent_models);
+        }
         Ok(PromptSpec {
-            instructions: self
-                .assets
-                .mode(mode)
-                .prompt
-                .replace("{{FAKE_MODEL_NAME}}", fake_model_name),
+            instructions,
             tools,
         })
     }
@@ -91,4 +124,33 @@ fn append_dynamic_tools(
         tools.push(tool);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_description_receives_dynamic_model_parameter_options() {
+        let compiler = PromptCompiler::new(PromptAssets::embedded().unwrap());
+        let prompt = compiler
+            .prompt_spec_with_available_subagent_models(
+                Mode::Multitask,
+                &ModelSpec::new("model"),
+                &[],
+                false,
+                "- inherit\n- Configured [provider-model] — effort: low, high; context: 272k, 1m",
+            )
+            .unwrap();
+        let task = prompt
+            .tools
+            .iter()
+            .find(|tool| tool.name == "Task")
+            .unwrap();
+        assert!(task.description.contains("Configured [provider-model]"));
+        assert!(task
+            .description
+            .contains("effort: low, high; context: 272k, 1m"));
+        assert!(!task.description.contains("{{AVAILABLE_SUBAGENT_MODELS}}"));
+    }
 }

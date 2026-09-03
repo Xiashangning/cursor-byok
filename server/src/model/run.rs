@@ -6,7 +6,7 @@ use super::{
     ToolRoundAssistant,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SubagentKind {
     GeneralPurpose,
     Named(String),

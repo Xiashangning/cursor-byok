@@ -140,7 +140,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             .as_path(),
     )
     .unwrap();
-    assert_eq!(assets.mode(Mode::Agent).tools.len(), 21);
+    assert_eq!(assets.mode(Mode::Agent).tools.len(), 24);
     assert_eq!(
         assets
             .mode(Mode::Agent)
@@ -168,6 +168,9 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "FetchMcpResource",
             "SwitchMode",
             "CallMcpTool",
+            "create-agent",
+            "send-message-to-agent",
+            "AWAIT",
             "SembleSearch",
             "SembleFindRelated",
         ]
@@ -194,7 +197,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "98bb57a9ade7f1a572c5c5fe77a905a129d28ecfd42b8d318250f6486b09e1ec",
+        "9908d81fca823c2726b59cf6a3b16d6e81a56646b0bc45470057ef66f212ef79",
     );
     assert_mode(
         &assets,
@@ -216,7 +219,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "9a7e0f9e0bd8ef0af01032fa311686f72c42ec260e3057f6fae5e68f5ed36fb8",
+        "67310e29ea29729c155975ec760bc95839442b46a32d95a44ed86f765116b797",
     );
     assert_mode(
         &assets,
@@ -240,7 +243,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "98bb57a9ade7f1a572c5c5fe77a905a129d28ecfd42b8d318250f6486b09e1ec",
+        "9908d81fca823c2726b59cf6a3b16d6e81a56646b0bc45470057ef66f212ef79",
     );
     assert_mode(
         &assets,
@@ -263,10 +266,13 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "WebSearch",
             "Write",
             "GenerateImage",
+            "create-agent",
+            "send-message-to-agent",
+            "AWAIT",
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "976b309dd91e314d4916439ebb9da8995751d011532e39934a1da7593dc78ccb",
+        "3fe2a87befe80e980fdcd8c3257d689ba52421dbbd922f15679b13ebb219d7c7",
     );
     assert_mode(
         &assets,
@@ -303,7 +309,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
     );
     assert_eq!(
         schema_digest(&assets.mode(Mode::Agent).tools),
-        "282a1dff7957090d0a75eac4a46474ac7cffa1b0937bdf97354544e729bb15c2"
+        "3eb4fc1dd2a125bd7cf31e2498ba029288453e144ab905b070bd67cf36a6db16"
     );
     let task = assets
         .mode(Mode::Agent)

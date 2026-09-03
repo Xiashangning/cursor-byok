@@ -18,6 +18,7 @@ import { addIcon } from "../../shared/ui/icons";
 import { useMessage } from "../../shared/ui/message";
 import { PageActions } from "../../shell/PageActions";
 import { appStore, useAppStore } from "../../shared/store/appStore";
+import { parseTokenCount } from "../../shared/utils/modelDefaults";
 
 export function CursorSettingsPage() {
   const { models, cursorHarness, cursorBusy, plugins } = useAppStore();
@@ -333,7 +334,7 @@ export function CursorSettingsPage() {
 
 function modelInput(model: Model): ModelInput {
   const { model_hash: _hash, created_at_ms: _created, updated_at_ms: _updated, ...input } = model;
-  return input;
+  return { ...input, effort_options: [...model.effort_options], context_options: [...model.context_options] };
 }
 
 /** 组内所有模型取值一致时返回该值,否则返回 null(表单留空表示保持不变)。 */
@@ -356,10 +357,13 @@ function draftInput(draft: CursorModelDraft): ModelInput {
     anthropic_extra_params: parseObject(draft.anthropicExtraParamsText, t("Anthropic 额外参数")),
   };
   if (!model.display_name || !model.base_url || !model.api_key || !model.tooltip_data || !model.model_id) throw new Error(t("服务器地址或完整请求 URL、API Key、模型名称、显示名称和备注不能为空"));
-  for (const [label, value] of [[t("上下文窗口 Token"), model.context_window_tokens], [t("最大输出 Token"), model.type === "openai" ? model.max_completion_tokens : model.anthropic_max_tokens], [t("思考预算 Token"), model.thinking_budget_tokens]] as const) {
+  for (const [label, value] of [[t("最大输出 Token"), model.type === "openai" ? model.max_completion_tokens : model.anthropic_max_tokens], [t("思考预算 Token"), model.thinking_budget_tokens]] as const) {
     if (value !== null && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(t("{label} 必须是大于 0 的整数", { label }));
   }
-  return model;
+  if (!model.effort_options.length) throw new Error(t("至少需要一个 effort 选项"));
+  if (!model.context_options.length || model.context_options.some((value) => !/^\d+[km]?$/i.test(value))) throw new Error(t("Context 选项必须是逗号分隔的 token 数，例如 200k, 1m"));
+  // 上下文窗口不再是独立输入：默认取 Context 选项列表第一项
+  return { ...model, context_window_tokens: parseTokenCount(model.context_options[0]) };
 }
 
 function parseHeaders(text: string): Record<string, string> {

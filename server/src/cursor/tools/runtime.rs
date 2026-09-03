@@ -9,7 +9,11 @@ use std::{
 
 use tokio::sync::Mutex;
 
-use crate::{cursor::protocol::proto::agent::v1 as pb, model::ToolCall, Error, Result};
+use crate::{
+    cursor::protocol::proto::agent::v1 as pb,
+    model::{SubagentKind, ToolCall},
+    Error, Result,
+};
 
 use super::edit::EditWrite;
 
@@ -43,9 +47,11 @@ pub struct ExecContext {
     pub conversation_id: String,
     pub root_conversation_id: String,
     pub default_subagent_model: String,
-    pub subagent_model: Option<SubagentModel>,
+    pub default_subagent_model_variant: Option<String>,
+    pub model_aliases: HashMap<String, String>,
+    pub model_variant_defaults: HashMap<String, (String, String)>,
+    pub subagent_models: HashMap<SubagentKind, SubagentModel>,
     pub allow_subagents: bool,
-    pub subagents_disabled: bool,
     pub terminals_folder: String,
     pub admin_command_denylist: Vec<String>,
     pub mcp_routes: HashMap<(String, String), McpRoute>,
@@ -62,15 +68,72 @@ pub struct McpRoute {
 #[derive(Clone, Debug)]
 pub enum SubagentModel {
     Model(String),
+    Inherit,
     Disabled,
 }
 
+/// Tools that delegate work to subagents. The prompt omits them and the runtime
+/// rejects them when subagents are disabled for a run.
+pub(crate) fn is_orchestration_tool(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "task" | "create-agent" | "send-message-to-agent"
+    )
+}
+
+pub(crate) fn subagent_kind(value: &str) -> SubagentKind {
+    if value == "generalPurpose" {
+        SubagentKind::GeneralPurpose
+    } else {
+        SubagentKind::Named(value.into())
+    }
+}
+
+fn task_parameter(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    id: &str,
+) -> Option<String> {
+    let value = arguments.get("model_parameters")?;
+    let values = match value {
+        serde_json::Value::Array(values) => values.iter().collect::<Vec<_>>(),
+        serde_json::Value::Object(_) => vec![value],
+        _ => return None,
+    };
+    values.into_iter().find_map(|value| {
+        let object = value.as_object()?;
+        (object.get("id").and_then(serde_json::Value::as_str) == Some(id))
+            .then(|| object.get("value").and_then(serde_json::Value::as_str))
+            .flatten()
+            .map(str::to_string)
+    })
+}
+
 impl ExecContext {
+    fn canonical_model(&self, model: &str) -> String {
+        self.model_aliases
+            .get(model)
+            .or_else(|| self.model_aliases.get(&model.to_ascii_lowercase()))
+            .cloned()
+            .unwrap_or_else(|| model.to_string())
+    }
+
+    pub(crate) fn subagent_model_for(&self, subagent_type: &str) -> Option<&SubagentModel> {
+        self.subagent_models.get(&subagent_kind(subagent_type))
+    }
+
     pub fn task_disabled(&self, call: &ToolCall) -> bool {
-        if !call.name.eq_ignore_ascii_case("Task") {
+        if !is_orchestration_tool(&call.name) {
             return false;
         }
-        self.subagents_disabled || matches!(self.subagent_model, Some(SubagentModel::Disabled))
+        let subagent_type = call
+            .arguments
+            .get("subagent_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("generalPurpose");
+        matches!(
+            self.subagent_model_for(subagent_type),
+            Some(SubagentModel::Disabled)
+        )
     }
 
     pub fn prepare_call(&self, call: &ToolCall) -> Result<ToolCall> {
@@ -88,15 +151,55 @@ impl ExecContext {
         if self.task_disabled(call) {
             return Ok(call.clone());
         }
-        let model = match &self.subagent_model {
+        let override_model = self.subagent_model_for(subagent_type);
+        let inherits_default = match override_model {
+            Some(SubagentModel::Model(_)) | Some(SubagentModel::Disabled) => false,
+            Some(SubagentModel::Inherit) => true,
+            None => arguments
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|model| model == "inherit"),
+        };
+        let model = match override_model {
             Some(SubagentModel::Model(model)) => model.clone(),
+            Some(SubagentModel::Inherit) => self
+                .default_subagent_model_variant
+                .clone()
+                .unwrap_or_else(|| self.default_subagent_model.clone()),
             Some(SubagentModel::Disabled) => unreachable!("disabled Task returned above"),
             None => arguments
                 .get("model")
                 .and_then(serde_json::Value::as_str)
                 .filter(|model| *model != "inherit")
-                .unwrap_or(&self.default_subagent_model)
-                .to_string(),
+                .map_or_else(
+                    || {
+                        self.default_subagent_model_variant
+                            .clone()
+                            .unwrap_or_else(|| self.default_subagent_model.clone())
+                    },
+                    str::to_owned,
+                ),
+        };
+        let model = if inherits_default {
+            model
+        } else {
+            self.canonical_model(&model)
+        };
+        let model = if let Some((default_context, default_effort)) =
+            self.model_variant_defaults.get(&model)
+        {
+            let has_parameters = arguments.contains_key("model_parameters");
+            if has_parameters {
+                let context =
+                    task_parameter(arguments, "context").unwrap_or_else(|| default_context.clone());
+                let effort =
+                    task_parameter(arguments, "effort").unwrap_or_else(|| default_effort.clone());
+                format!("{model}-{context}-{effort}")
+            } else {
+                model
+            }
+        } else {
+            model
         };
         if model.is_empty() {
             return Err(Error::Protocol(format!(
@@ -364,4 +467,162 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "task-1".into(),
+            model_call_id: "model-call-1".into(),
+            name: "Task".into(),
+            arguments_text: arguments.to_string(),
+            arguments,
+            argument_error: None,
+        }
+    }
+
+    #[test]
+    fn inherited_task_keeps_the_parent_model_variant() {
+        let context = ExecContext {
+            default_subagent_model: "deepseek-hash".into(),
+            default_subagent_model_variant: Some("deepseek-hash-1m-max".into()),
+            model_variant_defaults: HashMap::from([(
+                "deepseek-hash".into(),
+                ("1m".into(), "high".into()),
+            )]),
+            ..ExecContext::default()
+        };
+        let call = task(serde_json::json!({
+            "prompt": "inspect",
+            "model": "inherit"
+        }));
+
+        assert_eq!(
+            context.prepare_call(&call).unwrap().arguments["model"],
+            "deepseek-hash-1m-max"
+        );
+    }
+
+    #[test]
+    fn model_aliases_canonicalize_display_names_and_slugs() {
+        let context = ExecContext {
+            default_subagent_model: "parent-model".into(),
+            model_aliases: HashMap::from([
+                ("DeepSeek Flash".into(), "hash-deepseek".into()),
+                ("deepseek flash".into(), "hash-deepseek".into()),
+                ("hash-deepseek-1m-low".into(), "hash-deepseek".into()),
+            ]),
+            model_variant_defaults: HashMap::from([(
+                "hash-deepseek".into(),
+                ("1m".into(), "high".into()),
+            )]),
+            ..ExecContext::default()
+        };
+        for model in ["DeepSeek Flash", "hash-deepseek-1m-low"] {
+            let call = task(serde_json::json!({"prompt":"inspect", "model": model}));
+            assert_eq!(
+                context.prepare_call(&call).unwrap().arguments["model"],
+                "hash-deepseek"
+            );
+        }
+        let parameterized = task(serde_json::json!({
+            "prompt":"inspect",
+            "model":"DeepSeek Flash",
+            "model_parameters":[{"id":"effort","value":"low"}]
+        }));
+        assert_eq!(
+            context.prepare_call(&parameterized).unwrap().arguments["model"],
+            "hash-deepseek-1m-low"
+        );
+    }
+
+    #[test]
+    fn task_model_defaults_to_parent_and_honors_an_explicit_model() {
+        let context = ExecContext {
+            default_subagent_model: "parent-model".into(),
+            ..ExecContext::default()
+        };
+        let inherited = context
+            .prepare_call(&task(serde_json::json!({"prompt":"inspect"})))
+            .unwrap();
+        let explicit = context
+            .prepare_call(&task(serde_json::json!({
+                "prompt":"inspect",
+                "model":"child-model"
+            })))
+            .unwrap();
+
+        assert_eq!(inherited.arguments["model"], "parent-model");
+        assert_eq!(explicit.arguments["model"], "child-model");
+    }
+
+    #[test]
+    fn subagent_models_are_selected_by_task_type() {
+        let context = ExecContext {
+            default_subagent_model: "parent-model".into(),
+            subagent_models: HashMap::from([
+                (
+                    SubagentKind::Named("explore".into()),
+                    SubagentModel::Model("explore-model".into()),
+                ),
+                (SubagentKind::Named("shell".into()), SubagentModel::Inherit),
+            ]),
+            ..ExecContext::default()
+        };
+        let explore = task(serde_json::json!({
+            "prompt":"inspect",
+            "subagent_type":"explore",
+            "model":"gpt-5.6-sol"
+        }));
+        let shell = task(serde_json::json!({
+            "prompt":"inspect",
+            "subagent_type":"shell",
+            "model":"k3-256k"
+        }));
+
+        assert_eq!(
+            context.prepare_call(&explore).unwrap().arguments["model"],
+            "explore-model"
+        );
+        assert_eq!(
+            context.prepare_call(&shell).unwrap().arguments["model"],
+            "parent-model"
+        );
+    }
+
+    #[test]
+    fn disabled_subagent_type_only_disables_that_type() {
+        let context = ExecContext {
+            default_subagent_model: "parent-model".into(),
+            subagent_models: HashMap::from([(
+                SubagentKind::Named("shell".into()),
+                SubagentModel::Disabled,
+            )]),
+            ..ExecContext::default()
+        };
+        let shell = task(serde_json::json!({
+            "prompt":"inspect",
+            "subagent_type":"shell"
+        }));
+        let explore = task(serde_json::json!({
+            "prompt":"inspect",
+            "subagent_type":"explore"
+        }));
+
+        assert!(context.task_disabled(&shell));
+        assert!(!context.task_disabled(&explore));
+        assert!(context
+            .prepare_call(&shell)
+            .unwrap()
+            .arguments
+            .get("model")
+            .is_none());
+        assert_eq!(
+            context.prepare_call(&explore).unwrap().arguments["model"],
+            "parent-model"
+        );
+    }
 }

@@ -454,11 +454,21 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
+            let consumed_completion_table_exists: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'consumed_background_completions'
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
             assert_eq!(checksum_after, checksum_before);
-            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
             assert_eq!(checkpoint_table_exists, 1);
             assert_eq!(argument_error_column_exists, 1);
+            assert_eq!(consumed_completion_table_exists, 1);
         }
     }
 
@@ -474,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn stalled_migration_stage_returns_a_timeout_error() {
         let result = run_stage_with_limits(
-            "0006 rename revisions to checkpoints",
+            "0007 rename revisions to checkpoints",
             Duration::from_millis(2),
             Duration::from_millis(10),
             std::future::pending(),
@@ -484,7 +494,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(Error::MigrationTimeout { stage, .. })
-                if stage == "0006 rename revisions to checkpoints"
+                if stage == "0007 rename revisions to checkpoints"
         ));
     }
 }

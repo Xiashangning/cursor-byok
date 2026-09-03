@@ -365,7 +365,9 @@ fn map_finish(value: &str, has_tools: bool) -> FinishReason {
     match value {
         "tool_calls" | "function_call" => FinishReason::ToolUse,
         "length" => FinishReason::Length,
-        "stop" | "content_filter" => FinishReason::Stop,
+        // Observed tool calls outrank whatever the provider labelled the stop:
+        // OpenAI-compatible servers routinely report "stop" while streaming tool
+        // calls, and the run rejects a finish reason that contradicts them.
         _ if has_tools => FinishReason::ToolUse,
         _ => FinishReason::Stop,
     }
@@ -431,5 +433,32 @@ pub(crate) fn openai_usage(value: &Value) -> Usage {
         reasoning_tokens: value
             .pointer("/completion_tokens_details/reasoning_tokens")
             .and_then(Value::as_u64),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observed_tool_calls_outrank_a_stop_finish_reason() {
+        assert_eq!(map_finish("stop", true), FinishReason::ToolUse);
+        assert_eq!(map_finish("content_filter", true), FinishReason::ToolUse);
+        assert_eq!(map_finish("", true), FinishReason::ToolUse);
+    }
+
+    #[test]
+    fn finish_reason_mapping_without_tool_calls_is_unchanged() {
+        assert_eq!(map_finish("stop", false), FinishReason::Stop);
+        assert_eq!(map_finish("content_filter", false), FinishReason::Stop);
+        assert_eq!(map_finish("", false), FinishReason::Stop);
+        assert_eq!(map_finish("tool_calls", false), FinishReason::ToolUse);
+        assert_eq!(map_finish("function_call", false), FinishReason::ToolUse);
+    }
+
+    #[test]
+    fn a_truncated_response_stays_truncated_even_with_tool_calls() {
+        assert_eq!(map_finish("length", true), FinishReason::Length);
+        assert_eq!(map_finish("length", false), FinishReason::Length);
     }
 }

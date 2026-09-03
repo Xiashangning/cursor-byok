@@ -201,6 +201,6 @@ impl CursorHarness {
 }
 
 async fn apply_cursor_configuration(proxy_url: &str) -> Result<()> {
-    account::inject_if_missing().await?;
+    account::ensure_local_account().await?;
     settings::write_proxy_settings(proxy_url)
 }

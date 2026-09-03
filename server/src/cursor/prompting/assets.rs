@@ -17,6 +17,8 @@ pub enum Mode {
     Multitask,
     Subagent,
     Compaction,
+    Projects,
+    Orchestrator,
 }
 
 impl Mode {
@@ -29,6 +31,8 @@ impl Mode {
             "multitask" => Ok(Self::Multitask),
             "subagent" => Ok(Self::Subagent),
             "compaction" => Ok(Self::Compaction),
+            "projects" | "project" => Ok(Self::Projects),
+            "orchestrator" => Ok(Self::Orchestrator),
             other => Err(Error::Config(format!("unknown prompt mode: {other}"))),
         }
     }
@@ -42,6 +46,8 @@ impl Mode {
             Self::Multitask => "multitask",
             Self::Subagent => "subagent",
             Self::Compaction => "compaction",
+            Self::Projects => "projects",
+            Self::Orchestrator => "orchestrator",
         }
     }
 
@@ -54,6 +60,8 @@ impl Mode {
             Self::Multitask => 4,
             Self::Subagent => 5,
             Self::Compaction => 6,
+            Self::Projects => 7,
+            Self::Orchestrator => 8,
         }
     }
 }
@@ -67,7 +75,7 @@ pub struct ModeAssets {
 
 #[derive(Clone, Debug)]
 pub struct PromptAssets {
-    modes: [ModeAssets; 7],
+    modes: [ModeAssets; 9],
 }
 
 impl PromptAssets {
@@ -98,7 +106,7 @@ impl PromptAssets {
             &asset("tools.json")?
                 .ok_or_else(|| Error::Config("missing Cursor tools.json".into()))?,
         )?;
-        let mut modes = Vec::with_capacity(7);
+        let mut modes = Vec::with_capacity(9);
         for mode in [
             Mode::Agent,
             Mode::Ask,
@@ -107,6 +115,8 @@ impl PromptAssets {
             Mode::Multitask,
             Mode::Subagent,
             Mode::Compaction,
+            Mode::Projects,
+            Mode::Orchestrator,
         ] {
             let prompt = asset(&format!("{}/prompt.md", mode.name()))?
                 .ok_or_else(|| Error::Config(format!("missing prompt for {mode:?}")))?;
@@ -177,4 +187,53 @@ pub(super) fn runtime_expression() -> &'static regex::Regex {
     EXPRESSION.get_or_init(|| {
         regex::Regex::new(r"\{\{([A-Z_]+)\}\}").expect("valid runtime placeholder expression")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_semble_tools_are_available_in_every_working_mode() {
+        let assets = PromptAssets::embedded().unwrap();
+        for mode in [
+            Mode::Agent,
+            Mode::Ask,
+            Mode::Plan,
+            Mode::Debug,
+            Mode::Multitask,
+            Mode::Subagent,
+        ] {
+            let names = assets
+                .mode(mode)
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(names.contains(&"SembleSearch"), "missing in {mode:?}");
+            assert!(names.contains(&"SembleFindRelated"), "missing in {mode:?}");
+        }
+    }
+
+    #[test]
+    fn project_and_orchestrator_assets_expose_background_coordination_tools() {
+        let assets = PromptAssets::embedded().unwrap();
+        for mode in [Mode::Projects, Mode::Orchestrator] {
+            let names = assets
+                .mode(mode)
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                names.contains(&"create-agent"),
+                "missing create-agent in {mode:?}"
+            );
+            assert!(
+                names.contains(&"send-message-to-agent"),
+                "missing send-message-to-agent in {mode:?}"
+            );
+            assert!(names.contains(&"AWAIT"), "missing AWAIT in {mode:?}");
+        }
+    }
 }

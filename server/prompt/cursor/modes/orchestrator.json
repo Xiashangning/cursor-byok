@@ -1,0 +1,8 @@
+{
+  "tools": [
+    "AskQuestion", "CallMcpTool", "Delete", "FetchMcpResource", "Glob",
+    "Grep", "Read", "ReadLints", "Shell", "StrReplace", "Task", "TodoWrite",
+    "WebFetch", "WebSearch", "Write", "create-agent", "send-message-to-agent",
+    "AWAIT", "SembleSearch", "SembleFindRelated"
+  ]
+}

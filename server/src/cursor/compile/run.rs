@@ -1,5 +1,5 @@
 //! Compiles an AgentRunRequest into a PreparedRun.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use uuid::Uuid;
 
@@ -11,7 +11,7 @@ use crate::{
         protocol::proto::agent::v1 as pb,
         services::blob_sync::BlobSynchronizer,
         services::context_sync::RequestContextSynchronizer,
-        tools::runtime::{ExecContext, SubagentModel},
+        tools::runtime::{is_orchestration_tool, ExecContext, SubagentModel},
     },
     model::{
         CanonicalMessage, ContentPart, ConversationId, MessageContent, Origin, PreparedRun,
@@ -124,6 +124,13 @@ pub(crate) async fn prepare(
         context::merge_local_rules(&mut request_context, rules_dir);
     }
     let request_context = request_context;
+    let explicit_resume = matches!(
+        request
+            .action
+            .as_ref()
+            .and_then(|action| action.action.as_ref()),
+        Some(pb::conversation_action::Action::ResumeAction(_))
+    );
     let ActionProjection {
         mode: mode_number,
         mut turn_user,
@@ -134,23 +141,59 @@ pub(crate) async fn prepare(
         compacting,
         background_completion,
     } = action(request)?;
+    let pending_tool_round = if !starts_turn && !compacting {
+        match request
+            .conversation_state
+            .as_ref()
+            .map(|state| state.pending_tool_calls.as_slice())
+            .unwrap_or_default()
+        {
+            [] => None,
+            [pending] => Some(messages::decode_pending(pending)?),
+            pending => {
+                return Err(Error::Protocol(format!(
+                    "Cursor resume contains {} pending assistant messages",
+                    pending.len()
+                )))
+            }
+        }
+    } else {
+        None
+    };
     let checkpoint_mode = if request.subagent_type_name.is_some() {
         Mode::Subagent
     } else {
         mode_from_proto(mode_number)?
     };
     let mut model = model::requested_model(request)?;
-    if let Some(configured_model) = store.model(&model.model_id).await? {
+    let requested_model_id = model.model_id.clone();
+    let mut inherited_subagent_model_variant = None;
+    if let Some(configured_model) = store.resolve_model(&model.model_id).await? {
+        model.model_id = configured_model.model_hash.clone();
         configured_model.configure(&mut model);
+        if let Some((context, effort)) =
+            model_variant_parameters(&requested_model_id, &configured_model)
+        {
+            model.context_window_tokens = Some(context);
+            model.reasoning.effort = Some(effort);
+            model.reasoning.enabled = true;
+        }
+        inherited_subagent_model_variant = model_variant_id(&configured_model, &model);
     }
     let dynamic = context::dynamic_mcp(request, &request_context)?;
     let subagent_model_overrides = model::overrides(request)?;
-    let subagents_disabled = subagent_model_overrides
-        .first()
-        .is_some_and(|(_, selection)| {
+    let model_aliases = load_model_aliases(store).await?;
+    let model_variant_defaults = load_model_variant_defaults(store).await?;
+    let subagents_disabled = !subagent_model_overrides.is_empty()
+        && subagent_model_overrides.iter().all(|(_, selection)| {
             matches!(selection, crate::model::SubagentModelOverride::Disabled)
         });
-    let mut checkpoint_prompt = compiler.prompt_spec(
+    let available_subagent_models = if compiler.needs_available_subagent_models(checkpoint_mode) {
+        load_available_subagent_models(store).await?
+    } else {
+        String::new()
+    };
+    let mut checkpoint_prompt = compiler.prompt_spec_with_available_subagent_models(
         checkpoint_mode,
         &model,
         &dynamic
@@ -158,12 +201,21 @@ pub(crate) async fn prepare(
             .map(|(_, definition)| definition.clone())
             .collect::<Vec<_>>(),
         request.suppress_subagent_progress_update_tool == Some(true),
+        &available_subagent_models,
     )?;
     if subagents_disabled {
-        checkpoint_prompt.tools.retain(|tool| tool.name != "Task");
+        checkpoint_prompt
+            .tools
+            .retain(|tool| !is_orchestration_tool(&tool.name));
     }
     let prompt = if compacting {
-        compiler.prompt_spec(Mode::Compaction, &model, &[], false)?
+        compiler.prompt_spec_with_available_subagent_models(
+            Mode::Compaction,
+            &model,
+            &[],
+            false,
+            &available_subagent_models,
+        )?
     } else {
         checkpoint_prompt.clone()
     };
@@ -294,6 +346,14 @@ pub(crate) async fn prepare(
             }
         }
     };
+    if explicit_resume {
+        initial_messages.extend(break_messages::compile_resume_messages(
+            request_id,
+            &request_context,
+            base_messages.as_deref().unwrap_or_default(),
+            pending_tool_round.is_some(),
+        )?);
+    }
     let (base_checkpoint_id, reused) = store
         .match_checkpoint_prefix(&conversation_id, base_checkpoint_id, &initial_messages)
         .await?;
@@ -303,21 +363,6 @@ pub(crate) async fn prepare(
     } else if starts_turn {
         RunAction::Start
     } else {
-        let pending_tool_round = match request
-            .conversation_state
-            .as_ref()
-            .map(|state| state.pending_tool_calls.as_slice())
-            .unwrap_or_default()
-        {
-            [] => None,
-            [pending] => Some(messages::decode_pending(pending)?),
-            pending => {
-                return Err(Error::Protocol(format!(
-                    "Cursor resume contains {} pending assistant messages",
-                    pending.len()
-                )))
-            }
-        };
         RunAction::Resume { pending_tool_round }
     };
     let exec = exec_context(
@@ -325,7 +370,9 @@ pub(crate) async fn prepare(
         &request_context,
         &conversation_id,
         &model.model_id,
-        subagents_disabled,
+        inherited_subagent_model_variant.clone(),
+        &model_aliases,
+        &model_variant_defaults,
         &subagent_model_overrides,
     );
     Ok((
@@ -354,6 +401,118 @@ pub(crate) async fn prepare(
             background_completion,
         },
     ))
+}
+
+fn model_variant_parameters(key: &str, model: &crate::model::ModelConfig) -> Option<(u64, String)> {
+    let suffix = key.strip_prefix(&format!("{}-", model.model_hash))?;
+    let mut contexts = model.context_options.clone();
+    if let Some(tokens) = model.context_window_tokens {
+        let bare = tokens.to_string();
+        if !contexts.iter().any(|value| value == &bare) {
+            contexts.push(bare);
+        }
+    }
+    contexts.iter().find_map(|context| {
+        model.effort_options.iter().find_map(|effort| {
+            let matches = suffix == format!("{context}-{effort}")
+                || suffix == format!("{context}-{effort}-fast");
+            matches
+                .then(|| Some((crate::model::parse_token_count(context)?, effort.clone())))
+                .flatten()
+        })
+    })
+}
+
+fn model_variant_id(
+    model: &crate::model::ModelConfig,
+    selected: &crate::model::ModelSpec,
+) -> Option<String> {
+    let context = selected.context_window_tokens?;
+    let effort = selected.reasoning.effort.as_deref()?;
+    let context = model
+        .context_options
+        .iter()
+        .find(|value| crate::model::parse_token_count(value) == Some(context))
+        .cloned()
+        .unwrap_or_else(|| context.to_string());
+    Some(format!("{}-{context}-{effort}", model.model_hash))
+}
+
+async fn load_model_aliases(store: &Store) -> Result<HashMap<String, String>> {
+    let models = store.models().await?;
+    let mut aliases = HashMap::new();
+    for model in models {
+        let hash = model.model_hash.clone();
+        for alias in [&model.model_hash, &model.model_id, &model.display_name] {
+            aliases.insert((*alias).clone(), hash.clone());
+            aliases.insert(alias.to_ascii_lowercase(), hash.clone());
+        }
+        let mut contexts = model.context_options.clone();
+        if let Some(tokens) = model.context_window_tokens {
+            let bare = tokens.to_string();
+            if !contexts.iter().any(|value| value == &bare) {
+                contexts.push(bare);
+            }
+        }
+        for context in contexts {
+            for effort in &model.effort_options {
+                for suffix in [
+                    format!("{context}-{effort}"),
+                    format!("{context}-{effort}-fast"),
+                ] {
+                    let alias = format!("{}-{suffix}", model.model_hash);
+                    aliases.insert(alias.clone(), hash.clone());
+                    aliases.insert(alias.to_ascii_lowercase(), hash.clone());
+                }
+            }
+        }
+    }
+    Ok(aliases)
+}
+
+async fn load_model_variant_defaults(store: &Store) -> Result<HashMap<String, (String, String)>> {
+    let models = store.models().await?;
+    Ok(models
+        .into_iter()
+        .map(|model| {
+            let context = model
+                .context_window_tokens
+                .and_then(|tokens| {
+                    model
+                        .context_options
+                        .iter()
+                        .find(|value| crate::model::parse_token_count(value) == Some(tokens))
+                        .cloned()
+                        .or_else(|| Some(tokens.to_string()))
+                })
+                .or_else(|| model.context_options.first().cloned())
+                .unwrap_or_else(|| "200k".into());
+            let effort = model
+                .effort_options
+                .iter()
+                .find(|value| value.as_str() == "high")
+                .cloned()
+                .or_else(|| model.effort_options.first().cloned())
+                .unwrap_or_else(|| "high".into());
+            (model.model_hash, (context, effort))
+        })
+        .collect())
+}
+
+fn format_available_subagent_model(model: &crate::model::ModelConfig) -> String {
+    format!(
+        "- {} — effort: {}; context: {}",
+        model.display_name,
+        model.effort_options.join(", "),
+        model.context_options.join(", "),
+    )
+}
+
+async fn load_available_subagent_models(store: &Store) -> Result<String> {
+    let models = store.models().await?;
+    let mut lines = vec!["- inherit".to_string()];
+    lines.extend(models.iter().map(format_available_subagent_model));
+    Ok(lines.join("\n"))
 }
 
 fn runtime_message_text(message: &CanonicalMessage) -> Result<String> {
@@ -397,6 +556,17 @@ fn validate_prompt_root(messages: &[CanonicalMessage]) -> Result<()> {
 fn execution_run_id(request_id: &str) -> RunId {
     let execution_id = Uuid::new_v4().simple().to_string();
     RunId::new(format!("{request_id}:{}", &execution_id[..8]))
+}
+
+pub(crate) fn background_completion_fully_consumed(request: &pb::AgentRunRequest) -> bool {
+    let Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)) = request
+        .action
+        .as_ref()
+        .and_then(|action| action.action.as_ref())
+    else {
+        return false;
+    };
+    insert_messages::fully_consumed(action, request.conversation_state.as_ref())
 }
 
 fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
@@ -474,7 +644,8 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
             })
         }
         pb::conversation_action::Action::BackgroundTaskCompletionAction(action) => {
-            let projection = insert_messages::project(action, mode)?;
+            let projection =
+                insert_messages::project(action, mode, request.conversation_state.as_ref())?;
             let event_id = projection.turn_user.message_id.clone();
             Ok(ActionProjection {
                 mode,
@@ -568,6 +739,7 @@ pub(super) fn mode_from_proto(mode: i32) -> Result<Mode> {
         pb::AgentMode::Plan => Ok(Mode::Plan),
         pb::AgentMode::Debug => Ok(Mode::Debug),
         pb::AgentMode::Multitask => Ok(Mode::Multitask),
+        pb::AgentMode::Project => Ok(Mode::Projects),
         mode => Err(Error::Protocol(format!(
             "unsupported Cursor agent mode: {}",
             mode.as_str_name()
@@ -580,19 +752,27 @@ fn exec_context(
     request_context: &pb::RequestContext,
     conversation_id: &ConversationId,
     model_id: &str,
-    subagents_disabled: bool,
+    inherited_model_variant: Option<String>,
+    model_aliases: &HashMap<String, String>,
+    model_variant_defaults: &HashMap<String, (String, String)>,
     overrides: &[(
         crate::model::SubagentKind,
         crate::model::SubagentModelOverride,
     )],
 ) -> ExecContext {
-    let subagent_model = overrides.first().map(|(_, value)| match value {
-        crate::model::SubagentModelOverride::Explicit(model) => {
-            SubagentModel::Model(model.model_id.clone())
-        }
-        crate::model::SubagentModelOverride::Inherit => SubagentModel::Model(model_id.into()),
-        crate::model::SubagentModelOverride::Disabled => SubagentModel::Disabled,
-    });
+    let subagent_models = overrides
+        .iter()
+        .map(|(kind, value)| {
+            let model = match value {
+                crate::model::SubagentModelOverride::Explicit(model) => {
+                    SubagentModel::Model(model.model_id.clone())
+                }
+                crate::model::SubagentModelOverride::Inherit => SubagentModel::Inherit,
+                crate::model::SubagentModelOverride::Disabled => SubagentModel::Disabled,
+            };
+            (kind.clone(), model)
+        })
+        .collect();
     ExecContext {
         conversation_id: conversation_id.to_string(),
         root_conversation_id: request
@@ -600,9 +780,11 @@ fn exec_context(
             .clone()
             .unwrap_or_else(|| conversation_id.to_string()),
         default_subagent_model: model_id.into(),
-        subagent_model,
-        allow_subagents: request.subagent_type_name.is_none() && !subagents_disabled,
-        subagents_disabled,
+        default_subagent_model_variant: inherited_model_variant.clone(),
+        model_aliases: model_aliases.clone(),
+        model_variant_defaults: model_variant_defaults.clone(),
+        subagent_models,
+        allow_subagents: request.subagent_type_name.is_none(),
         terminals_folder: request_context
             .env
             .as_ref()
@@ -610,5 +792,222 @@ fn exec_context(
             .unwrap_or_default(),
         admin_command_denylist: request_context.admin_command_denylist.clone(),
         mcp_routes: context::meta_mcp_routes(request_context),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_subagent_model_line_omits_the_hash() {
+        let model = crate::model::ModelConfig {
+            model_hash: "abcd1234".into(),
+            sort_order: 0,
+            display_name: "Configured Model".into(),
+            group_name: None,
+            model_type: crate::model::ModelType::OpenAi,
+            base_url: String::new(),
+            use_full_url: false,
+            api_key: String::new(),
+            tooltip_data: String::new(),
+            model_id: "provider-model".into(),
+            reasoning_effort: Some("high".into()),
+            effort_options: vec!["low".into(), "high".into()],
+            context_options: vec!["272k".into(), "1m".into()],
+            openai_endpoint: String::new(),
+            openai_extra_params_enabled: false,
+            openai_extra_params: serde_json::json!({}),
+            custom_headers_enabled: false,
+            custom_headers: serde_json::json!({}),
+            anthropic_extra_params_enabled: false,
+            anthropic_extra_params: serde_json::json!({}),
+            context_window_tokens: None,
+            max_completion_tokens: None,
+            anthropic_max_tokens: None,
+            anthropic_thinking_effort: None,
+            thinking_budget_tokens: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        assert_eq!(
+            format_available_subagent_model(&model),
+            "- Configured Model — effort: low, high; context: 272k, 1m"
+        );
+        assert!(!format_available_subagent_model(&model).contains("abcd1234"));
+    }
+
+    #[test]
+    fn restored_system_root_is_structural_not_bound_to_the_next_model() {
+        let prompt = CanonicalMessage::text(
+            "root",
+            Role::System,
+            Origin::Prompt,
+            "prompt from the previous model",
+        );
+        validate_prompt_root(std::slice::from_ref(&prompt)).unwrap();
+        assert!(validate_prompt_root(&[prompt.clone(), prompt]).is_err());
+    }
+
+    #[test]
+    fn unsupported_cursor_mode_is_not_silently_treated_as_agent() {
+        assert_eq!(
+            mode_from_proto(pb::AgentMode::Agent as i32).unwrap(),
+            Mode::Agent
+        );
+        assert_eq!(
+            mode_from_proto(pb::AgentMode::Project as i32).unwrap(),
+            Mode::Projects
+        );
+        assert!(mode_from_proto(99).is_err());
+    }
+
+    #[test]
+    fn execution_run_id_keeps_the_request_id_and_adds_eight_uuid_hex_digits() {
+        let run_id = execution_run_id("01bba7c5-9c00-4922-b1df-1f58146b5d90");
+        let suffix = run_id
+            .as_str()
+            .strip_prefix("01bba7c5-9c00-4922-b1df-1f58146b5d90:")
+            .unwrap();
+
+        assert_eq!(suffix.len(), 8);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn current_user_message_consumes_the_mode_instead_of_history_mode() {
+        let request = pb::AgentRunRequest {
+            conversation_state: Some(pb::ConversationStateStructure {
+                mode: Some(pb::AgentMode::Agent as i32),
+                ..Default::default()
+            }),
+            action: Some(pb::ConversationAction {
+                action: Some(pb::conversation_action::Action::UserMessageAction(
+                    pb::UserMessageAction {
+                        user_message: Some(pb::UserMessage {
+                            text: "explain".into(),
+                            message_id: "user-message".into(),
+                            mode: pb::AgentMode::Ask as i32,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let projection = action(&request).unwrap();
+        assert_eq!(projection.mode, pb::AgentMode::Ask as i32);
+        assert_eq!(
+            projection.input_id.as_deref(),
+            Some("cursor:user:user-message")
+        );
+        assert_eq!(mode_from_proto(projection.mode).unwrap(), Mode::Ask);
+    }
+
+    #[test]
+    fn queued_user_message_without_mode_inherits_conversation_mode() {
+        let request = pb::AgentRunRequest {
+            conversation_state: Some(pb::ConversationStateStructure {
+                mode: Some(pb::AgentMode::Agent as i32),
+                ..Default::default()
+            }),
+            action: Some(pb::ConversationAction {
+                action: Some(pb::conversation_action::Action::UserMessageAction(
+                    pb::UserMessageAction {
+                        user_message: Some(pb::UserMessage {
+                            text: "queued follow-up".into(),
+                            message_id: "queued-user-message".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let projection = action(&request).unwrap();
+
+        assert_eq!(projection.mode, pb::AgentMode::Agent as i32);
+        assert_eq!(mode_from_proto(projection.mode).unwrap(), Mode::Agent);
+    }
+
+    #[test]
+    fn queued_messages_keep_distinct_input_anchors_until_runtime_identity_is_compiled() {
+        let request = |message_id: &str| pb::AgentRunRequest {
+            action: Some(pb::ConversationAction {
+                action: Some(pb::conversation_action::Action::UserMessageAction(
+                    pb::UserMessageAction {
+                        user_message: Some(pb::UserMessage {
+                            text: "queued follow-up".into(),
+                            message_id: message_id.into(),
+                            mode: pb::AgentMode::Agent as i32,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let first = action(&request("message-one")).unwrap();
+        let second = action(&request("message-two")).unwrap();
+
+        assert_eq!(first.event_id, None);
+        assert_eq!(second.event_id, None);
+        assert_eq!(first.input_id.as_deref(), Some("cursor:user:message-one"));
+        assert_eq!(second.input_id.as_deref(), Some("cursor:user:message-two"));
+        assert_ne!(first.input_id, second.input_id);
+    }
+
+    #[test]
+    fn execute_plan_appends_the_approved_plan_as_a_stable_runtime_event() {
+        let execute = pb::ExecutePlanAction {
+            plan_file_uri: Some("file:///workspace/example.plan.md".into()),
+            plan_file_content: Some("# Build\n\n- implement it".into()),
+            execution_mode: pb::AgentMode::Agent as i32,
+            ..Default::default()
+        };
+        let request = pb::AgentRunRequest {
+            action: Some(pb::ConversationAction {
+                action: Some(pb::conversation_action::Action::ExecutePlanAction(
+                    execute.clone(),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let first = action(&request).unwrap();
+        let second = action(&request).unwrap();
+        assert_eq!(first.mode, pb::AgentMode::Agent as i32);
+        assert!(first.starts_turn);
+        assert_eq!(first.event_id, second.event_id);
+        assert_eq!(first.input_id, None);
+        assert_eq!(
+            first.turn_user.as_ref().map(|user| user.text.as_str()),
+            Some("Execute the approved plan.")
+        );
+        assert!(first
+            .action_context
+            .contains("file:///workspace/example.plan.md"));
+        assert!(first.action_context.contains("# Build\n\n- implement it"));
+    }
+
+    #[test]
+    fn execute_plan_requires_content() {
+        let result = execute_plan(&pb::ExecutePlanAction {
+            execution_mode: pb::AgentMode::Agent as i32,
+            ..Default::default()
+        });
+        assert!(matches!(
+            result,
+            Err(Error::Protocol(message)) if message.contains("missing plan content")
+        ));
     }
 }

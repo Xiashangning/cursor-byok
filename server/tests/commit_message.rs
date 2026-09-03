@@ -51,6 +51,8 @@ fn model_input(model_id: &str) -> ModelConfigInput {
         tooltip_data: "模型介绍".into(),
         model_id: model_id.into(),
         reasoning_effort: None,
+        effort_options: Vec::new(),
+        context_options: Vec::new(),
         openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
         openai_extra_params_enabled: false,
         openai_extra_params: serde_json::json!({}),

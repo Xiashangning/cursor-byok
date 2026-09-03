@@ -26,6 +26,34 @@ export default defineConfig(async ({ command }) => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
+  build: {
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: "echarts",
+              test: /node_modules[\\/](echarts|zrender)\//,
+              priority: 20,
+            },
+            {
+              name: "chartjs",
+              test: /node_modules[\\/](chart\.js|react-chartjs-2)\//,
+              priority: 20,
+            },
+            {
+              name: "react-vendor",
+              test: /node_modules[\\/](react|react-dom|scheduler)\//,
+              priority: 10,
+            },
+          ],
+        },
+      },
+    },
+    // monaco-editor chunks are lazy-loaded and inherently large (editor.api ~2.6 MB);
+    // keep the warning meaningful for everything else.
+    chunkSizeWarningLimit: 2700,
+  },
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,

@@ -158,6 +158,7 @@ impl ConversationOutput {
         let mut streams = BTreeMap::<usize, ToolCallStream>::new();
         let mut completions = HashMap::<String, ToolCompletion>::new();
         let mut completed = HashSet::<String>::new();
+        let mut completed_round = None::<ToolRoundId>;
         let mut response_text = String::new();
         let mut response_thinking = String::new();
         let mut active_round = None::<ToolRoundId>;
@@ -425,6 +426,16 @@ impl ConversationOutput {
                         round_id,
                         calls: round_calls,
                     } => {
+                        // `completed` exists so that replaying ExecuteToolRound for a round
+                        // does not dispatch a call this round already committed. Tool call ids
+                        // are only unique *within* a round -- the schema says as much with
+                        // `UNIQUE (round_id, call_id)` -- so an id retained from an earlier
+                        // round would make start_batch skip a fresh call, and tool_round wait
+                        // forever for a result nothing will ever produce.
+                        if completed_round.as_ref() != Some(&round_id) {
+                            completed.clear();
+                            completed_round = Some(round_id.clone());
+                        }
                         active_round = Some(round_id.clone());
                         active_tool_calls = round_calls
                             .iter()

@@ -170,6 +170,14 @@ fn model_input(model: LegacyModel) -> Result<ModelConfigInput> {
         },
         model_id: model.model_id,
         reasoning_effort: optional_string(model.reasoning_effort),
+        effort_options: crate::model::DEFAULT_EFFORT_OPTIONS
+            .iter()
+            .map(|value| (*value).into())
+            .collect(),
+        context_options: crate::model::DEFAULT_CONTEXT_OPTIONS
+            .iter()
+            .map(|value| (*value).into())
+            .collect(),
         openai_endpoint,
         openai_extra_params_enabled: model.openai_extra_params_enabled,
         openai_extra_params: enabled_json_object(

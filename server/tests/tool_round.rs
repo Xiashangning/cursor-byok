@@ -48,11 +48,13 @@ fn exec_context() -> ExecContext {
         conversation_id: "conversation".into(),
         root_conversation_id: "conversation".into(),
         default_subagent_model: "model".into(),
-        subagent_model: None,
+        default_subagent_model_variant: None,
+        model_aliases: std::collections::HashMap::new(),
+        model_variant_defaults: std::collections::HashMap::new(),
+        subagent_models: std::collections::HashMap::new(),
         terminals_folder: "/tmp/terminals".into(),
         admin_command_denylist: Vec::new(),
         allow_subagents: true,
-        subagents_disabled: false,
         mcp_routes: std::collections::HashMap::new(),
     }
 }
@@ -839,6 +841,8 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
             tooltip_data: "Repeated compaction".into(),
             model_id: "repeated-compaction-model".into(),
             reasoning_effort: None,
+            effort_options: Vec::new(),
+            context_options: Vec::new(),
             openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
             openai_extra_params_enabled: false,
             openai_extra_params: json!({}),
@@ -1251,6 +1255,151 @@ fn client_run_for_model(
             },
         )),
     }
+}
+
+/// A provider that reuses a tool call id across two rounds of the same run
+/// must not wedge the run. `ToolDispatcher::start_batch` skips any call whose
+/// id is already in `ToolBatchState::completed`, and that set is never cleared
+/// for the lifetime of the run, so the skipped call produced no completion and
+/// `tool_round::execute` waited forever for a result that could never arrive.
+#[tokio::test]
+async fn duplicate_tool_call_id_across_rounds_does_not_wedge_the_run() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    for _ in 0..2 {
+        provider.push(vec![
+            ModelEvent::Start {
+                model_call_id: "ignored".into(),
+            },
+            ModelEvent::ToolCallStart {
+                index: 0,
+                call_id: "call-1".into(),
+                name: "Read".into(),
+            },
+            ModelEvent::ToolCallArgumentsDelta {
+                index: 0,
+                delta: "{\"path\":\"/tmp/a\"}".into(),
+            },
+            ModelEvent::ToolCallEnd { index: 0 },
+            ModelEvent::Done(FinishReason::ToolUse),
+        ]);
+    }
+    provider.push(vec![
+        ModelEvent::Start {
+            model_call_id: "ignored".into(),
+        },
+        ModelEvent::TextStart,
+        ModelEvent::TextDelta("done".into()),
+        ModelEvent::TextEnd,
+        ModelEvent::Done(FinishReason::Stop),
+    ]);
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = TransportRegistry::new(
+        store.clone(),
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+    let handle = registry.get_or_create("tool-request").await.unwrap();
+    let mut output = handle.subscribe();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(client_run()),
+        })
+        .await
+        .unwrap();
+    let mut seqno = 1;
+    let mut execs = 0;
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), output.recv())
+            .await
+            .expect("run must not hang on a reused tool call id")
+            .unwrap();
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        if flags & connect::END_STREAM_FLAG != 0 {
+            break;
+        }
+        let server = pb::AgentServerMessage::decode(payload).unwrap();
+        match server.message {
+            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
+                handle
+                    .command(TransportCommand::Append {
+                        seqno,
+                        message: Box::new(kv_ack(kv.id)),
+                    })
+                    .await
+                    .unwrap();
+                seqno += 1;
+            }
+            Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => {
+                execs += 1;
+                let exec_id = exec.id;
+                handle
+                    .command(TransportCommand::Append {
+                        seqno,
+                        message: Box::new(pb::AgentClientMessage {
+                            message: Some(pb::agent_client_message::Message::ExecClientMessage(
+                                pb::ExecClientMessage {
+                                    id: exec_id,
+                                    exec_id: String::new(),
+                                    message: Some(pb::exec_client_message::Message::ReadResult(
+                                        pb::ReadResult {
+                                            result: Some(pb::read_result::Result::Success(
+                                                pb::ReadSuccess {
+                                                    path: "/tmp/a".into(),
+                                                    total_lines: 1,
+                                                    file_size: 1,
+                                                    output: Some(
+                                                        pb::read_success::Output::Content(
+                                                            "x".into(),
+                                                        ),
+                                                    ),
+                                                    ..Default::default()
+                                                },
+                                            )),
+                                        },
+                                    )),
+                                    ..Default::default()
+                                },
+                            )),
+                        }),
+                    })
+                    .await
+                    .unwrap();
+                seqno += 1;
+                handle
+                    .command(TransportCommand::Append {
+                        seqno,
+                        message: Box::new(pb::AgentClientMessage {
+                            message: Some(
+                                pb::agent_client_message::Message::ExecClientControlMessage(
+                                    pb::ExecClientControlMessage {
+                                        message: Some(
+                                            pb::exec_client_control_message::Message::StreamClose(
+                                                pb::ExecClientStreamClose { id: exec_id },
+                                            ),
+                                        ),
+                                    },
+                                ),
+                            ),
+                        }),
+                    })
+                    .await
+                    .unwrap();
+                seqno += 1;
+            }
+            _ => {}
+        }
+    }
+    // Both rounds have to reach the client, and the run has to get far enough
+    // to ask the provider a third time and finish.
+    assert_eq!(execs, 2);
+    assert_eq!(provider.requests().len(), 3);
 }
 
 fn client_run() -> pb::AgentClientMessage {

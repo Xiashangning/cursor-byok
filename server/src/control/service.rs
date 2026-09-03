@@ -1062,3 +1062,382 @@ fn apply_discovery_headers(
     }
     Ok(request)
 }
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{
+        model::{ModelConfig, ModelConfigInput, ModelInvocation, ModelType, ProjectedContent},
+        plugin::{PluginRegistry, PluginRuntime},
+        provider::{FinishReason, ModelEvent, Provider, ProviderStream},
+        store::Store,
+    };
+
+    use super::{model_discovery_url, model_discovery_urls, ControlService};
+
+    #[test]
+    fn model_discovery_url_appends_to_path() {
+        let cases = [
+            (
+                "https://api.deepseek.com",
+                "https://api.deepseek.com/v1/models",
+            ),
+            (
+                "https://open.bigmodel.cn/api/anthropic",
+                "https://open.bigmodel.cn/api/anthropic/v1/models",
+            ),
+            (
+                "https://api.kimi.com/coding",
+                "https://api.kimi.com/coding/v1/models",
+            ),
+            (
+                "https://api.moonshot.cn/v1",
+                "https://api.moonshot.cn/v1/models",
+            ),
+            (
+                "https://ark.cn-beijing.volces.com/api/v3",
+                "https://ark.cn-beijing.volces.com/api/v3/models",
+            ),
+            (
+                "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+                "https://open.bigmodel.cn/api/coding/paas/v4/models",
+            ),
+        ];
+        for (base, expected) in cases {
+            assert_eq!(
+                model_discovery_url(base).unwrap().as_str(),
+                expected,
+                "base: {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_discovery_urls_fall_back_without_a_version() {
+        let cases = [
+            (
+                "https://opencode.ai/zen/go/v1",
+                vec!["https://opencode.ai/zen/go/v1/models"],
+            ),
+            (
+                "https://opencode.ai/zen/go",
+                vec![
+                    "https://opencode.ai/zen/go/v1/models",
+                    "https://opencode.ai/zen/go/models",
+                ],
+            ),
+            (
+                "https://api.example.com/openai/v1/models",
+                vec!["https://api.example.com/openai/v1/models"],
+            ),
+        ];
+        for (base, expected) in cases {
+            let actual = model_discovery_urls(base)
+                .unwrap()
+                .into_iter()
+                .map(|url| url.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "base: {base}");
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_model_discovery_uses_the_unversioned_fallback() {
+        let app = axum::Router::new().route(
+            "/proxy/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({ "data": [{ "id": "model-a" }] }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let models = super::openai_models(
+            &reqwest::Client::new(),
+            &format!("http://{address}/proxy"),
+            "secret",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(models, vec!["model-a"]);
+        server.abort();
+    }
+
+    struct TestProvider {
+        invocation: Arc<Mutex<Option<ModelInvocation>>>,
+    }
+
+    struct CancellationProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl Provider for TestProvider {
+        fn stream(
+            &self,
+            invocation: ModelInvocation,
+            _cancellation: CancellationToken,
+        ) -> ProviderStream {
+            *self.invocation.lock().unwrap() = Some(invocation);
+            Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Start {
+                    model_call_id: "test-call".into(),
+                }),
+                Ok(ModelEvent::TextStart),
+                Ok(ModelEvent::TextDelta("OK".into())),
+                Ok(ModelEvent::TextEnd),
+                Ok(ModelEvent::Usage(crate::model::Usage {
+                    output_tokens: Some(2),
+                    ..Default::default()
+                })),
+                Ok(ModelEvent::Done(FinishReason::Stop)),
+            ]))
+        }
+    }
+
+    impl Provider for CancellationProvider {
+        fn stream(
+            &self,
+            _invocation: ModelInvocation,
+            cancellation: CancellationToken,
+        ) -> ProviderStream {
+            let started = self.started.clone();
+            Box::pin(async_stream::try_stream! {
+                started.notify_one();
+                cancellation.cancelled().await;
+                if false { yield ModelEvent::TextStart; }
+            })
+        }
+    }
+
+    async fn create_test_model(store: &Store) -> ModelConfig {
+        store
+            .create_model(&ModelConfigInput {
+                model_id: "reasoning-model".into(),
+                display_name: "Reasoning Model".into(),
+                group_name: None,
+                model_type: ModelType::OpenAi,
+                base_url: "https://example.com/v1/responses".into(),
+                use_full_url: true,
+                api_key: "secret".into(),
+                tooltip_data: "Reasoning Model".into(),
+                sort_order: 0,
+                reasoning_effort: Some("medium".into()),
+                effort_options: vec!["low".into(), "high".into()],
+                context_options: vec!["200k".into(), "1m".into()],
+                openai_endpoint: "/v1/responses".into(),
+                openai_extra_params_enabled: false,
+                openai_extra_params: serde_json::json!({}),
+                custom_headers_enabled: false,
+                custom_headers: serde_json::json!({}),
+                anthropic_extra_params_enabled: false,
+                anthropic_extra_params: serde_json::json!({}),
+                context_window_tokens: None,
+                max_completion_tokens: None,
+                anthropic_max_tokens: None,
+                anthropic_thinking_effort: None,
+                thinking_budget_tokens: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connectivity_test_uses_the_configured_llm_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("control.db").display()
+        ))
+        .await
+        .unwrap();
+        let invocation = Arc::new(Mutex::new(None));
+        let model = create_test_model(&store).await;
+        let plugin_runtime = PluginRuntime::managed().unwrap();
+        let plugins =
+            PluginRegistry::managed(store.clone(), plugin_runtime.clone(), "test".into()).unwrap();
+        let clients = crate::network::NetworkClients::new(store.clone());
+        let service = ControlService::new(
+            store,
+            Arc::new(TestProvider {
+                invocation: invocation.clone(),
+            }),
+            plugin_runtime,
+            plugins,
+            clients,
+            "test".into(),
+        )
+        .unwrap();
+
+        let result = service
+            .test_model(&model.model_hash, "test-id")
+            .await
+            .unwrap();
+
+        assert_eq!(result.output, "OK");
+        assert!(result.first_valid_response_ms.is_some());
+        assert_eq!(result.output_tokens, 2);
+        assert!(!result.tokens_estimated);
+        assert!(result.tokens_per_second > 0.0);
+        let invocation = invocation.lock().unwrap().clone().unwrap();
+        assert_eq!(invocation.request.model.model_id, model.model_hash);
+        assert!(invocation.request.model.reasoning.enabled);
+        assert_eq!(
+            invocation.request.model.reasoning.effort.as_deref(),
+            Some("medium")
+        );
+        assert!(invocation.request.prompt.tools.is_empty());
+        assert_eq!(invocation.request.history.len(), 1);
+        assert!(matches!(
+            &invocation.request.history[0].content,
+            ProjectedContent::Parts(parts)
+                if matches!(&parts[..], [crate::model::ContentPart::Text { text }] if text == "Output the numbers 1 through 120 separated by a single space. No commas, no newlines, no explanation.")
+        ));
+    }
+
+    #[tokio::test]
+    async fn connectivity_test_can_be_cancelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("cancel.db").display()
+        ))
+        .await
+        .unwrap();
+        let model = create_test_model(&store).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let plugin_runtime = PluginRuntime::managed().unwrap();
+        let plugins =
+            PluginRegistry::managed(store.clone(), plugin_runtime.clone(), "test".into()).unwrap();
+        let clients = crate::network::NetworkClients::new(store.clone());
+        let service = ControlService::new(
+            store,
+            Arc::new(CancellationProvider {
+                started: started.clone(),
+            }),
+            plugin_runtime,
+            plugins,
+            clients,
+            "test".into(),
+        )
+        .unwrap();
+        let running_service = service.clone();
+        let model_hash = model.model_hash.clone();
+        let task =
+            tokio::spawn(
+                async move { running_service.test_model(&model_hash, "cancel-test").await },
+            );
+
+        started.notified().await;
+        service.cancel_model_test("cancel-test");
+
+        assert!(matches!(task.await.unwrap(), Err(crate::Error::Cancelled)));
+        assert!(!service
+            .model_tests
+            .lock()
+            .unwrap()
+            .contains_key("cancel-test"));
+    }
+
+    #[test]
+    fn connectivity_output_token_estimate_handles_words_and_empty_text() {
+        assert_eq!(super::estimate_output_tokens("1 2 3"), 3);
+        assert_eq!(super::estimate_output_tokens(""), 0);
+    }
+
+    #[test]
+    fn model_discovery_url_keeps_provider_path_prefix() {
+        assert_eq!(
+            super::model_discovery_url("https://example.com:8443/arbitrary/v1/chat/completions")
+                .unwrap()
+                .as_str(),
+            "https://example.com:8443/arbitrary/v1/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_discovery_does_not_inherit_user_agent_or_request_body_settings() {
+        type CapturedRequest = (
+            axum::http::Method,
+            axum::http::Uri,
+            axum::http::HeaderMap,
+            bytes::Bytes,
+        );
+
+        async fn models(
+            axum::extract::State(sender): axum::extract::State<
+                tokio::sync::mpsc::UnboundedSender<CapturedRequest>,
+            >,
+            request: axum::extract::Request,
+        ) -> axum::Json<serde_json::Value> {
+            let (parts, body) = request.into_parts();
+            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            sender
+                .send((parts.method, parts.uri, parts.headers, body))
+                .unwrap();
+            axum::Json(serde_json::json!({ "data": [{ "id": "model-a" }] }))
+        }
+
+        let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new()
+            .route("/custom/models", axum::routing::get(models))
+            .with_state(sender);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("discovery.db").display()
+        ))
+        .await
+        .unwrap();
+        let plugin_runtime = PluginRuntime::managed().unwrap();
+        let plugins =
+            PluginRegistry::managed(store.clone(), plugin_runtime.clone(), "test".into()).unwrap();
+        let clients = crate::network::NetworkClients::new(store.clone());
+        let service = ControlService::new(
+            store,
+            Arc::new(TestProvider {
+                invocation: Arc::new(Mutex::new(None)),
+            }),
+            plugin_runtime,
+            plugins,
+            clients,
+            "test".into(),
+        )
+        .unwrap();
+        let result = service
+            .discover_models(&super::ModelDiscoveryInput {
+                model_type: ModelType::OpenAi,
+                base_url: format!("http://{address}/custom/responses"),
+                api_key: "secret".into(),
+                custom_headers_enabled: true,
+                custom_headers: serde_json::json!({
+                    "uSeR-aGeNt": "inherited-user-agent",
+                    "x-tenant": "tenant-a"
+                }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.models, vec!["model-a"]);
+        let (method, uri, headers, body) = requests.recv().await.unwrap();
+        assert_eq!(method, axum::http::Method::GET);
+        // /custom/responses 剥掉端点段后是 /custom，发现地址为 /custom/models
+        assert_eq!(uri.path(), "/custom/models");
+        assert!(body.is_empty());
+        assert!(headers.get(axum::http::header::USER_AGENT).is_none());
+        assert_eq!(headers.get("x-tenant").unwrap(), "tenant-a");
+        assert_eq!(
+            headers.get(axum::http::header::AUTHORIZATION).unwrap(),
+            "Bearer secret"
+        );
+        server.abort();
+    }
+}
