@@ -10,7 +10,7 @@ use crate::{
     provider::{FinishReason, ModelEvent, ProviderStream},
 };
 
-use super::{RunEvent, RunFailure};
+use super::{model_retry::is_permanent_rejection, RunEvent, RunFailure};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelCycleResult {
@@ -84,6 +84,9 @@ pub async fn consume_model_cycle(
         };
         let event = match next {
             Ok(event) => event,
+            Err(error) if is_permanent_rejection(&error) => {
+                return Err(terminal_failure(error.into(), text, reasoning, usage));
+            }
             Err(error) => {
                 return Err(failure(error.into(), text, reasoning, usage));
             }
@@ -405,7 +408,48 @@ mod tests {
         model::Usage,
         provider::{FinishReason, ModelEvent},
     };
+    use axum::http::StatusCode;
     use tokio_stream::wrappers::ReceiverStream;
+
+    #[tokio::test]
+    async fn rejected_provider_requests_are_terminal() {
+        let failure = consume_failure(status_error(StatusCode::UNAUTHORIZED)).await;
+
+        assert!(!failure.retryable);
+        assert!(matches!(
+            failure.failure,
+            RunFailure::Provider(message) if message == "test 401 Unauthorized"
+        ));
+    }
+
+    #[tokio::test]
+    async fn overloaded_provider_requests_stay_retryable() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                consume_failure(status_error(status)).await.retryable,
+                "{status}"
+            );
+        }
+    }
+
+    fn status_error(status: StatusCode) -> crate::Error {
+        crate::Error::ProviderStatus {
+            status,
+            message: format!("test {status}"),
+        }
+    }
+
+    async fn consume_failure(error: crate::Error) -> ModelCycleFailure {
+        let stream = Box::pin(tokio_stream::iter(vec![Err(error)]));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+        consume_model_cycle(stream, &event_tx, &CancellationToken::new())
+            .await
+            .unwrap_err()
+    }
 
     #[tokio::test]
     async fn provider_tool_names_are_normalized_when_received() {
