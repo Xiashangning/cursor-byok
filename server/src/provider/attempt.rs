@@ -38,10 +38,10 @@ where
         _ = cancellation.cancelled() => return Ok(Attempt::Cancelled),
         bytes = response.bytes() => bytes,
     }?;
-    Err(Error::Provider(format!(
-        "{label} {status}: {}",
-        String::from_utf8_lossy(&bytes)
-    )))
+    Err(Error::ProviderStatus {
+        status,
+        message: format!("{label} {status}: {}", String::from_utf8_lossy(&bytes)),
+    })
 }
 
 #[cfg(test)]
@@ -69,9 +69,13 @@ mod tests {
         let error = send_once("test", || client.get(&url), &CancellationToken::new(), None)
             .await
             .unwrap_err();
-        assert!(
-            matches!(error, Error::Provider(message) if message.contains("503") && message.contains("down"))
-        );
+        assert!(matches!(
+            error,
+            Error::ProviderStatus { status, message }
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && message.contains("503")
+                    && message.contains("down")
+        ));
     }
 
     #[tokio::test]

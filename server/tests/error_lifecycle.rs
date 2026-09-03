@@ -6,6 +6,7 @@ mod fixtures;
 
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use cursor_server::{
     cursor::prompting::{PromptAssets, PromptCompiler},
@@ -286,6 +287,85 @@ async fn provider_failure_keeps_the_initial_checkpoint_then_returns_structured_e
             MessageContent::Assistant { text, .. } if text.contains("Cursor server error")
         )
     }));
+}
+
+#[tokio::test]
+async fn rejected_provider_request_is_reported_after_one_attempt() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    provider.push_error(Error::ProviderStatus {
+        status: StatusCode::UNAUTHORIZED,
+        message: "OpenAI Chat 401 Unauthorized: invalid api key".into(),
+    });
+    // A retry would consume this response and finish the run successfully.
+    provider.push(vec![
+        ModelEvent::Start {
+            model_call_id: "retried".into(),
+        },
+        ModelEvent::TextStart,
+        ModelEvent::TextDelta("retried".into()),
+        ModelEvent::TextEnd,
+        ModelEvent::Done(FinishReason::Stop),
+    ]);
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+    let handle = registry.get_or_create("failed-request").await.unwrap();
+    let mut output = handle.subscribe();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(client_run()),
+        })
+        .await
+        .unwrap();
+
+    let mut append_seqno = 1;
+    let error_json = loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), output.recv())
+            .await
+            .unwrap()
+            .expect("RunSSE closed before EndStream");
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        if flags & connect::END_STREAM_FLAG != 0 {
+            break serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+        }
+        let server = pb::AgentServerMessage::decode(payload).unwrap();
+        if let Some(pb::agent_server_message::Message::KvServerMessage(kv)) = server.message {
+            handle
+                .command(TransportCommand::Append {
+                    seqno: append_seqno,
+                    message: Box::new(kv_ack(kv.id)),
+                })
+                .await
+                .unwrap();
+            append_seqno += 1;
+        }
+    };
+
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a 401 must be reported after one attempt"
+    );
+    assert_eq!(error_json["error"]["code"], "unavailable");
+    let encoded = error_json["error"]["details"][0]["value"].as_str().unwrap();
+    let decoded = STANDARD_NO_PAD.decode(encoded).unwrap();
+    let decoded = ai::ErrorDetails::decode(decoded.as_slice()).unwrap();
+    let custom = decoded.details.unwrap();
+    assert!(
+        custom.detail.contains("401 Unauthorized"),
+        "{}",
+        custom.detail
+    );
 }
 
 #[tokio::test]
