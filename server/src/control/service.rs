@@ -327,8 +327,11 @@ impl ControlService {
         start_ms: Option<i64>,
         end_ms: Option<i64>,
         model_hashes: Option<&str>,
+        bucket_ms: Option<i64>,
     ) -> Result<Overview> {
-        self.store.overview(start_ms, end_ms, model_hashes).await
+        self.store
+            .overview(start_ms, end_ms, model_hashes, bucket_ms)
+            .await
     }
 
     pub async fn create_models(&self, models: &[ModelConfigInput]) -> Result<Vec<ModelConfig>> {

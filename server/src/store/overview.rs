@@ -15,6 +15,7 @@ use super::Store;
 
 const OVERVIEW_DAYS: u64 = 365;
 const MAX_RANGE_BUCKETS: i64 = 60;
+const MAX_EXPLICIT_BUCKETS: i64 = 1440;
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
@@ -25,6 +26,7 @@ impl Store {
         start_ms: Option<i64>,
         end_ms: Option<i64>,
         model_hashes: Option<&str>,
+        bucket_ms: Option<i64>,
     ) -> Result<Overview> {
         let call_row = sqlx::query(
             "SELECT
@@ -84,7 +86,7 @@ impl Store {
         };
 
         let (token_usage_granularity, bucket_ms, series_start_ms, bucket_count) =
-            token_usage_buckets(start_ms, end_ms);
+            token_usage_buckets(start_ms, end_ms, bucket_ms);
         let rows = sqlx::query(&format!(
             "SELECT
                 (created_at_ms / {bucket_ms}) * {bucket_ms} AS bucket_start_ms,
@@ -146,20 +148,36 @@ impl Store {
 fn token_usage_buckets(
     start_ms: Option<i64>,
     end_ms: Option<i64>,
+    requested_bucket_ms: Option<i64>,
 ) -> (TokenUsageGranularity, i64, i64, i64) {
     if let (Some(start_ms), Some(end_ms)) = (start_ms, end_ms) {
         let duration_ms = end_ms.saturating_sub(start_ms).max(1);
-        let (granularity, bucket_ms) = if duration_ms <= HOUR_MS {
-            (TokenUsageGranularity::Minute, MINUTE_MS)
-        } else if duration_ms <= MAX_RANGE_BUCKETS * HOUR_MS {
-            (TokenUsageGranularity::Hour, HOUR_MS)
+        let explicit_bucket_ms = requested_bucket_ms.filter(|bucket_ms| *bucket_ms >= MINUTE_MS);
+        let bucket_ms = explicit_bucket_ms.unwrap_or_else(|| {
+            if duration_ms <= HOUR_MS {
+                MINUTE_MS
+            } else if duration_ms <= MAX_RANGE_BUCKETS * HOUR_MS {
+                HOUR_MS
+            } else {
+                DAY_MS
+            }
+        });
+        let granularity = if bucket_ms < HOUR_MS {
+            TokenUsageGranularity::Minute
+        } else if bucket_ms < DAY_MS {
+            TokenUsageGranularity::Hour
         } else {
-            (TokenUsageGranularity::Day, DAY_MS)
+            TokenUsageGranularity::Day
+        };
+        let max_buckets = if explicit_bucket_ms.is_some() {
+            MAX_EXPLICIT_BUCKETS
+        } else {
+            MAX_RANGE_BUCKETS
         };
         let last_bucket_ms = end_ms.saturating_sub(1).div_euclid(bucket_ms) * bucket_ms;
         let first_bucket_ms = start_ms.div_euclid(bucket_ms) * bucket_ms;
         let bucket_count = ((last_bucket_ms - first_bucket_ms).div_euclid(bucket_ms) + 1)
-            .clamp(1, MAX_RANGE_BUCKETS);
+            .clamp(1, max_buckets);
         let series_start_ms =
             last_bucket_ms.saturating_sub((bucket_count - 1).saturating_mul(bucket_ms));
         return (granularity, bucket_ms, series_start_ms, bucket_count);
