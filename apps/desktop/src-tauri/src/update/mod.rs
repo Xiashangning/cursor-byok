@@ -57,9 +57,9 @@ pub(crate) async fn check_portable_update(
     #[cfg(target_os = "windows")]
     {
         let update = portable_update(&app).await?;
-        return Ok(update.map(|update| PortableUpdateInfo {
+        Ok(update.map(|update| PortableUpdateInfo {
             version: update.version,
-        }));
+        }))
     }
     #[cfg(not(target_os = "windows"))]
     {

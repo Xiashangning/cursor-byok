@@ -172,9 +172,9 @@ impl ConversationRuntime {
                         break;
                     }
                     TransportCommand::RunFinished { generation, finish } => {
-                        if !current
+                        if current
                             .as_ref()
-                            .is_some_and(|current| current.id == generation)
+                            .is_none_or(|current| current.id != generation)
                         {
                             continue;
                         }
