@@ -50,24 +50,6 @@
   &:hover { color: var(--vscode-textLink-activeForeground); }
 }
 
-.importRow {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-  padding: 16px;
-
-  > div {
-    display: grid;
-    gap: 5px;
-  }
-
-  small {
-    color: var(--vscode-descriptionForeground);
-    font-size: type.$font-size-xs;
-  }
-}
-
 .confirmContent {
   display: grid;
   gap: 8px;
@@ -150,12 +132,6 @@
   .portFields {
     grid-template-columns: 1fr;
   }
-
-  .importRow {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
 }
 
 .themeActions .selected {

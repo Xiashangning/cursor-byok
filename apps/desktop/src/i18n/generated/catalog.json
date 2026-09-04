@@ -1455,18 +1455,6 @@
         }
       ]
     },
-    "3a8c76b2ce785f96": {
-      "source": "查看并导入",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "features/settings/SettingsPage.tsx",
-          "line": 242,
-          "column": 39
-        }
-      ]
-    },
     "3b67824289b5fa1e": {
       "source": "已隐藏 Dock 栏图标",
       "kind": "text",
@@ -2075,18 +2063,6 @@
         }
       ]
     },
-    "576d81bb0631b165": {
-      "source": "导入",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "features/settings/SettingsPage.tsx",
-          "line": 235,
-          "column": 78
-        }
-      ]
-    },
     "5886afc1c71df1fe": {
       "source": "显示在 Cursor 模型说明中。",
       "kind": "text",
@@ -2118,18 +2094,6 @@
           "file": "features/settings/TabSettingsCard.tsx",
           "line": 84,
           "column": 20
-        }
-      ]
-    },
-    "5a284a1a2be8da0e": {
-      "source": "从本机旧版配置读取模型；确认前会显示新增和已存在的模型。",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "features/settings/SettingsPage.tsx",
-          "line": 239,
-          "column": 21
         }
       ]
     },
@@ -3095,18 +3059,6 @@
           "file": "shell/AppLayout.tsx",
           "line": 48,
           "column": 29
-        }
-      ]
-    },
-    "8ccaf87ddb9ca3f4": {
-      "source": "旧版配置",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "features/settings/SettingsPage.tsx",
-          "line": 238,
-          "column": 22
         }
       ]
     },

@@ -23,7 +23,7 @@ export const PluginModelEditor = forwardRef<PluginModelEditorHandle, PluginModel
   const [maxTokensText, setMaxTokensText] = useState(model.maxOutputTokens === null ? "" : String(model.maxOutputTokens));
   useImperativeHandle(ref, () => ({
     save: () => onSave({
-      modelId: model.modelId,
+      id: model.id,
       displayName: displayName.trim(),
       tooltip: tooltip.trim(),
       effortOptions: parseOptions(effortText),

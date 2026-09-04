@@ -152,7 +152,7 @@ async function invoke(
 
 export const kimiProvider: ProviderSupport = {
   id: "kimi",
-  displayName: "Kimi",
+  displayName: "Moonshot Kimi",
   description: {
     "en-US": "Kimi for Coding subscription access through the official Kimi Code endpoint.",
     "zh-CN": "通过官方 Kimi Code 接口使用 Kimi For Coding 订阅。",

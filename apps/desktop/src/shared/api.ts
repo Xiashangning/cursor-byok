@@ -254,7 +254,7 @@ export interface PluginModelDescriptor {
 }
 
 export interface PluginModelOverrideInput {
-  modelId: string;
+  id: string;               // 完整描述符 ID:plugin:<plugin>/<provider>/<model>
   displayName: string;      // "" ⇒ 重置为插件默认
   tooltip: string;          // "" ⇒ 重置
   effortOptions: string[];  // [] ⇒ 重置

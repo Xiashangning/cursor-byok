@@ -170,7 +170,8 @@ pub async fn set_disabled_accounts(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetModelOverrideInput {
-    pub model_id: String,
+    /// 完整描述符 ID:`plugin:<plugin>/<provider>/<model>`,与描述符查找键一致。
+    pub id: String,
     pub display_name: String,
     pub tooltip: String,
     pub effort_options: Vec<String>,
@@ -185,7 +186,7 @@ pub async fn set_model_override(
 ) -> Result<StatusCode> {
     service
         .set_plugin_model_override(
-            input.model_id,
+            input.id,
             PluginModelOverride {
                 display_name: Some(input.display_name),
                 tooltip: Some(input.tooltip),

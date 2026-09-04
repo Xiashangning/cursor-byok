@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type ProxySettings, type ProxySettingsInput, type StatisticsStorage, type StatisticsStorageScope, type TabSettings } from "../../shared/api";
 import { PageContent } from "../../shell/layout/PageContent";
-import { LegacyModelImport } from "../models/LegacyModelImport";
 import { AppLifecycleSettingsCard } from "./AppLifecycleSettingsCard";
 import { CommitSettingsCard } from "./CommitSettingsCard";
 import { ProxySettingsCard } from "./ProxySettingsCard";
@@ -232,17 +231,6 @@ export function SettingsPage() {
       <TabSettingsCard settings={tabSettings} draft={tabDraft} editing={editingTab} saving={savingTab} onDraftChange={setTabDraft} onEdit={editTab} onCancel={cancelTabEdit} onSave={() => void saveTab()} />
       <CommitSettingsCard />
       <AppLifecycleSettingsCard />
-      <LegacyModelImport>{({ busy, previewing, open }) => <TitledCard title={t("导入")}>
-        <div className={styles.importRow}>
-          <div>
-            <strong>{t("旧版配置")}</strong>
-            <small>{t("从本机旧版配置读取模型；确认前会显示新增和已存在的模型。")}</small>
-          </div>
-          <Button size="small" disabled={busy} onClick={open}>
-            {previewing ? t("读取中…") : t("查看并导入")}
-          </Button>
-        </div>
-      </TitledCard>}</LegacyModelImport>
       <TitledCard title={t("语言")}>
         <div className={styles.settingRow}>
           <div>

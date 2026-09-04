@@ -283,10 +283,10 @@ impl ControlService {
 
     pub async fn set_plugin_model_override(
         &self,
-        model_id: String,
+        id: String,
         over: PluginModelOverride,
     ) -> Result<()> {
-        self.store.set_plugin_model_override(&model_id, over).await
+        self.store.set_plugin_model_override(&id, over).await
     }
 
     pub async fn models(&self) -> Result<Vec<ModelConfig>> {
