@@ -133,15 +133,15 @@ function OAuthMethodCard({ pluginId, resourceType, method, onConfigured }: {
       <small>{t("设备验证码")}</small>
       <button
         type="button"
-        title={begun.verificationUrlComplete || begun.verificationUrl || begun.userCode}
-        onClick={() => void copyCode(begun.verificationUrlComplete || begun.verificationUrl || begun.userCode)}
+        title={begun.userCode}
+        onClick={() => void copyCode(begun.userCode)}
       >
         {begun.userCode.startsWith("http") ? t("授权链接") : begun.userCode}
       </button>
       <button
         type="button"
         className={styles.copy}
-        onClick={() => void copyCode(begun.verificationUrlComplete || begun.verificationUrl || begun.userCode)}
+        onClick={() => void copyCode(begun.userCode)}
       >
         {copied ? t("已复制") : t("复制")}
       </button>

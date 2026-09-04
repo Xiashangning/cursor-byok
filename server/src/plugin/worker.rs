@@ -476,16 +476,9 @@ impl HostContext {
         let raw_url = required_string(params, "url")?;
         let url = url::Url::parse(raw_url)
             .map_err(|error| Error::Config(format!("invalid plugin network URL: {error}")))?;
-        let is_loopback = url
-            .host_str()
-            .map(|h| h == "127.0.0.1" || h == "localhost")
-            .unwrap_or(false);
-        if (url.scheme() != "https" && (!is_loopback || url.scheme() != "http"))
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
+        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
             return Err(Error::Config(
-                "plugin network URL must be HTTPS without credentials (or loopback HTTP)".into(),
+                "plugin network URL must be HTTPS without credentials".into(),
             ));
         }
         let host = url

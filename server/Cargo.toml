@@ -1,7 +1,7 @@
 # Defines the server crate, binaries, and dependency graph.
 [package]
 name = "cursor-server"
-version = "0.1.0"
+version = "0.1.6"
 edition = "2021"
 publish = false
 default-run = "cursor-server"

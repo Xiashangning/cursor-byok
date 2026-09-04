@@ -109,7 +109,63 @@ const GROK_AUTH: &[(&str, &str)] = &[
     ),
 ];
 
-const PLUGINS: &[(&str, &[(&str, &str)])] = &[("codex-auth", CODEX_AUTH), ("grok-auth", GROK_AUTH)];
+const KIMI_AUTH: &[(&str, &str)] = &[
+    (
+        "plugin.json",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/kimi-auth/plugin.json"
+        )),
+    ),
+    (
+        "main.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/kimi-auth/main.ts"
+        )),
+    ),
+    (
+        "provider.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/kimi-auth/provider.ts"
+        )),
+    ),
+    (
+        "models.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/kimi-auth/models.ts"
+        )),
+    ),
+    (
+        "oauth.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/kimi-auth/oauth.ts"
+        )),
+    ),
+    (
+        "resources.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/kimi-auth/resources.ts"
+        )),
+    ),
+    (
+        "assets/kimi.svg",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/kimi-auth/assets/kimi.svg"
+        )),
+    ),
+];
+
+const PLUGINS: &[(&str, &[(&str, &str)])] = &[
+    ("codex-auth", CODEX_AUTH),
+    ("grok-auth", GROK_AUTH),
+    ("kimi-auth", KIMI_AUTH),
+];
 
 /// 把内置插件预装到 installed 目录。manifest 的 version 是缓存键:
 /// 版本一致时零写盘;版本变化时整目录同步并清理旧版本残留文件。

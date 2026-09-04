@@ -222,8 +222,9 @@ impl PluginRegistry {
         Ok(PluginInvocationPlan { model, request_url })
     }
 
-    /// 插件模型的统一 Provider 流:选首个可用资源,经 Worker 执行,
-    /// 事件与内置 Provider 走同一管道。未来的负载均衡在这里换资源重试。
+    /// 插件模型的统一 Provider 流:按亲和顺序选择候选账号,经 Worker 执行,
+    /// 事件与内置 Provider 走同一管道。资源错误(额度/授权)在尚未发出任何
+    /// 事件时按候选顺序换账号重试;已发出事件后不再切换,避免重复输出。
     pub fn stream_model(
         &self,
         invocation: ModelInvocation,
@@ -243,58 +244,90 @@ impl PluginRegistry {
                 .into_iter()
                 .find(|model| model.id == upstream_id)
                 .ok_or_else(|| Error::RunNotFound(format!("plugin model {model_id}")))?;
-            let resource = match &provider.resource_type {
-                Some(resource_type) => Some((
-                    resource_type.clone(),
-                    registry.select_resource(&plugin_id, resource_type).await?,
-                )),
-                None => None,
+            // 无资源 Provider 只有一次尝试;有资源 Provider 以会话 ID 为
+            // 亲和键得到有序候选,首选与故障转移顺序一致。
+            let candidates: Vec<(String, ResourceRecord)> = match &provider.resource_type {
+                Some(resource_type) => registry
+                    .select_resources(&plugin_id, resource_type, Some(&invocation.conversation_id))
+                    .await?
+                    .into_iter()
+                    .map(|record| (resource_type.clone(), record))
+                    .collect(),
+                None => Vec::new(),
             };
             let request = wire::llm_request(&invocation)?;
-            let params = serde_json::json!({
-                "providerId": provider_id,
-                "model": stored.snapshot(),
-                "resource": resource.as_ref().map(|(resource_type, record)| record.snapshot(resource_type)),
-                "request": request,
-            });
             let worker = registry.worker(&entry, &executable).await;
-            let mut items = worker.invoke_streaming("provider.invoke", params, cancellation.clone(), Some(recorder)).await?;
             yield ModelEvent::Start { model_call_id: invocation.call_id.clone() };
-            while let Some(item) = items.recv().await {
-                match item {
-                    WorkerStreamItem::Event(event) => {
-                        yield wire::model_event(&event)?;
-                    }
-                    WorkerStreamItem::Result(result) => {
-                        let value = result?;
-                        let status = value.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
-                        let patch = value.get("patch")
-                            .filter(|patch| !patch.is_null())
-                            .map(|patch| serde_json::from_value::<ResourcePatch>(patch.clone()))
-                            .transpose()?;
-                        if let (Some(patch), Some((resource_type, record))) = (patch, resource.as_ref()) {
-                            if let Err(error) = registry.inner.state
-                                .apply_patch(&plugin_id, resource_type, &record.id, patch).await
-                            {
-                                tracing::warn!(plugin = %plugin_id, %error, "failed to apply plugin resource patch");
-                            }
+            let attempts = candidates.len().max(1);
+            let mut attempt = 0;
+            loop {
+                let resource = candidates.get(attempt);
+                let params = serde_json::json!({
+                    "providerId": provider_id,
+                    "model": stored.snapshot(),
+                    "resource": resource.map(|(resource_type, record)| record.snapshot(resource_type)),
+                    "request": request,
+                });
+                let mut items = worker.invoke_streaming("provider.invoke", params, cancellation.clone(), Some(recorder.clone())).await?;
+                let mut emitted = false;
+                let mut result_value: Option<serde_json::Value> = None;
+                while let Some(item) = items.recv().await {
+                    match item {
+                        WorkerStreamItem::Event(event) => {
+                            emitted = true;
+                            yield wire::model_event(&event)?;
                         }
-                        match status {
-                            "completed" => return,
-                            "resource-error" | "request-error" => {
-                                let message = value.get("message")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("plugin provider call failed");
-                                Err(Error::Provider(message.to_owned()))?;
-                            }
-                            status => {
-                                Err(Error::Protocol(format!("unknown plugin provider result: {status}")))?;
-                            }
+                        WorkerStreamItem::Result(result) => {
+                            result_value = Some(result?);
+                            break;
                         }
                     }
                 }
+                let Some(value) = result_value else {
+                    Err(Error::Provider(format!("plugin '{plugin_id}' worker stopped mid-stream")))?
+                };
+                let status = value.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
+                let patch = value.get("patch")
+                    .filter(|patch| !patch.is_null())
+                    .map(|patch| serde_json::from_value::<ResourcePatch>(patch.clone()))
+                    .transpose()?;
+                if let (Some(patch), Some((resource_type, record))) = (patch, resource) {
+                    if let Err(error) = registry.inner.state
+                        .apply_patch(&plugin_id, resource_type, &record.id, patch).await
+                    {
+                        tracing::warn!(plugin = %plugin_id, %error, "failed to apply plugin resource patch");
+                    }
+                }
+                match status {
+                    "completed" => return,
+                    "resource-error" => {
+                        let message = value.get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("plugin provider call failed")
+                            .to_owned();
+                        if !emitted && attempt + 1 < attempts {
+                            tracing::warn!(
+                                plugin = %plugin_id,
+                                account = %resource.map(|(_, record)| record.key.as_str()).unwrap_or_default(),
+                                %message,
+                                "plugin account failed before any event; failing over to the next candidate"
+                            );
+                            attempt += 1;
+                            continue;
+                        }
+                        Err(Error::Provider(message))?;
+                    }
+                    "request-error" => {
+                        let message = value.get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("plugin provider call failed");
+                        Err(Error::Provider(message.to_owned()))?;
+                    }
+                    status => {
+                        Err(Error::Protocol(format!("unknown plugin provider result: {status}")))?;
+                    }
+                }
             }
-            Err(Error::Provider(format!("plugin '{plugin_id}' worker stopped mid-stream")))?;
         })
     }
 
@@ -824,12 +857,15 @@ impl PluginRegistry {
         Ok(models.len())
     }
 
-    /// 第一版选择策略:按创建顺序取首个可用资源;冷却到期视为可用。
-    async fn select_resource(
+    /// 候选账号按套餐优先级排序后稳定排列;带亲和键(会话 ID)时以哈希
+    /// 决定首选,同一会话在候选集不变期间稳定落在同一账号,冷却或停用
+    /// 的账号被排除后自然漂移。返回顺序即同一次请求故障转移的尝试顺序。
+    async fn select_resources(
         &self,
         plugin_id: &str,
         resource_type: &str,
-    ) -> Result<ResourceRecord> {
+        affinity: Option<&str>,
+    ) -> Result<Vec<ResourceRecord>> {
         let disabled_accounts = self
             .inner
             .store
@@ -867,17 +903,32 @@ impl PluginRegistry {
             }
         };
 
-        ready_records.sort_by_key(|r| get_priority(r));
-        if let Some(best_prio) = ready_records.first().map(|r| get_priority(r)) {
-            ready_records.retain(|r| get_priority(r) == best_prio);
-        }
+        // 套餐优先,ID 作为次序的决胜键,保证候选集不变时顺序稳定。
+        ready_records.sort_by(|a, b| {
+            get_priority(a)
+                .cmp(&get_priority(b))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let start = match affinity {
+            Some(key) => affinity_index(key, ready_records.len()),
+            None => {
+                self.inner
+                    .rr_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % ready_records.len()
+            }
+        };
+        ready_records.rotate_left(start);
+        Ok(ready_records)
+    }
 
-        let index = self
-            .inner
-            .rr_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % ready_records.len();
-        Ok(ready_records[index].clone())
+    async fn select_resource(
+        &self,
+        plugin_id: &str,
+        resource_type: &str,
+    ) -> Result<ResourceRecord> {
+        let mut candidates = self.select_resources(plugin_id, resource_type, None).await?;
+        Ok(candidates.remove(0))
     }
 
     async fn find_record(
@@ -994,6 +1045,14 @@ struct ImportParseResult {
     resources: Vec<ResourceDraft>,
     #[serde(default)]
     warnings: Vec<String>,
+}
+
+/// 会话亲和的首选下标:同 key 在候选数量不变时恒定。
+fn affinity_index(key: &str, len: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % len
 }
 
 fn find_provider<'a>(entry: &'a PluginEntry, provider_id: &str) -> Result<&'a ProviderDefinition> {

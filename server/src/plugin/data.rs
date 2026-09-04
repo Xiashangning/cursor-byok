@@ -71,6 +71,40 @@ impl PluginDataStore {
             })
     }
 
+    /// 在同一把插件锁内完成"读-改-写",避免并发的刷新与删除互相覆写。
+    /// `modify` 接收当前值(不存在时为 Null),返回要持久化的新值。
+    pub async fn modify(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        modify: impl FnOnce(serde_json::Value) -> Result<serde_json::Value>,
+    ) -> Result<()> {
+        let path = self.path(plugin_id, key)?;
+        let lock = self.lock(plugin_id);
+        let _guard = lock.lock().await;
+        let current = match tokio::fs::read(&path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::Value::Null
+            }
+            Err(error) => {
+                return Err(Error::Config(format!(
+                    "plugin data read failed at {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let next = modify(current)?;
+        self.write_locked(&path, key, &next)
+            .await
+            .map_err(|error| {
+                Error::Config(format!(
+                    "plugin data write failed at {}: {error}",
+                    path.display()
+                ))
+            })
+    }
+
     /// 全程使用同步 IO 在阻塞线程完成:tokio 异步文件的关闭是延迟的,
     /// 替换前句柄可能仍被本进程持有;同步写入保证替换时句柄已确定关闭。
     async fn write_locked(&self, path: &Path, key: &str, value: &serde_json::Value) -> Result<()> {

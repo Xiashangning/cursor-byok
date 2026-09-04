@@ -7,7 +7,6 @@ mod definition;
 mod descriptor;
 mod installation;
 mod manifest;
-pub mod oauth_callback;
 mod protocol;
 mod registry;
 mod runtime;

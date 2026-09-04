@@ -210,7 +210,7 @@ function PluginCard({ plugin, onOpen }: {
           label={t("添加账号")}
           onClick={() => onOpen(plugin.id, "add")}
         />
-        {configured && (
+        {(configured || accountCount > 0) && (
           <TruncatedButton
             size="small"
             label={t("账号管理")}
