@@ -1,12 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import type { IconifyIcon } from "@iconify/react/offline";
 import KeepAliveRouteOutlet from "keepalive-for-react-router";
 import { NavLink, useLocation } from "react-router-dom";
 import cursorIconUrl from "../shared/assets/icons/cursor.svg";
 import { api } from "../shared/api";
-import { AdMenu } from "./ads/AdMenu";
-import { FloatingAd } from "./ads/FloatingAd";
-import { AdActionType, type AdAction, type AdSlot } from "./ads/types";
 import { PageLayout } from "./layout/PageLayout";
 import { Card } from "../shared/ui/Card";
 import { ConfirmDialog } from "../shared/ui/ConfirmDialog";
@@ -16,7 +13,6 @@ import { TooltipTrigger } from "../shared/ui/TooltipTrigger";
 import { flatColorAboutIcon, flatColorAreaChartIcon, flatColorCrystalOscillatorIcon, flatColorSalesPerformanceIcon, flatColorSettingsIcon, refreshIcon } from "../shared/ui/icons";
 import { useMessage } from "../shared/ui/message";
 import { VirtualList } from "../shared/virtual/VirtualList";
-import { useI18n } from "../i18n/store";
 import { appStore, useAppStore } from "../shared/store/appStore";
 import { useUpdateStore } from "../shared/store/updateStore";
 import styles from "./AppLayout.module.scss";
@@ -28,32 +24,16 @@ type MenuItem =
   | { kind: "group"; label: string };
 
 const keptAlivePages = ["/", "/calls", "/settings", "/harness/cursor", "/plugins"];
-const readAdStorageKey = "cursor-byok:read-ad-ids";
-const dismissedAdStorageKey = "cursor-byok:dismissed-ad-ids";
 const tutorialReadStorageKey = "cursor-byok:tutorial-read";
 const tutorialUrl = "https://docs.leokun.cn";
-
-function loadStoredAdIds(key: string): Set<string> {
-  try {
-    const value: unknown = JSON.parse(localStorage.getItem(key) ?? "[]");
-    return new Set(Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : []);
-  } catch {
-    return new Set();
-  }
-}
 
 export function AppLayout() {
   const { busy } = useAppStore();
   const { availableVersion } = useUpdateStore();
-  const { locale } = useI18n();
   const message = useMessage();
   const location = useLocation();
   const [leftActionTarget, setLeftActionTarget] = useState<HTMLDivElement | null>(null);
   const [rightActionTarget, setRightActionTarget] = useState<HTMLDivElement | null>(null);
-  const [ads, setAds] = useState<AdSlot[]>([]);
-  const [activeAd, setActiveAd] = useState<AdSlot | null>(null);
-  const [dismissCandidate, setDismissCandidate] = useState<AdSlot | null>(null);
-  const [dismissReason, setDismissReason] = useState("");
   const [confirmTutorial, setConfirmTutorial] = useState(false);
   const [tutorialRead, setTutorialRead] = useState(() => {
     try {
@@ -62,13 +42,6 @@ export function AppLayout() {
       return false;
     }
   });
-  const [readAdIds, setReadAdIds] = useState(() => loadStoredAdIds(readAdStorageKey));
-  const [dismissedAdIds, setDismissedAdIds] = useState(() => loadStoredAdIds(dismissedAdStorageKey));
-  const dismissedAdIdsRef = useRef(dismissedAdIds);
-  dismissedAdIdsRef.current = dismissedAdIds;
-  const adTriggers = useRef(new Map<string, HTMLButtonElement>());
-  const closeAd = useCallback(() => setActiveAd(null), []);
-  const visibleAds = ads.filter((ad) => ad.enabled && ad.placement === "menu" && !dismissedAdIds.has(ad.id));
   const menuItems: MenuItem[] = [
     { kind: "page", path: "/", label: t("数据概览"), icon: flatColorAreaChartIcon },
     { kind: "page", path: "/calls", label: t("调用详细"), icon: flatColorSalesPerformanceIcon },
@@ -93,95 +66,6 @@ export function AppLayout() {
       })
       .catch((cause) => message(cause instanceof Error ? cause.message : String(cause)));
   }, [message]);
-
-  useEffect(() => {
-    let disposed = false;
-    let pending = false;
-    let lastRequestedAt = 0;
-    const refreshAds = () => {
-      const now = Date.now();
-      if (pending || now - lastRequestedAt < 10_000) return;
-      pending = true;
-      lastRequestedAt = now;
-      void api.ads(dismissedAdIdsRef.current, locale)
-        .then((runtime) => {
-          if (disposed) return;
-          setAds(runtime.slots);
-          setActiveAd((current) => current
-            ? runtime.slots.find((ad) => ad.id === current.id) ?? null
-            : null);
-        })
-        .catch(() => {
-          if (disposed) return;
-          setAds([]);
-          setActiveAd(null);
-        })
-        .finally(() => { pending = false; });
-    };
-    const refreshVisibleAds = () => {
-      if (document.visibilityState === "visible") refreshAds();
-    };
-
-    refreshAds();
-    window.addEventListener("focus", refreshAds);
-    document.addEventListener("visibilitychange", refreshVisibleAds);
-    return () => {
-      disposed = true;
-      window.removeEventListener("focus", refreshAds);
-      document.removeEventListener("visibilitychange", refreshVisibleAds);
-    };
-  }, [locale]);
-
-  const openAd = useCallback((ad: AdSlot) => {
-    setReadAdIds((current) => {
-      if (current.has(ad.id)) return current;
-      const next = new Set(current).add(ad.id);
-      try {
-        localStorage.setItem(readAdStorageKey, JSON.stringify([...next]));
-      } catch {
-        // Read state remains valid for the current session when storage is unavailable.
-      }
-      return next;
-    });
-    setActiveAd((current) => current?.id === ad.id ? null : ad);
-  }, []);
-
-  const performAdAction = useCallback((action: AdAction) => {
-    if (action.type !== AdActionType.OpenBrowser) return;
-    void api.openExternalUrl(action.url)
-      .catch((cause) => message(cause instanceof Error ? cause.message : String(cause)));
-  }, [message]);
-
-  const openDismissAd = useCallback((ad: AdSlot) => {
-    setDismissReason("");
-    setDismissCandidate(ad);
-  }, []);
-
-  const closeDismissAd = useCallback(() => {
-    setDismissCandidate(null);
-    setDismissReason("");
-  }, []);
-
-  const dismissAd = useCallback(() => {
-    if (!dismissCandidate) return;
-    const dismissedId = dismissCandidate.id;
-    const reason = dismissReason.trim();
-    setDismissedAdIds((current) => {
-      const next = new Set(current).add(dismissedId);
-      try {
-        localStorage.setItem(dismissedAdStorageKey, JSON.stringify([...next]));
-      } catch {
-        // Dismissed state remains valid for the current session when storage is unavailable.
-      }
-      return next;
-    });
-    setActiveAd((current) => current?.id === dismissedId ? null : current);
-    setDismissCandidate(null);
-    setDismissReason("");
-    void api.dismissAd(dismissedId, reason).catch(() => {
-      // Dismissal is intentionally fire-and-forget so reporting never blocks the UI.
-    });
-  }, [dismissCandidate, dismissReason]);
 
   return <PageLayout className={styles.root}>
     <Card as="aside" className={styles.menuCard}>
@@ -219,10 +103,8 @@ export function AppLayout() {
             </NavLink>
           </div>}
         </VirtualList>
-        <AdMenu ads={visibleAds} activeAdId={activeAd?.id} dismissingAdId={dismissCandidate?.id} readAdIds={readAdIds} triggerRefs={adTriggers} onOpen={openAd} onDismiss={openDismissAd} />
       </nav>
     </Card>
-    {activeAd && <FloatingAd ad={activeAd} trigger={adTriggers.current.get(activeAd.id) ?? null} onClose={closeAd} onAction={performAdAction} />}
     <ConfirmDialog
       id="open-tutorial-dialog"
       open={confirmTutorial}
@@ -233,27 +115,6 @@ export function AppLayout() {
       onConfirm={openTutorial}
     >
       <p>{t("将在系统浏览器中打开使用教程，是否继续？")}</p>
-    </ConfirmDialog>
-    <ConfirmDialog
-      id="dismiss-ad-dialog"
-      open={dismissCandidate !== null}
-      title={t("不再显示此广告")}
-      cancelLabel={t("取消")}
-      confirmLabel={t("确认")}
-      onCancel={closeDismissAd}
-      onConfirm={() => void dismissAd()}
-    >
-      <p>{t("你确认不想再看到此广告吗？")}</p>
-      <label className={styles.dismissReason}>
-        <span>{t("原因（可选）")}</span>
-        <textarea
-          value={dismissReason}
-          maxLength={2000}
-          rows={4}
-          placeholder={t("可以告诉我们原因")}
-          onChange={(event) => setDismissReason(event.target.value)}
-        />
-      </label>
     </ConfirmDialog>
     <main className={styles.content}>
       <div className={styles.actionRegion}>

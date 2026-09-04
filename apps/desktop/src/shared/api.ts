@@ -1,6 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AdRuntime } from "../shell/ads/types";
-import type { Locale } from "../i18n/runtime";
 
 export type ModelType = "openai" | "anthropic";
 
@@ -447,16 +445,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  ads: (disabledAdIds: Iterable<string>, locale: Locale) => {
-    const value = [...disabledAdIds].join(",");
-    return request<AdRuntime>("/ads", {
-      headers: {
-        "accept-language": locale,
-        ...(value ? { "disable-ad-ids": value } : {}),
-      },
-    });
-  },
-  dismissAd: (id: string, reason: string) => request<void>(`/ads/${encodeURIComponent(id)}/dismissals`, { method: "POST", body: JSON.stringify({ reason }) }),
   models: () => request<Model[]>("/models"),
   createModels: (models: ModelInput[]) => request<Model[]>("/models", { method: "POST", body: JSON.stringify({ models }) }),
   reorderModels: (modelHashes: string[]) => request<Model[]>("/models/order", { method: "PUT", body: JSON.stringify({ model_hashes: modelHashes }) }),

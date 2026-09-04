@@ -66,7 +66,6 @@ impl App {
             plugin_runtime,
             plugins,
             clients.clone(),
-            config.app_version.clone(),
         )?;
         let harness = control.cursor_harness().clone();
         let mut router = api::router(registry.clone(), clients)?;

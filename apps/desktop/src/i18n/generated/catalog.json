@@ -957,18 +957,6 @@
         }
       ]
     },
-    "29fbbef32a6eb58b": {
-      "source": "不再显示此广告",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "shell/AppLayout.tsx",
-          "line": 240,
-          "column": 14
-        }
-      ]
-    },
     "2a2773134a829016": {
       "source": "按历史 LLM 调用记录汇总，进行中的调用不计入。",
       "kind": "text",
@@ -1072,12 +1060,7 @@
         },
         {
           "file": "shell/AppLayout.tsx",
-          "line": 230,
-          "column": 20
-        },
-        {
-          "file": "shell/AppLayout.tsx",
-          "line": 241,
+          "line": 112,
           "column": 20
         }
       ]
@@ -1182,7 +1165,7 @@
       "refs": [
         {
           "file": "shell/AppLayout.tsx",
-          "line": 229,
+          "line": 111,
           "column": 14
         }
       ]
@@ -1312,11 +1295,6 @@
           "file": "shared/ui/ConfirmDialog.tsx",
           "line": 4,
           "column": 110
-        },
-        {
-          "file": "shell/AppLayout.tsx",
-          "line": 242,
-          "column": 21
         }
       ]
     },
@@ -1529,18 +1507,6 @@
           "file": "features/settings/SettingsPage.tsx",
           "line": 255,
           "column": 26
-        }
-      ]
-    },
-    "3da0bf1610ff5db5": {
-      "source": "推荐内容",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "shell/ads/AdMenu.tsx",
-          "line": 18,
-          "column": 56
         }
       ]
     },
@@ -1910,13 +1876,8 @@
       "placeholders": [],
       "refs": [
         {
-          "file": "shell/ads/AdMenu.tsx",
-          "line": 28,
-          "column": 99
-        },
-        {
           "file": "shell/AppLayout.tsx",
-          "line": 202,
+          "line": 86,
           "column": 67
         }
       ]
@@ -2072,18 +2033,6 @@
           "file": "features/models/CursorSettingsPage.tsx",
           "line": 253,
           "column": 47
-        }
-      ]
-    },
-    "550eddc3c7fefa99": {
-      "source": "推广",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "shell/ads/FloatingAd.tsx",
-          "line": 63,
-          "column": 48
         }
       ]
     },
@@ -2272,18 +2221,6 @@
         }
       ]
     },
-    "5f9acfb945229062": {
-      "source": "你确认不想再看到此广告吗？",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "shell/AppLayout.tsx",
-          "line": 246,
-          "column": 11
-        }
-      ]
-    },
     "5fd2ec5a6e9b654c": {
       "source": "合计：{cost}",
       "kind": "template",
@@ -2425,7 +2362,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 500,
+          "line": 488,
           "column": 43
         }
       ]
@@ -2564,7 +2501,7 @@
       "refs": [
         {
           "file": "shell/AppLayout.tsx",
-          "line": 79,
+          "line": 52,
           "column": 47
         }
       ]
@@ -2752,7 +2689,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 496,
+          "line": 484,
           "column": 43
         }
       ]
@@ -2906,7 +2843,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 432,
+          "line": 430,
           "column": 21
         }
       ]
@@ -3151,7 +3088,7 @@
       "refs": [
         {
           "file": "shell/AppLayout.tsx",
-          "line": 75,
+          "line": 48,
           "column": 29
         }
       ]
@@ -3182,18 +3119,6 @@
           "file": "features/calls/CallTable.tsx",
           "line": 58,
           "column": 15
-        }
-      ]
-    },
-    "8df48894086d6fbd": {
-      "source": "原因（可选）",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "shell/AppLayout.tsx",
-          "line": 248,
-          "column": 16
         }
       ]
     },
@@ -3266,7 +3191,7 @@
       "refs": [
         {
           "file": "shell/AppLayout.tsx",
-          "line": 73,
+          "line": 46,
           "column": 39
         }
       ]
@@ -3412,7 +3337,7 @@
       "refs": [
         {
           "file": "shell/AppLayout.tsx",
-          "line": 235,
+          "line": 117,
           "column": 11
         }
       ]
@@ -3770,7 +3695,7 @@
       "refs": [
         {
           "file": "shell/AppLayout.tsx",
-          "line": 231,
+          "line": 113,
           "column": 21
         }
       ]
@@ -4032,12 +3957,12 @@
         },
         {
           "file": "shell/AppLayout.tsx",
-          "line": 262,
+          "line": 123,
           "column": 64
         },
         {
           "file": "shell/AppLayout.tsx",
-          "line": 262,
+          "line": 123,
           "column": 125
         }
       ]
@@ -4249,18 +4174,6 @@
         }
       ]
     },
-    "b8c9b486c83b5778": {
-      "source": "不再显示广告",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "shell/ads/AdMenu.tsx",
-          "line": 44,
-          "column": 24
-        }
-      ]
-    },
     "b9670c85a4ab939e": {
       "source": "路由",
       "kind": "text",
@@ -4384,18 +4297,6 @@
           "file": "features/settings/SettingsPage.tsx",
           "line": 274,
           "column": 40
-        }
-      ]
-    },
-    "bda62ce1d5e4ace9": {
-      "source": "可以告诉我们原因",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "shell/AppLayout.tsx",
-          "line": 253,
-          "column": 24
         }
       ]
     },
@@ -4935,7 +4836,7 @@
       "refs": [
         {
           "file": "shell/AppLayout.tsx",
-          "line": 188,
+          "line": 72,
           "column": 54
         }
       ]
@@ -5099,7 +5000,7 @@
         },
         {
           "file": "shell/AppLayout.tsx",
-          "line": 77,
+          "line": 50,
           "column": 29
         }
       ]
@@ -5168,18 +5069,6 @@
           "file": "features/models/CursorModelTestResult.tsx",
           "line": 34,
           "column": 7
-        }
-      ]
-    },
-    "e1295adecbb77755": {
-      "source": "关闭广告",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "shell/ads/FloatingAd.tsx",
-          "line": 64,
-          "column": 66
         }
       ]
     },
@@ -5276,7 +5165,7 @@
       "refs": [
         {
           "file": "shell/AppLayout.tsx",
-          "line": 74,
+          "line": 47,
           "column": 44
         }
       ]
@@ -5669,7 +5558,7 @@
         },
         {
           "file": "shell/AppLayout.tsx",
-          "line": 78,
+          "line": 51,
           "column": 46
         }
       ]
@@ -5931,7 +5820,7 @@
       "refs": [
         {
           "file": "shell/AppLayout.tsx",
-          "line": 80,
+          "line": 53,
           "column": 48
         }
       ]

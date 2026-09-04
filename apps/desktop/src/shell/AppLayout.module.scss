@@ -92,33 +92,6 @@
   border-radius: 50%;
 }
 
-.dismissReason {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 14px;
-  font-size: type.$font-size-base;
-
-  textarea {
-    min-height: 78px;
-    padding: 8px 10px;
-    resize: vertical;
-    color: var(--vscode-input-foreground);
-    background: var(--vscode-input-background);
-    border: 1px solid var(--vscode-input-border, var(--vscode-sideBar-border));
-    border-radius: 6px;
-    outline: none;
-
-    &:focus {
-      border-color: var(--vscode-focusBorder);
-    }
-
-    &:disabled {
-      opacity: 0.6;
-    }
-  }
-}
-
 .content {
   width: calc(100% - var(--app-content-left));
   height: 100%;

@@ -191,7 +191,6 @@ server/
 │   │   ├── models.rs                           # ≈350 行；模型接口
 │   │   ├── overview.rs                         # ≈300 行；概览
 │   │   ├── calls.rs                            # ≈250 行；调用记录
-│   │   ├── ads.rs                              # ≈150 行；广告配置
 │   │   └── harness.rs                          # ≈170 行；Harness 控制
 │   │
 │   ├── search/                                 # ≈1,400 行；搜索能力
