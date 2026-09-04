@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, pluginText, type PluginDescriptor, type PluginImportFile, type PluginRuntimePhase, type PluginRuntimeStatus } from "../../shared/api";
+import { api, getDisabledPluginModelIds, pluginText, type PluginDescriptor, type PluginImportFile, type PluginRuntimePhase, type PluginRuntimeStatus } from "../../shared/api";
 import { useI18n } from "../../i18n/store";
 import { PageContent } from "../../shell/layout/PageContent";
 import { appStore, useAppStore } from "../../shared/store/appStore";
@@ -138,7 +138,17 @@ function PluginCard({ plugin, onOpen }: {
   const [importing, setImporting] = useState(false);
   const configured = plugin.providers.some((provider) => provider.configured);
   const accountCount = plugin.resources.reduce((count, resource) => count + resource.resources.length, 0);
-  const modelCount = plugin.providers.reduce((count, provider) => count + provider.models.length, 0);
+  const [disabledModelIds, setDisabledModelIds] = useState<Set<string>>(() => getDisabledPluginModelIds());
+  useEffect(() => {
+    const handleUpdate = () => setDisabledModelIds(getDisabledPluginModelIds());
+    window.addEventListener("cursor_plugin_models_changed", handleUpdate);
+    return () => window.removeEventListener("cursor_plugin_models_changed", handleUpdate);
+  }, []);
+
+  const modelCount = plugin.providers.reduce(
+    (count, provider) => count + provider.models.filter((m) => !disabledModelIds.has(m.id)).length,
+    0,
+  );
   const subtitle = plugin.providers.map((provider) => pluginText(provider.displayName, locale)).join(" · ") || plugin.id;
   const importResource = plugin.resources.find((resource) => resource.import);
   const exportResource = plugin.resources.find((resource) => resource.resources.length > 0);

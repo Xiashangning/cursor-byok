@@ -203,11 +203,11 @@ fn validate_component(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn set_directory_permissions(path: &Path) -> Result<()> {
+fn set_directory_permissions(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o700))?;
     }
     #[cfg(not(unix))]
     {
@@ -216,11 +216,11 @@ fn set_directory_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn set_file_permissions(path: &Path) -> Result<()> {
+fn set_file_permissions(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
     {

@@ -304,9 +304,83 @@ export type ConfiguredModel =
   | { kind: "builtin"; id: string; name: string; builtin: Model }
   | { kind: "plugin"; id: string; name: string; plugin: PluginModelDescriptor };
 
+let cachedDisabledPluginModelIds: Set<string> = new Set();
+let cachedDisabledPluginAccountIds: Set<string> = new Set();
+let modelsLoaded = false;
+let accountsLoaded = false;
+
+export function getDisabledPluginModelIds(): Set<string> {
+  if (!modelsLoaded) {
+    modelsLoaded = true;
+    void api.disabledPluginModels().then((ids) => {
+      cachedDisabledPluginModelIds = new Set(ids);
+      window.dispatchEvent(new CustomEvent("cursor_plugin_models_changed"));
+    }).catch(() => {});
+  }
+  return new Set(cachedDisabledPluginModelIds);
+}
+
+export function setPluginModelEnabled(modelId: string, enabled: boolean): void {
+  if (enabled) {
+    cachedDisabledPluginModelIds.delete(modelId);
+  } else {
+    cachedDisabledPluginModelIds.add(modelId);
+  }
+  window.dispatchEvent(new CustomEvent("cursor_plugin_models_changed"));
+  void api.setDisabledPluginModels([...cachedDisabledPluginModelIds]).catch(() => {});
+}
+
+export function setMultiplePluginModelsEnabled(modelIds: string[], enabled: boolean): void {
+  if (enabled) {
+    for (const id of modelIds) {
+      cachedDisabledPluginModelIds.delete(id);
+    }
+  } else {
+    for (const id of modelIds) {
+      cachedDisabledPluginModelIds.add(id);
+    }
+  }
+  window.dispatchEvent(new CustomEvent("cursor_plugin_models_changed"));
+  void api.setDisabledPluginModels([...cachedDisabledPluginModelIds]).catch(() => {});
+}
+
+export function getDisabledPluginAccountIds(): Set<string> {
+  if (!accountsLoaded) {
+    accountsLoaded = true;
+    void api.disabledPluginAccounts().then((ids) => {
+      cachedDisabledPluginAccountIds = new Set(ids);
+      window.dispatchEvent(new CustomEvent("cursor_plugin_accounts_changed"));
+    }).catch(() => {});
+  }
+  return new Set(cachedDisabledPluginAccountIds);
+}
+
+export function setPluginAccountEnabled(accountId: string, enabled: boolean): void {
+  if (enabled) {
+    cachedDisabledPluginAccountIds.delete(accountId);
+  } else {
+    cachedDisabledPluginAccountIds.add(accountId);
+  }
+  window.dispatchEvent(new CustomEvent("cursor_plugin_accounts_changed"));
+  void api.setDisabledPluginAccounts([...cachedDisabledPluginAccountIds]).catch(() => {});
+}
+
+export function updateCachedDisabledStates(models: string[], accounts: string[]): void {
+  cachedDisabledPluginModelIds = new Set(models);
+  cachedDisabledPluginAccountIds = new Set(accounts);
+  modelsLoaded = true;
+  accountsLoaded = true;
+  window.dispatchEvent(new CustomEvent("cursor_plugin_models_changed"));
+  window.dispatchEvent(new CustomEvent("cursor_plugin_accounts_changed"));
+}
+
 export function configuredPluginModels(plugins: PluginDescriptor[]): PluginModelDescriptor[] {
+  const disabled = getDisabledPluginModelIds();
   return plugins.flatMap((plugin) =>
-    plugin.providers.flatMap((provider) => provider.configured ? provider.models : []));
+    plugin.providers.flatMap((provider) =>
+      provider.configured ? provider.models.filter((m) => !disabled.has(m.id)) : []
+    )
+  );
 }
 
 export function configuredModels(models: Model[], plugins: PluginDescriptor[]): ConfiguredModel[] {
@@ -469,6 +543,10 @@ export const api = {
   cursorHarness: () => request<CursorHarnessStatus>("/harness/cursor/status"),
   initializeCursorCa: () => request<CursorHarnessStatus>("/harness/cursor/ca/initialize", { method: "POST" }),
   plugins: () => request<PluginDescriptor[]>("/plugins"),
+  disabledPluginModels: () => request<string[]>("/plugins/disabled-models"),
+  setDisabledPluginModels: (modelIds: string[]) => request<string[]>("/plugins/disabled-models", { method: "PUT", body: JSON.stringify({ modelIds }) }),
+  disabledPluginAccounts: () => request<string[]>("/plugins/disabled-accounts"),
+  setDisabledPluginAccounts: (accountIds: string[]) => request<string[]>("/plugins/disabled-accounts", { method: "PUT", body: JSON.stringify({ accountIds }) }),
   pluginOAuthBegin: (pluginId: string, resourceType: string, methodId: string) => request<PluginOAuthBegin>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/add/${encodeURIComponent(methodId)}/begin`, { method: "POST" }),
   pluginOAuthPoll: (sessionId: string, signal?: AbortSignal) => request<PluginOAuthPoll>(`/plugins/oauth/${encodeURIComponent(sessionId)}/poll`, { method: "POST", signal }),
   importPluginResources: (pluginId: string, resourceType: string, files: PluginImportFile[]) => request<PluginImportResult>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/import`, { method: "POST", body: JSON.stringify(files) }),

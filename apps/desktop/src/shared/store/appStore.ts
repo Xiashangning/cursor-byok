@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { api, type CursorHarnessStatus, type LlmCall, type Model, type ModelInput, type Overview, type PluginDescriptor, type PluginRuntimeStatus, type PortSettings } from "../api";
+import { api, updateCachedDisabledStates, type CursorHarnessStatus, type LlmCall, type Model, type ModelInput, type Overview, type PluginDescriptor, type PluginRuntimeStatus, type PortSettings } from "../api";
 import { applyTheme, isThemeId, type ThemeId } from "../theme/theme";
 
 export type AppSnapshot = {
@@ -151,7 +151,13 @@ export const appStore = {
   },
   async refreshPlugins() {
     try {
-      update({ plugins: await api.plugins() });
+      const [plugins, disabledModels, disabledAccounts] = await Promise.all([
+        api.plugins(),
+        api.disabledPluginModels(),
+        api.disabledPluginAccounts(),
+      ]);
+      updateCachedDisabledStates(disabledModels, disabledAccounts);
+      update({ plugins });
     } catch (cause) {
       update({ error: cause instanceof Error ? cause.message : String(cause) });
     }

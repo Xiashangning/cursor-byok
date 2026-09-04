@@ -277,9 +277,7 @@ Deno.test("invoke streams normalized events from the xAI Chat Completions API", 
   );
   assertEquals(result, { status: "completed" });
   const body = JSON.parse(requestBody) as Record<string, unknown>;
-  assertEquals(body.model, "grok-4");
-  assertEquals(body.stream, true);
-  assertEquals(body.prompt_cache_key, "conversation-1");
+  assert(!("prompt_cache_key" in body), "standard OpenAI chat completion does not include prompt_cache_key");
   assert(!("reasoning_effort" in body), "xAI endpoint rejects reasoning_effort");
   assert(!("service_tier" in body), "xAI endpoint rejects service_tier");
   assertEquals(requestHeaders["authorization"], `Bearer ${token}`);

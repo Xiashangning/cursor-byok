@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use serde::Deserialize;
 
 use crate::{
     plugin::{
@@ -121,4 +122,46 @@ pub async fn cancel_runtime_initialization(
     State(service): State<ControlService>,
 ) -> Result<Json<PluginRuntimeStatus>> {
     Ok(Json(service.cancel_plugin_runtime_initialization()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDisabledModelsInput {
+    pub model_ids: Vec<String>,
+}
+
+pub async fn get_disabled_models(
+    State(service): State<ControlService>,
+) -> Result<Json<Vec<String>>> {
+    Ok(Json(service.disabled_plugin_models().await?))
+}
+
+pub async fn set_disabled_models(
+    State(service): State<ControlService>,
+    Json(input): Json<SetDisabledModelsInput>,
+) -> Result<Json<Vec<String>>> {
+    service.set_disabled_plugin_models(input.model_ids).await?;
+    Ok(Json(service.disabled_plugin_models().await?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDisabledAccountsInput {
+    pub account_ids: Vec<String>,
+}
+
+pub async fn get_disabled_accounts(
+    State(service): State<ControlService>,
+) -> Result<Json<Vec<String>>> {
+    Ok(Json(service.disabled_plugin_accounts().await?))
+}
+
+pub async fn set_disabled_accounts(
+    State(service): State<ControlService>,
+    Json(input): Json<SetDisabledAccountsInput>,
+) -> Result<Json<Vec<String>>> {
+    service
+        .set_disabled_plugin_accounts(input.account_ids)
+        .await?;
+    Ok(Json(service.disabled_plugin_accounts().await?))
 }

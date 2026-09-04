@@ -102,7 +102,6 @@ export function buildChatBody(call: OpenAiChatCall): Record<string, JsonValue> {
     body.reasoning_effort = call.request.reasoning.effort;
   }
   if (call.request.latency === "fast") body.service_tier = "fast";
-  if (call.request.cacheKey !== null) body.prompt_cache_key = call.request.cacheKey;
   return { ...body, ...call.extraBody };
 }
 

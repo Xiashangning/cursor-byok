@@ -132,6 +132,7 @@ impl App {
         self.registry.web_cache().set_service_addr(address);
         self.harness.set_backend_addr(address);
         tracing::info!(%address, "cursor server listening");
+        tokio::spawn(crate::plugin::oauth_callback::start_oauth_callback_server(shutdown.clone()));
         let registry = self.registry;
         let harness = self.harness;
         let graceful = shutdown.clone();

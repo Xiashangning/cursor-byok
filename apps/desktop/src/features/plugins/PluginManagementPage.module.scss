@@ -99,11 +99,13 @@
   display: flex;
   align-items: center;
   flex-wrap: nowrap;
-  gap: 7px;
+  gap: 6px;
 
   > button {
     min-width: 0;
     flex: 0 1 auto;
+    padding-left: 8px;
+    padding-right: 8px;
   }
 }
 
