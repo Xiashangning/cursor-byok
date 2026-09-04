@@ -131,6 +131,7 @@ impl App {
         let address = listener.local_addr()?;
         self.registry.web_cache().set_service_addr(address);
         self.harness.set_backend_addr(address);
+        self.harness.restore_on_startup().await;
         tracing::info!(%address, "cursor server listening");
         let registry = self.registry;
         let harness = self.harness;

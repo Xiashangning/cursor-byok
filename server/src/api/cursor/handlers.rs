@@ -215,9 +215,7 @@ async fn bidi_handler(
     let trace = registry.trace(&decoded.request_id);
     let local = if let Some(model_id) = decoded.model_id() {
         // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
-        if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
-            || registry.store().model(model_id).await?.is_some()
-        {
+        if routes_to_local_model(registry.store(), model_id).await? {
             tracing::info!(
                 request_id = decoded.request_id,
                 model_id,
@@ -320,6 +318,11 @@ async fn bidi_handler(
     Ok(response)
 }
 
+async fn routes_to_local_model(store: &crate::store::Store, model_id: &str) -> Result<bool> {
+    Ok(model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
+        || store.resolve_model(model_id).await?.is_some())
+}
+
 fn trace_outcome(
     mut metadata: serde_json::Value,
     accepted: bool,
@@ -365,4 +368,58 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>
         .map(|value| value.to_str())
         .transpose()
         .map_err(|error| crate::Error::Protocol(format!("invalid {name} header: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ModelConfigInput, ModelType, OPENAI_RESPONSES_ENDPOINT};
+
+    fn model_input() -> ModelConfigInput {
+        ModelConfigInput {
+            sort_order: 0,
+            display_name: "Local Model".into(),
+            group_name: None,
+            model_type: ModelType::OpenAi,
+            base_url: "https://example.com/v1/responses".into(),
+            use_full_url: true,
+            api_key: "test-key".into(),
+            tooltip_data: "Local Model".into(),
+            model_id: "local-model".into(),
+            reasoning_effort: Some("high".into()),
+            effort_options: vec!["low".into(), "high".into()],
+            context_options: vec!["200k".into(), "1m".into()],
+            openai_endpoint: OPENAI_RESPONSES_ENDPOINT.into(),
+            openai_extra_params_enabled: false,
+            openai_extra_params: serde_json::json!({}),
+            custom_headers_enabled: false,
+            custom_headers: serde_json::json!({}),
+            anthropic_extra_params_enabled: false,
+            anthropic_extra_params: serde_json::json!({}),
+            context_window_tokens: Some(200_000),
+            max_completion_tokens: None,
+            anthropic_max_tokens: None,
+            anthropic_thinking_effort: None,
+            thinking_budget_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_model_variants_stay_on_the_local_byok_route() {
+        let store = crate::store::Store::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let model = store.create_model(&model_input()).await.unwrap();
+
+        for suffix in ["1m-low", "200k-high", "1m-high-fast"] {
+            let model_id = format!("{}-{suffix}", model.model_hash);
+            assert!(
+                routes_to_local_model(&store, &model_id).await.unwrap(),
+                "variant {model_id} must stay local"
+            );
+        }
+        assert!(!routes_to_local_model(&store, "cursor-official-model")
+            .await
+            .unwrap());
+    }
 }

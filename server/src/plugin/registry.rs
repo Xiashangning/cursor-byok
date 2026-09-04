@@ -646,7 +646,12 @@ impl PluginRegistry {
 
     async fn descriptor(&self, entry: &PluginEntry, executable: &Path) -> PluginDescriptor {
         let plugin_id = &entry.manifest.id;
-        let overrides = self.inner.store.plugin_model_overrides().await.unwrap_or_default();
+        let overrides = self
+            .inner
+            .store
+            .plugin_model_overrides()
+            .await
+            .unwrap_or_default();
         let mut providers = Vec::new();
         for provider in &entry.definition.providers {
             let stored = self

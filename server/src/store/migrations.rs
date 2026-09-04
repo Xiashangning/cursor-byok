@@ -382,6 +382,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn published_migration_versions_and_checksums_remain_stable() {
+        let expected = [
+            (
+                5,
+                "add first valid response timing",
+                "a45e17ce85559b6efc0b316ba71db32ab31a3d30ef562ec780e3534915035b124372c5a28848802ef81a5473dfe927dd",
+            ),
+            (
+                6,
+                "rename revisions to checkpoints",
+                "7dc9190e2429027df8b824cabf2ce216b2aef5767a8295ffb901c5b8adeaa126cd29b75b48a10f0c669b48b35f4c52bd",
+            ),
+            (
+                7,
+                "drop llm calls model hash fk",
+                "8eea9ac50d6a044127ec7cede03675991a3714fbb0f50d44209ba0fba1cd5c345b43d9a15aedcf17d790af82490d1b33",
+            ),
+            (
+                8,
+                "add model group name",
+                "b268957d1b5fa0adc23875739b18fad2b3a58b22ec7c90a64abc4cc7ecbca42238230c0b4125035f09216dcb66175d95",
+            ),
+            (
+                9,
+                "add tool call argument error",
+                "adc36234d88898eddd84f00f286768e0696b966d6c16653c3eed1794789b1dbead0a797d2dc491142bafa3694bde021f",
+            ),
+        ];
+
+        for (version, description, checksum) in expected {
+            let migration = ALL_MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap_or_else(|| panic!("missing published migration {version}"));
+            assert_eq!(migration.description, description);
+            assert_eq!(hex::encode(migration.checksum.as_ref()), checksum);
+        }
+    }
+
+    #[test]
     fn normalized_checksums_match_the_published_lf_and_windows_crlf_migrations() {
         let lf = migrator_with_line_endings(MigrationLineEndings::Lf);
         let crlf = migrator_with_line_endings(MigrationLineEndings::Crlf);
@@ -472,6 +512,97 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn published_v9_schema_upgrades_without_losing_rows() {
+        for line_endings in [MigrationLineEndings::Lf, MigrationLineEndings::Crlf] {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            let historical = migrator_with_line_endings(line_endings);
+            let published_v9 = Migrator {
+                migrations: Cow::Owned(historical.iter().take(9).cloned().collect()),
+                ..Migrator::DEFAULT
+            };
+            published_v9.run(&pool).await.unwrap();
+            let checksum_before: Vec<u8> =
+                sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 5")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+
+            sqlx::query(
+                "INSERT INTO conversations(conversation_id, updated_at_ms)
+                 VALUES ('published-upgrade', 1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO model_configs(
+                    model_hash, display_name, model_type, base_url,
+                    api_key, tooltip_data, model_id, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    '12345678', 'Test Model', 'openai', 'https://example.com',
+                    'secret', 'Test Model', 'test-model', 1, 1
+                 )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            run(&pool, Path::new("published-v9-upgrade.db"))
+                .await
+                .unwrap();
+
+            let checksum_after: Vec<u8> =
+                sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 5")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let versions: Vec<i64> =
+                sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            let model_options: (String, String) = sqlx::query_as(
+                "SELECT effort_options_json, context_options_json
+                 FROM model_configs WHERE model_hash = '12345678'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let conversation_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM conversations WHERE conversation_id = 'published-upgrade'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let consumed_completion_table_exists: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'consumed_background_completions'
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(checksum_after, checksum_before);
+            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            assert_eq!(
+                model_options,
+                (
+                    r#"["low","medium","high","xhigh","max"]"#.to_owned(),
+                    r#"["200k","356k","800k","1m"]"#.to_owned(),
+                )
+            );
+            assert_eq!(conversation_count, 1);
+            assert_eq!(consumed_completion_table_exists, 1);
+        }
+    }
+
     #[test]
     fn sqlite_sidecar_paths_preserve_the_database_path() {
         let database = Path::new(r"C:\Users\Test User\cursor-byok.db");
@@ -484,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn stalled_migration_stage_returns_a_timeout_error() {
         let result = run_stage_with_limits(
-            "0007 rename revisions to checkpoints",
+            "0006 rename revisions to checkpoints",
             Duration::from_millis(2),
             Duration::from_millis(10),
             std::future::pending(),
@@ -494,7 +625,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(Error::MigrationTimeout { stage, .. })
-                if stage == "0007 rename revisions to checkpoints"
+                if stage == "0006 rename revisions to checkpoints"
         ));
     }
 }

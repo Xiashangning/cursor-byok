@@ -1360,10 +1360,10 @@ async fn stale_context_injection_is_rejected_without_failing_the_active_run() {
 }
 
 #[tokio::test]
-async fn unsupported_runtime_action_is_ignored_without_failing_the_active_run() {
+async fn unsupported_runtime_action_returns_invalid_argument_for_the_active_run() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();
-    let release = provider.push_gated(text_response("active run completed"));
+    let _release = provider.push_gated(text_response("active run completed"));
     let assets = PromptAssets::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("prompt/cursor")
@@ -1413,10 +1413,23 @@ async fn unsupported_runtime_action_is_ignored_without_failing_the_active_run() 
         .await
         .unwrap();
     append_seqno += 1;
-    tokio::task::yield_now().await;
-    release.notify_one();
+    let error = loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
+            .await
+            .unwrap()
+            .expect("RunSSE closed before Error EndStream");
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        if flags & connect::END_STREAM_FLAG != 0 {
+            break serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+        }
+        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
+    };
 
-    drain_successfully(&handle, &mut output, &mut append_seqno).await;
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert_eq!(
+        error["error"]["message"],
+        "runtime ConversationAction does not support ResumeAction"
+    );
     assert_eq!(provider.requests().len(), 1);
 }
 

@@ -482,20 +482,23 @@ impl ConversationRuntime {
                                             }
                                         }
                                         Some(action) => {
-                                            tracing::warn!(
-                                                request_id = handle.request_id(),
-                                                action = runtime_action_name(&action),
-                                                "ignoring unsupported runtime ConversationAction"
-                                            );
+                                            let error = unsupported_runtime_action_error(&action);
+                                            if let Some(generation) = current.as_ref() {
+                                                generation.results.send_error(error);
+                                            } else {
+                                                let _ = super::finish_failed(&handle, &error);
+                                                return;
+                                            }
                                         }
                                         None => {
+                                            let error = crate::Error::Protocol(
+                                                "runtime ConversationAction has no action".into(),
+                                            );
                                             if let Some(generation) = current.as_ref() {
-                                                generation.results.send_error(
-                                                    crate::Error::Protocol(
-                                                        "runtime ConversationAction has no action"
-                                                            .into(),
-                                                    ),
-                                                );
+                                                generation.results.send_error(error);
+                                            } else {
+                                                let _ = super::finish_failed(&handle, &error);
+                                                return;
                                             }
                                         }
                                     },
@@ -952,6 +955,13 @@ async fn hydrate_consumed_subagent_completions(
     Ok(())
 }
 
+fn unsupported_runtime_action_error(action: &pb::conversation_action::Action) -> crate::Error {
+    crate::Error::Protocol(format!(
+        "runtime ConversationAction does not support {}",
+        runtime_action_name(action)
+    ))
+}
+
 fn runtime_action_name(action: &pb::conversation_action::Action) -> &'static str {
     use pb::conversation_action::Action;
 
@@ -971,5 +981,20 @@ fn runtime_action_name(action: &pb::conversation_action::Action) -> &'static str
         Action::SubscriptionNotificationAction(_) => "SubscriptionNotificationAction",
         Action::GoalContinuationAction(_) => "GoalContinuationAction",
         Action::InjectContextAction(_) => "InjectContextAction",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_runtime_actions_become_protocol_errors() {
+        let action = pb::conversation_action::Action::ResumeAction(pb::ResumeAction::default());
+        let error = unsupported_runtime_action_error(&action);
+        assert_eq!(
+            error.to_string(),
+            "protocol error: runtime ConversationAction does not support ResumeAction"
+        );
     }
 }

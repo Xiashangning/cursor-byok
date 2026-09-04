@@ -25,6 +25,14 @@ fn integration_prerequisites_ready(ca: &CaState, backend_ready: bool) -> bool {
     matches!(ca, CaState::Ready) && backend_ready
 }
 
+fn integration_state(proxy_running: bool, settings_applied: bool) -> IntegrationState {
+    match (proxy_running, settings_applied) {
+        (false, false) => IntegrationState::Disabled,
+        (true, true) => IntegrationState::Enabled,
+        _ => IntegrationState::Degraded,
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaState {
@@ -34,7 +42,7 @@ pub enum CaState {
     Invalid,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationState {
     Disabled,
@@ -98,14 +106,12 @@ impl CursorHarness {
         settings::clear_stale_managed_settings()
     }
 
+    /// Observes the integration without starting or stopping it.
     pub async fn status(&self) -> Result<CursorHarnessStatus> {
         let models = self.inner.store.models().await?;
         let configured_models = models.len();
         let enabled_models = configured_models;
         let ca = self.inner.ca.state()?;
-        if integration_prerequisites_ready(&ca, self.inner.backend_addr.read().is_some()) {
-            self.enable().await?;
-        }
         let proxy = self.inner.proxy.lock().await;
         let proxy_url = proxy.url();
         let settings_applied = proxy_url
@@ -113,11 +119,7 @@ impl CursorHarness {
             .map(settings::settings_match)
             .transpose()?
             .unwrap_or(false);
-        let integration = match (proxy.running(), settings_applied) {
-            (false, false) => IntegrationState::Disabled,
-            (true, true) => IntegrationState::Enabled,
-            _ => IntegrationState::Degraded,
-        };
+        let integration = integration_state(proxy.running(), settings_applied);
         Ok(CursorHarnessStatus {
             platform: std::env::consts::OS,
             ca,
@@ -127,6 +129,22 @@ impl CursorHarness {
             proxy_url,
             ca_install_command: self.inner.ca.install_command(),
         })
+    }
+
+    /// Restores the integration once the server has established its backend address.
+    pub async fn restore_on_startup(&self) {
+        let ca = match self.inner.ca.state() {
+            Ok(ca) => ca,
+            Err(error) => {
+                tracing::warn!(%error, "failed to read CA state during startup");
+                return;
+            }
+        };
+        if integration_prerequisites_ready(&ca, self.inner.backend_addr.read().is_some()) {
+            if let Err(error) = self.enable().await {
+                tracing::warn!(%error, "failed to restore Cursor harness during startup");
+            }
+        }
     }
 
     pub async fn initialize_ca(&self) -> Result<CursorHarnessStatus> {
@@ -203,4 +221,26 @@ impl CursorHarness {
 async fn apply_cursor_configuration(proxy_url: &str) -> Result<()> {
     account::ensure_local_account().await?;
     settings::write_proxy_settings(proxy_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_classifies_integration_without_changing_it() {
+        assert_eq!(integration_state(false, false), IntegrationState::Disabled);
+        assert_eq!(integration_state(true, true), IntegrationState::Enabled);
+        assert_eq!(integration_state(true, false), IntegrationState::Degraded);
+        assert_eq!(integration_state(false, true), IntegrationState::Degraded);
+    }
+
+    #[test]
+    fn startup_restore_requires_both_ca_and_backend() {
+        assert!(integration_prerequisites_ready(&CaState::Ready, true));
+        assert!(!integration_prerequisites_ready(&CaState::Ready, false));
+        assert!(!integration_prerequisites_ready(&CaState::Missing, true));
+        assert!(!integration_prerequisites_ready(&CaState::Untrusted, true));
+        assert!(!integration_prerequisites_ready(&CaState::Invalid, true));
+    }
 }
