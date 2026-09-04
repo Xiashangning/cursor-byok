@@ -8,9 +8,9 @@ pub(crate) const REQUESTED_OPEN_FILE_LIMIT: u64 = 65_536;
 
 #[cfg(unix)]
 pub(crate) struct OpenFileLimit {
-    pub(crate) previous: u64,
-    pub(crate) effective: u64,
-    pub(crate) hard: u64,
+    pub(crate) previous: libc::rlim_t,
+    pub(crate) effective: libc::rlim_t,
+    pub(crate) hard: libc::rlim_t,
 }
 
 #[cfg(unix)]
@@ -49,8 +49,8 @@ pub(crate) fn raise_open_file_limit() -> io::Result<OpenFileLimit> {
     }
 
     Ok(OpenFileLimit {
-        previous: previous as u64,
-        effective: effective.rlim_cur as u64,
-        hard: effective.rlim_max as u64,
+        previous,
+        effective: effective.rlim_cur,
+        hard: effective.rlim_max,
     })
 }

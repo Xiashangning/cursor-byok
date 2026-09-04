@@ -1,8 +1,16 @@
+use std::process::ExitCode;
+
+#[cfg(target_os = "windows")]
 use std::{
     fs::{self, OpenOptions},
-    io::{Cursor, Read, Write},
-    path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    io::Write,
+    path::PathBuf,
+    process::Command,
+};
+#[cfg(any(target_os = "windows", test))]
+use std::{
+    io::{Cursor, Read},
+    path::Path,
 };
 
 use serde::Serialize;
@@ -14,8 +22,10 @@ use tauri_plugin_updater::UpdaterExt;
 #[cfg(target_os = "windows")]
 mod replacement;
 
+#[cfg(target_os = "windows")]
 const PORTABLE_UPDATE_ENDPOINT: &str =
     "https://github.com/leookun/cursor-byok/releases/latest/download/portable-latest.json";
+#[cfg(any(target_os = "windows", test))]
 const WINDOWS_PAYLOAD_NAME: &str = "cursor-byok-desktop.exe";
 
 #[derive(Serialize)]
@@ -176,6 +186,7 @@ async fn wait_for_replacement_start(
     result
 }
 
+#[cfg(target_os = "windows")]
 fn ensure_target_writable(target: &Path) -> std::io::Result<()> {
     let parent = target
         .parent()
@@ -193,6 +204,7 @@ fn ensure_target_writable(target: &Path) -> std::io::Result<()> {
     fs::remove_file(probe)
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn extract_windows_payload(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|error| format!("failed to open ZIP: {error}"))?;
@@ -222,6 +234,7 @@ fn extract_windows_payload(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(payload)
 }
 
+#[cfg(target_os = "windows")]
 fn stage_payload(target: &Path, payload: &[u8]) -> std::io::Result<PathBuf> {
     let directory = tempfile::Builder::new()
         .prefix("cursor-byok-portable-update-")
