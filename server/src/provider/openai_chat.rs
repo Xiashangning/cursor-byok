@@ -365,9 +365,9 @@ fn map_finish(value: &str, has_tools: bool) -> FinishReason {
     match value {
         "tool_calls" | "function_call" => FinishReason::ToolUse,
         "length" => FinishReason::Length,
-        // Observed tool calls outrank whatever the provider labelled the stop:
-        // OpenAI-compatible servers routinely report "stop" while streaming tool
-        // calls, and the run rejects a finish reason that contradicts them.
+        "content_filter" => FinishReason::Stop,
+        // Observed tool calls outrank ordinary or unknown stop labels because
+        // OpenAI-compatible servers commonly emit tools with `stop`.
         _ if has_tools => FinishReason::ToolUse,
         _ => FinishReason::Stop,
     }
@@ -441,10 +441,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn observed_tool_calls_outrank_a_stop_finish_reason() {
+    fn observed_tool_calls_outrank_ordinary_stop_reasons() {
         assert_eq!(map_finish("stop", true), FinishReason::ToolUse);
-        assert_eq!(map_finish("content_filter", true), FinishReason::ToolUse);
         assert_eq!(map_finish("", true), FinishReason::ToolUse);
+    }
+
+    #[test]
+    fn content_filter_never_executes_observed_tool_calls() {
+        assert_eq!(map_finish("content_filter", true), FinishReason::Stop);
+        assert_eq!(map_finish("content_filter", false), FinishReason::Stop);
     }
 
     #[test]
