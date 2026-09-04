@@ -250,6 +250,44 @@ mod tests {
         assert_eq!(bucket_count, 2);
     }
 
+    #[test]
+    fn explicit_buckets_cover_calendar_day_and_month_windows() {
+        let day_start_ms = 1_800_000_000_000;
+
+        let (granularity, bucket_ms, series_start_ms, bucket_count) =
+            token_usage_buckets(Some(day_start_ms), Some(day_start_ms + DAY_MS), Some(15 * MINUTE_MS));
+        assert_eq!(granularity, TokenUsageGranularity::Minute);
+        assert_eq!(bucket_ms, 15 * MINUTE_MS);
+        assert_eq!(series_start_ms, day_start_ms);
+        assert_eq!(bucket_count, 96);
+
+        let (_, bucket_ms, series_start_ms, bucket_count) =
+            token_usage_buckets(Some(day_start_ms), Some(day_start_ms + DAY_MS), Some(30 * MINUTE_MS));
+        assert_eq!(bucket_ms, 30 * MINUTE_MS);
+        assert_eq!(series_start_ms, day_start_ms);
+        assert_eq!(bucket_count, 48);
+
+        let (granularity, bucket_ms, _, bucket_count) =
+            token_usage_buckets(Some(day_start_ms), Some(day_start_ms + 30 * DAY_MS), Some(HOUR_MS));
+        assert_eq!(granularity, TokenUsageGranularity::Hour);
+        assert_eq!(bucket_ms, HOUR_MS);
+        assert_eq!(bucket_count, 720);
+    }
+
+    #[test]
+    fn minute_bucket_over_a_week_clamps_to_explicit_bucket_cap() {
+        let start_ms = 1_800_000_000_000;
+        let (_, bucket_ms, series_start_ms, bucket_count) =
+            token_usage_buckets(Some(start_ms), Some(start_ms + 7 * DAY_MS), Some(MINUTE_MS));
+
+        assert_eq!(bucket_ms, MINUTE_MS);
+        assert_eq!(bucket_count, MAX_EXPLICIT_BUCKETS);
+        assert_eq!(
+            series_start_ms,
+            start_ms + 7 * DAY_MS - MAX_EXPLICIT_BUCKETS * MINUTE_MS
+        );
+    }
+
     #[tokio::test]
     async fn overview_aggregates_llm_calls_and_normalizes_token_usage() {
         let directory = tempfile::tempdir().unwrap();
@@ -344,6 +382,36 @@ mod tests {
         assert_eq!(filtered.metrics.llm_calls, 0);
         assert_eq!(filtered.metrics.token_usage, 0);
         assert_eq!(filtered.token_usage_series[0].total_tokens(), 0);
+    }
+
+    #[tokio::test]
+    async fn overview_honors_explicit_bucket_ms_within_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("bucketed-overview.db").display()
+        ))
+        .await
+        .unwrap();
+        let base_ms = 1_800_000_000_000;
+        insert_call(&store, "before", "anthropic", base_ms - HOUR_MS, [500, 0, 0, 0]).await;
+        insert_call(&store, "first", "anthropic", base_ms + MINUTE_MS, [10, 0, 0, 0]).await;
+        insert_call(&store, "second", "anthropic", base_ms + 20 * MINUTE_MS, [30, 0, 0, 0]).await;
+
+        let overview = store
+            .overview(Some(base_ms), Some(base_ms + HOUR_MS), None, Some(15 * MINUTE_MS))
+            .await
+            .unwrap();
+
+        assert_eq!(overview.metrics.llm_calls, 2);
+        assert_eq!(
+            overview.token_usage_granularity,
+            TokenUsageGranularity::Minute
+        );
+        assert_eq!(overview.token_usage_series.len(), 4);
+        assert_eq!(overview.token_usage_series[0].input_tokens, 10);
+        assert_eq!(overview.token_usage_series[1].input_tokens, 30);
+        assert_eq!(overview.token_usage_series[2].total_tokens(), 0);
     }
 
     async fn insert_call(

@@ -5,7 +5,7 @@ import { DailyTokenUsageChart } from "./charts/DailyTokenUsageChart";
 import { HomeMetrics } from "./metrics/HomeMetrics";
 import { PageContent } from "../../shell/layout/PageContent";
 import type { VirtualPageSection } from "../../shell/layout/VirtualPage";
-import { OverviewTimeRangeFilter, type OverviewRangePreset, type QuickPreset } from "./overview/OverviewTimeRangeFilter";
+import { OverviewTimeRangeFilter, type OverviewRangePreset } from "./overview/OverviewTimeRangeFilter";
 import { PageActions } from "../../shell/PageActions";
 import { appStore, useAppStore } from "../../shared/store/appStore";
 import { formatTimeInput, parseTimeInput } from "../../shared/utils/parseTimeInput";
@@ -20,13 +20,22 @@ function presetRange(preset: Exclude<OverviewRangePreset, "custom">, now = new D
     start.setHours(0, 0, 0, 0);
     return { startMs: start.getTime(), endMs };
   }
+  if (preset === "yesterday") {
+    const start = new Date(now);
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - 1);
+    const end = new Date(now);
+    end.setHours(0, 0, 0, 0);
+    return { startMs: start.getTime(), endMs: end.getTime() };
+  }
   if (preset === "month") {
     const start = new Date(now);
     start.setMonth(start.getMonth() - 1);
     return { startMs: start.getTime(), endMs };
   }
-  const duration = preset === "ten-minutes" ? 10 * 60_000
-    : preset === "hour" ? 60 * 60_000
+  const duration = preset === "hour" ? 60 * 60_000
+    : preset === "four-hours" ? 4 * 60 * 60_000
+    : preset === "twenty-four-hours" ? 24 * 60 * 60_000
     : 7 * 24 * 60 * 60_000;
   return { startMs: now.getTime() - duration, endMs };
 }
@@ -34,8 +43,7 @@ function presetRange(preset: Exclude<OverviewRangePreset, "custom">, now = new D
 export function HomePage() {
   const { overview, busy, models, plugins } = useAppStore();
   const [preset, setPreset] = useState<OverviewRangePreset>("month");
-  const [quick, setQuick] = useState<QuickPreset | null>(null);
-  const [fourHourBucket, setFourHourBucket] = useState<number | undefined>(undefined);
+  const [granularity, setGranularity] = useState<number | undefined>(undefined);
   const [customRange, setCustomRange] = useState<TimeRange | null>(null);
   const [customOpen, setCustomOpen] = useState(false);
   const [customStart, setCustomStart] = useState("");
@@ -54,14 +62,14 @@ export function HomePage() {
     void api.overview({
       ...selectedRange,
       modelHashes: appliedModels,
-      bucketMs: fourHourBucket,
+      bucketMs: granularity,
     }).then((next) => {
       if (active) setRangeOverview(next);
     }).finally(() => {
       if (active) setRangeBusy(false);
     });
     return () => { active = false; };
-  }, [preset, customRange, overview, refreshVersion, appliedModels, fourHourBucket]);
+  }, [preset, customRange, overview, refreshVersion, appliedModels, granularity]);
 
   const filteredOverview = rangeOverview ?? overview;
   const dailyTokenUsage = filteredOverview.token_usage_series.map((bucket) => ({
@@ -98,24 +106,11 @@ export function HomePage() {
     if (startMs === null || endMs === null || startMs >= endMs) return;
     setCustomRange({ startMs, endMs });
     setAppliedModels(selectedModels);
-    setQuick(null);
-    setFourHourBucket(undefined);
-    setPreset("custom");
-    setCustomOpen(false);
-  };
-  const selectQuick = (durationMs: number, bucketMs?: number) => {
-    const endMs = Date.now();
-    setCustomRange({ startMs: endMs - durationMs, endMs });
-    setAppliedModels(selectedModels);
-    setQuick(durationMs === 4 * 60 * 60_000 ? "four-hours" : "twenty-four-hours");
-    setFourHourBucket(durationMs === 4 * 60 * 60_000 ? bucketMs : undefined);
     setPreset("custom");
     setCustomOpen(false);
   };
   const selectPreset = (value: Exclude<OverviewRangePreset, "custom">) => {
     setPreset(value);
-    setQuick(null);
-    setFourHourBucket(undefined);
     setCustomOpen(false);
   };
   const refresh = async () => {
@@ -160,8 +155,7 @@ export function HomePage() {
   return <>
     <PageActions><OverviewTimeRangeFilter
       value={preset}
-      quick={quick}
-      fourHourBucket={fourHourBucket}
+      granularity={granularity}
       customOpen={customOpen}
       customStart={customStart}
       customEnd={customEnd}
@@ -169,7 +163,7 @@ export function HomePage() {
       selectedModels={selectedModels}
       busy={busy || rangeBusy}
       onSelect={selectPreset}
-      onQuickSelect={selectQuick}
+      onGranularitySelect={setGranularity}
       onCustomOpenChange={openCustom}
       onCustomStartChange={setCustomStart}
       onCustomEndChange={setCustomEnd}

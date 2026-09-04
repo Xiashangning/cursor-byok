@@ -214,9 +214,12 @@ function createOverview(params: URLSearchParams): Overview {
   const start = Number(params.get("start_ms"));
   const end = Number(params.get("end_ms"));
   const duration = Number.isFinite(start) && Number.isFinite(end) && end > start ? end - start : 365 * 86_400_000;
-  const granularity = duration <= 2 * 60 * 60_000 ? "minute" : duration <= 2 * 86_400_000 ? "hour" : "day";
-  const step = granularity === "minute" ? 60_000 : granularity === "hour" ? 3_600_000 : 86_400_000;
-  const count = granularity === "minute" ? Math.min(60, Math.max(10, Math.ceil(duration / step))) : granularity === "hour" ? Math.min(24, Math.max(8, Math.ceil(duration / step))) : Math.min(365, Math.max(7, Math.ceil(duration / step)));
+  const requested = Number(params.get("bucket_ms"));
+  const step = Number.isFinite(requested) && requested >= 60_000
+    ? requested
+    : duration <= 2 * 60 * 60_000 ? 60_000 : duration <= 2 * 86_400_000 ? 3_600_000 : 86_400_000;
+  const granularity = step < 3_600_000 ? "minute" : step < 86_400_000 ? "hour" : "day";
+  const count = Math.min(1440, Math.max(7, Math.ceil(duration / step)));
   const series = createSeries(count, step, Number.isFinite(end) && end > 0 ? end : FIXED_NOW);
   const totals = series.reduce((sum, bucket) => ({
     input: sum.input + bucket.input_tokens,

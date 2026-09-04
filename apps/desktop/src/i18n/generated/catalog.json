@@ -306,6 +306,18 @@
         }
       ]
     },
+    "0c184871f658375a": {
+      "source": "昨天",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
+          "line": 45,
+          "column": 34
+        }
+      ]
+    },
     "0c70665b6eb65f1a": {
       "source": "否",
       "kind": "text",
@@ -1005,7 +1017,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 176,
+          "line": 193,
           "column": 105
         },
         {
@@ -1606,7 +1618,12 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 185,
+          "line": 138,
+          "column": 19
+        },
+        {
+          "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
+          "line": 152,
           "column": 19
         }
       ]
@@ -1913,7 +1930,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 126,
+          "line": 133,
           "column": 9
         },
         {
@@ -1945,20 +1962,8 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 49,
+          "line": 54,
           "column": 37
-        }
-      ]
-    },
-    "51d04bc3d286f018": {
-      "source": "近1自然日",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 36,
-          "column": 30
         }
       ]
     },
@@ -1983,7 +1988,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 173,
+          "line": 190,
           "column": 70
         }
       ]
@@ -2252,18 +2257,6 @@
         }
       ]
     },
-    "609640f72d422b57": {
-      "source": "快捷时间范围",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 150,
-          "column": 56
-        }
-      ]
-    },
     "61a4c7bac12dc125": {
       "source": "异常调用：{count}",
       "kind": "template",
@@ -2328,7 +2321,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 177,
+          "line": 194,
           "column": 109
         }
       ]
@@ -2513,7 +2506,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 172,
+          "line": 189,
           "column": 21
         }
       ]
@@ -2785,6 +2778,18 @@
         }
       ]
     },
+    "7eb336e42cb5076b": {
+      "source": "自动",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
+          "line": 50,
+          "column": 35
+        }
+      ]
+    },
     "7f3c8312816fe26a": {
       "source": "刷新中…",
       "kind": "text",
@@ -2955,7 +2960,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 48,
+          "line": 53,
           "column": 37
         }
       ]
@@ -3417,7 +3422,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 172,
+          "line": 189,
           "column": 70
         }
       ]
@@ -3498,7 +3503,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 38,
+          "line": 46,
           "column": 29
         }
       ]
@@ -3942,12 +3947,12 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 128,
+          "line": 144,
           "column": 28
         },
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 128,
+          "line": 144,
           "column": 89
         },
         {
@@ -4336,7 +4341,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 110,
+          "line": 117,
           "column": 51
         }
       ]
@@ -4499,7 +4504,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 174,
+          "line": 191,
           "column": 61
         }
       ]
@@ -4622,7 +4627,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 39,
+          "line": 47,
           "column": 30
         }
       ]
@@ -4774,6 +4779,18 @@
         }
       ]
     },
+    "d5f5a7a010731feb": {
+      "source": "今天",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
+          "line": 44,
+          "column": 30
+        }
+      ]
+    },
     "d60669bb26a22f5d": {
       "source": "留空使用默认值",
       "kind": "text",
@@ -4872,7 +4889,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 35,
+          "line": 41,
           "column": 29
         }
       ]
@@ -4918,7 +4935,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 47,
+          "line": 52,
           "column": 37
         }
       ]
@@ -5211,18 +5228,6 @@
         }
       ]
     },
-    "e5043c7a2b408271": {
-      "source": "近10分钟",
-      "kind": "text",
-      "placeholders": [],
-      "refs": [
-        {
-          "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 37,
-          "column": 36
-        }
-      ]
-    },
     "e59ae97924d62f01": {
       "source": "第一页",
       "kind": "text",
@@ -5317,7 +5322,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 46,
+          "line": 51,
           "column": 32
         }
       ]
@@ -5517,7 +5522,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 173,
+          "line": 190,
           "column": 21
         }
       ]
@@ -5596,7 +5601,7 @@
       "refs": [
         {
           "file": "features/home/overview/OverviewTimeRangeFilter.tsx",
-          "line": 136,
+          "line": 179,
           "column": 19
         }
       ]
@@ -5808,7 +5813,7 @@
       "refs": [
         {
           "file": "features/home/HomePage.tsx",
-          "line": 180,
+          "line": 174,
           "column": 25
         }
       ]
