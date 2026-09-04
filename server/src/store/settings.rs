@@ -1,5 +1,5 @@
 //! Persists application settings.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,7 @@ const DESKTOP_SETTINGS_KEY: &str = "desktop_lifecycle";
 const COMMIT_SETTINGS_KEY: &str = "commit_settings";
 const DISABLED_PLUGIN_MODELS_KEY: &str = "disabled_plugin_models";
 const DISABLED_PLUGIN_ACCOUNTS_KEY: &str = "disabled_plugin_accounts";
+const PLUGIN_MODEL_OVERRIDES_KEY: &str = "plugin_model_overrides";
 
 /// Embedded default system prompt for commit message generation.
 pub const DEFAULT_COMMIT_PROMPT: &str = include_str!("../../prompt/cursor/commit/prompt.md");
@@ -139,6 +140,47 @@ pub(crate) struct ProxySettingsSecret {
     pub auth_enabled: bool,
     pub username: String,
     pub password: String,
+}
+
+/// 用户对单个插件模型的手工覆盖;字段为空/None 表示恢复插件默认。
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PluginModelOverride {
+    pub display_name: Option<String>,
+    pub tooltip: Option<String>,
+    pub effort_options: Option<Vec<String>>,
+    pub context_options: Option<Vec<String>>,
+    pub max_output_tokens: Option<u64>,
+}
+
+impl PluginModelOverride {
+    /// 归一覆盖:去除空白,空字符串/空数组/0 归一为 None;
+    /// 归一后等于默认值即代表"无覆盖",存储层据此删除条目。
+    pub fn normalized(self) -> Self {
+        let text = |value: Option<String>| {
+            value
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let options = |values: Option<Vec<String>>| {
+            values
+                .map(|values| {
+                    values
+                        .into_iter()
+                        .map(|value| value.trim().to_owned())
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|values| !values.is_empty())
+        };
+        Self {
+            display_name: text(self.display_name),
+            tooltip: text(self.tooltip),
+            effort_options: options(self.effort_options),
+            context_options: options(self.context_options),
+            max_output_tokens: self.max_output_tokens.filter(|tokens| *tokens > 0),
+        }
+    }
 }
 
 impl Store {
@@ -392,11 +434,50 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    pub async fn plugin_model_overrides(&self) -> Result<HashMap<String, PluginModelOverride>> {
+        let value = sqlx::query_scalar::<_, String>(
+            "SELECT value_json FROM service_settings WHERE setting_key = ?",
+        )
+        .bind(PLUGIN_MODEL_OVERRIDES_KEY)
+        .fetch_optional(&self.pool)
+        .await?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .unwrap_or_else(|| Ok(HashMap::new()))
+    }
+
+    /// 覆盖先归一再写入;全空时删除该模型的条目(即恢复插件默认)。
+    pub async fn set_plugin_model_override(
+        &self,
+        model_id: &str,
+        over: PluginModelOverride,
+    ) -> Result<()> {
+        // 读-改-写整体串行化,避免并发保存互相覆盖。
+        let _write = self.writes.lock().await;
+        let mut overrides = self.plugin_model_overrides().await?;
+        let over = over.normalized();
+        if over == PluginModelOverride::default() {
+            overrides.remove(model_id);
+        } else {
+            overrides.insert(model_id.to_owned(), over);
+        }
+        let value_json = serde_json::to_string(&overrides)?;
+        sqlx::query(
+            "INSERT INTO service_settings(setting_key, value_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(PLUGIN_MODEL_OVERRIDES_KEY)
+        .bind(value_json)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ProxyMode;
+    use super::{PluginModelOverride, ProxyMode, Store};
 
     #[test]
     fn default_proxy_mode_uses_the_default_wire_value() {
@@ -410,5 +491,43 @@ mod tests {
             ProxyMode::Default
         );
         assert!(serde_json::from_str::<ProxyMode>("\"system\"").is_err());
+    }
+
+    #[tokio::test]
+    async fn plugin_model_override_round_trips_and_drops_empty_entries() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let model_id = "plugin:dev.example/codex/org/gpt-5";
+        assert!(store.plugin_model_overrides().await.unwrap().is_empty());
+
+        store
+            .set_plugin_model_override(
+                model_id,
+                PluginModelOverride {
+                    display_name: Some("  Kimi K2 ".into()),
+                    tooltip: Some("   ".into()),
+                    effort_options: Some(vec!["low".into(), " ".into()]),
+                    context_options: Some(Vec::new()),
+                    max_output_tokens: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+        let overrides = store.plugin_model_overrides().await.unwrap();
+        assert_eq!(
+            overrides.get(model_id),
+            Some(&PluginModelOverride {
+                display_name: Some("Kimi K2".into()),
+                tooltip: None,
+                effort_options: Some(vec!["low".into()]),
+                context_options: None,
+                max_output_tokens: None,
+            })
+        );
+
+        store
+            .set_plugin_model_override(model_id, PluginModelOverride::default())
+            .await
+            .unwrap();
+        assert!(store.plugin_model_overrides().await.unwrap().is_empty());
     }
 }

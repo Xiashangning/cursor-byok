@@ -11,6 +11,7 @@ use crate::{
         ImportResponse, OAuthBeginResponse, OAuthPollResponse, PluginDescriptor,
         PluginRuntimeStatus,
     },
+    store::PluginModelOverride,
     Result,
 };
 
@@ -164,4 +165,35 @@ pub async fn set_disabled_accounts(
         .set_disabled_plugin_accounts(input.account_ids)
         .await?;
     Ok(Json(service.disabled_plugin_accounts().await?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelOverrideInput {
+    pub model_id: String,
+    pub display_name: String,
+    pub tooltip: String,
+    pub effort_options: Vec<String>,
+    pub context_options: Vec<String>,
+    pub max_output_tokens: Option<u64>,
+}
+
+/// 覆盖字段按"空值 = 恢复插件默认"归一后落库。
+pub async fn set_model_override(
+    State(service): State<ControlService>,
+    Json(input): Json<SetModelOverrideInput>,
+) -> Result<StatusCode> {
+    service
+        .set_plugin_model_override(
+            input.model_id,
+            PluginModelOverride {
+                display_name: Some(input.display_name),
+                tooltip: Some(input.tooltip),
+                effort_options: Some(input.effort_options),
+                context_options: Some(input.context_options),
+                max_output_tokens: input.max_output_tokens,
+            },
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

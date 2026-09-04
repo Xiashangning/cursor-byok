@@ -124,8 +124,8 @@ fn create_main_window(
         .expect("local frontend URL");
     let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::External(url))
         .title("Cursor BYOK")
-        .inner_size(820.0, 558.0)
-        .min_inner_size(820.0, 558.0)
+        .inner_size(902.0, 558.0)
+        .min_inner_size(902.0, 558.0)
         .center()
         .background_color(Color(20, 20, 20, 255))
         .decorations(cfg!(target_os = "macos"))

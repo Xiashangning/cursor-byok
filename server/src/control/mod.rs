@@ -137,6 +137,10 @@ pub fn api_router(service: ControlService) -> Router {
             get(plugins::get_disabled_models).put(plugins::set_disabled_models),
         )
         .route(
+            "/__byok-api__/api/plugins/model-overrides",
+            put(plugins::set_model_override),
+        )
+        .route(
             "/__byok-api__/api/plugins/disabled-accounts",
             get(plugins::get_disabled_accounts).put(plugins::set_disabled_accounts),
         )

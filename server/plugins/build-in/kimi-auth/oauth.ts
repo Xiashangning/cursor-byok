@@ -1,11 +1,10 @@
 import type { JsonValue, PluginContext } from "cursor-byok:plugin";
 import type { OAuth2AddMethod, OAuth2Begin, OAuth2Poll } from "cursor-byok:resource";
 import { credentialDraft } from "./resources.ts";
+import { OAUTH_CLIENT_ID, OAUTH_TOKEN_URL } from "./token.ts";
 
 // 与官方 Kimi CLI 相同的 Kimi Code 设备授权客户端。
-const CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const DEVICE_CODE_URL = "https://auth.kimi.com/api/oauth/device_authorization";
-const TOKEN_URL = "https://auth.kimi.com/api/oauth/token";
 
 type Session = {
   deviceCode: string;
@@ -52,7 +51,7 @@ async function begin(context: PluginContext): Promise<OAuth2Begin> {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
     },
-    body: new URLSearchParams({ client_id: CLIENT_ID }).toString(),
+    body: new URLSearchParams({ client_id: OAUTH_CLIENT_ID }).toString(),
   });
   const body = parseBody(response.body);
   if (response.status < 200 || response.status >= 300) {
@@ -81,7 +80,7 @@ async function begin(context: PluginContext): Promise<OAuth2Begin> {
 
 async function poll(sessionValue: JsonValue, context: PluginContext): Promise<OAuth2Poll> {
   const session = parseSession(sessionValue);
-  const response = await context.network.fetch(TOKEN_URL, {
+  const response = await context.network.fetch(OAUTH_TOKEN_URL, {
     method: "POST",
     headers: {
       accept: "application/json",
@@ -89,7 +88,7 @@ async function poll(sessionValue: JsonValue, context: PluginContext): Promise<OA
     },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-      client_id: CLIENT_ID,
+      client_id: OAUTH_CLIENT_ID,
       device_code: session.deviceCode,
     }).toString(),
   });

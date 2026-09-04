@@ -23,8 +23,8 @@ use crate::{
     plugin::{PluginDescriptor, PluginRegistry, PluginRuntime, PluginRuntimeStatus},
     provider::{is_valid_response_event, ModelEvent, Provider},
     store::{
-        CommitSettings, DesktopSettings, PortSettings, ProxySettings, ProxySettingsInput,
-        StatisticsStorage, Store, TabSettings,
+        CommitSettings, DesktopSettings, PluginModelOverride, PortSettings, ProxySettings,
+        ProxySettingsInput, StatisticsStorage, Store, TabSettings,
     },
     Error, Result,
 };
@@ -250,7 +250,12 @@ impl ControlService {
     }
 
     pub async fn disabled_plugin_models(&self) -> Result<Vec<String>> {
-        let mut list: Vec<_> = self.store.disabled_plugin_models().await?.into_iter().collect();
+        let mut list: Vec<_> = self
+            .store
+            .disabled_plugin_models()
+            .await?
+            .into_iter()
+            .collect();
         list.sort();
         Ok(list)
     }
@@ -261,7 +266,12 @@ impl ControlService {
     }
 
     pub async fn disabled_plugin_accounts(&self) -> Result<Vec<String>> {
-        let mut list: Vec<_> = self.store.disabled_plugin_accounts().await?.into_iter().collect();
+        let mut list: Vec<_> = self
+            .store
+            .disabled_plugin_accounts()
+            .await?
+            .into_iter()
+            .collect();
         list.sort();
         Ok(list)
     }
@@ -269,6 +279,14 @@ impl ControlService {
     pub async fn set_disabled_plugin_accounts(&self, account_ids: Vec<String>) -> Result<()> {
         let set = account_ids.into_iter().collect();
         self.store.set_disabled_plugin_accounts(&set).await
+    }
+
+    pub async fn set_plugin_model_override(
+        &self,
+        model_id: String,
+        over: PluginModelOverride,
+    ) -> Result<()> {
+        self.store.set_plugin_model_override(&model_id, over).await
     }
 
     pub async fn models(&self) -> Result<Vec<ModelConfig>> {

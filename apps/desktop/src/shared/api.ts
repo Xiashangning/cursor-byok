@@ -248,7 +248,18 @@ export interface PluginModelDescriptor {
   icon: string;
   providerType: string;
   maxOutputTokens: number | null;
+  effortOptions: string[];
+  contextOptions: string[];
   images: boolean;
+}
+
+export interface PluginModelOverrideInput {
+  modelId: string;
+  displayName: string;      // "" ⇒ 重置为插件默认
+  tooltip: string;          // "" ⇒ 重置
+  effortOptions: string[];  // [] ⇒ 重置
+  contextOptions: string[]; // [] ⇒ 重置
+  maxOutputTokens: number | null; // null ⇒ 重置
 }
 
 export interface PluginProviderDescriptor {
@@ -553,6 +564,7 @@ export const api = {
   refreshPluginResource: (pluginId: string, resourceType: string, resourceId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}/refresh`, { method: "POST" }),
   deletePluginResource: (pluginId: string, resourceType: string, resourceId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}`, { method: "DELETE" }),
   syncPluginModels: (pluginId: string, providerId: string) => request<{ models: number }>(`/plugins/${encodeURIComponent(pluginId)}/providers/${encodeURIComponent(providerId)}/models/sync`, { method: "POST" }),
+  setPluginModelOverride: (input: PluginModelOverrideInput) => request<void>("/plugins/model-overrides", { method: "PUT", body: JSON.stringify(input) }),
   pluginResourceExportUrl: (servicePort: number, pluginId: string, resourceType: string) => `http://127.0.0.1:${servicePort}${API_ROOT}/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/export`,
   removePluginConfiguration: (pluginId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}`, { method: "DELETE" }),
   pluginRuntime: () => request<PluginRuntimeStatus>("/plugins/runtime"),

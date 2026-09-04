@@ -84,9 +84,7 @@ impl PluginDataStore {
         let _guard = lock.lock().await;
         let current = match tokio::fs::read(&path).await {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                serde_json::Value::Null
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
             Err(error) => {
                 return Err(Error::Config(format!(
                     "plugin data read failed at {}: {error}",
@@ -95,14 +93,12 @@ impl PluginDataStore {
             }
         };
         let next = modify(current)?;
-        self.write_locked(&path, key, &next)
-            .await
-            .map_err(|error| {
-                Error::Config(format!(
-                    "plugin data write failed at {}: {error}",
-                    path.display()
-                ))
-            })
+        self.write_locked(&path, key, &next).await.map_err(|error| {
+            Error::Config(format!(
+                "plugin data write failed at {}: {error}",
+                path.display()
+            ))
+        })
     }
 
     /// 全程使用同步 IO 在阻塞线程完成:tokio 异步文件的关闭是延迟的,

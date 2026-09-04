@@ -1,4 +1,5 @@
-import type { JsonValue, PluginContext } from "cursor-byok:plugin";
+import type { JsonValue, NetworkResponse, PluginContext } from "cursor-byok:plugin";
+import { refreshBundle } from "./token.ts";
 import type {
   ResourceDraft,
   ResourceImportFile,
@@ -125,6 +126,35 @@ export function accountData(resource: ResourceSnapshot): AccountData {
   };
 }
 
+/** 令牌剩余寿命低于该值时提前刷新,避免每次会话开头都先吃一次 401。 */
+const EXPIRY_SKEW_MS = 60_000;
+
+/** 访问令牌的过期时刻;JWT exp 声明缺失时返回 0(视为无已知过期)。 */
+export function tokenExpiryMs(data: AccountData): number {
+  return (number(decodeJwtPayload(data.accessToken)?.exp) ?? 0) * 1000;
+}
+
+/** 令牌是否临期;exp 缺失时视为未过期,由调用 401 后的兜底刷新处理。 */
+export function tokenExpiring(data: AccountData, nowMs = Date.now()): boolean {
+  const expiry = tokenExpiryMs(data);
+  return expiry !== 0 && expiry <= nowMs + EXPIRY_SKEW_MS;
+}
+
+/** 用 refresh_token 换新令牌;返回 null 表示刷新被拒,需要重新登录。 */
+export async function refreshAccessToken(
+  data: AccountData,
+  context: PluginContext,
+): Promise<AccountData | null> {
+  if (!data.refreshToken) return null;
+  const bundle = await refreshBundle(data.refreshToken, context);
+  if (!bundle) return null;
+  return {
+    ...data,
+    accessToken: bundle.accessToken,
+    refreshToken: bundle.refreshToken ?? data.refreshToken,
+  };
+}
+
 function clampPercent(value: number): number {
   return Math.max(0, Math.min(100, value));
 }
@@ -238,23 +268,25 @@ export function presentAccount(resource: ResourceSnapshot): ResourceView {
   };
 }
 
-/** 先验证凭证,再查订阅额度;额度查询失败不影响凭证结论。 */
+/** 先验证凭证(被拒时先尝试刷新令牌),再查订阅额度;额度查询失败不影响凭证结论。 */
 export async function refreshAccount(
   resource: ResourceSnapshot,
   context: PluginContext,
 ): Promise<ResourcePatch> {
-  const data = accountData(resource);
-  const response = await context.network.fetch(MODELS_URL, {
-    method: "GET",
-    headers: {
-      accept: "application/json",
-      authorization: `Bearer ${data.accessToken}`,
-    },
-  });
-  if (response.status === 401 || response.status === 403) {
-    return {
-      state: { status: "invalid", message: "Kimi authorization expired; sign in again" },
-    };
+  let data = accountData(resource);
+  let rotated = false;
+  let response = await checkCredentials(data, context);
+  if (isRejected(response.status) && data.refreshToken) {
+    const refreshed = await refreshAccessToken(data, context);
+    if (!refreshed) {
+      return { state: { status: "invalid", message: EXPIRED_MESSAGE } };
+    }
+    data = refreshed;
+    rotated = true;
+    response = await checkCredentials(data, context);
+  }
+  if (isRejected(response.status)) {
+    return { state: { status: "invalid", message: EXPIRED_MESSAGE } };
   }
   if (response.status < 200 || response.status >= 300) {
     throw new Error(`Kimi credential check failed (HTTP ${response.status}): ${response.body}`);
@@ -274,11 +306,32 @@ export async function refreshAccount(
   } catch {
     // 额度是锦上添花:查询失败时保持 ready。
   }
-  if (!quota) return { state: { status: "ready" } };
+  if (!quota) {
+    return rotated ? { privateData: data as unknown as JsonValue } : { state: { status: "ready" } };
+  }
   return {
     privateData: { ...data, quota } as unknown as JsonValue,
     state: quotaState(quota),
   };
+}
+
+const EXPIRED_MESSAGE = "Kimi authorization expired; sign in again";
+
+function isRejected(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
+function checkCredentials(
+  data: AccountData,
+  context: PluginContext,
+): Promise<NetworkResponse> {
+  return context.network.fetch(MODELS_URL, {
+    method: "GET",
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${data.accessToken}`,
+    },
+  });
 }
 
 function firstText(source: Record<string, unknown>, keys: string[]): string | null {

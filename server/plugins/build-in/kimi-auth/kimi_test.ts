@@ -10,13 +10,16 @@ import { kimiDeviceOAuth } from "./oauth.ts";
 import { FALLBACK_MODELS, kimiModels, parseKimiModels } from "./models.ts";
 import { kimiProvider } from "./provider.ts";
 import {
+  accountData,
   accountIdentity,
   credentialDraft,
   parseCredentialFiles,
   parseKimiUsage,
   presentAccount,
+  refreshAccessToken,
   refreshAccount,
   RESOURCE_TYPE,
+  tokenExpiring,
 } from "./resources.ts";
 
 function assert(condition: unknown, message = "assertion failed"): asserts condition {
@@ -38,7 +41,10 @@ function jwt(payload: Record<string, unknown>): string {
 }
 
 type RequestInit = { body?: string; headers?: Record<string, string> };
-type FetchHandler = (url: string, init?: RequestInit) => NetworkResponse;
+type FetchHandler = (
+  url: string,
+  init?: RequestInit,
+) => NetworkResponse | Promise<NetworkResponse>;
 type StreamHandler = (url: string, init?: RequestInit) => NetworkEventStream;
 
 function context(handlers: { fetch?: FetchHandler; stream?: StreamHandler }): PluginContext {
@@ -57,9 +63,9 @@ function context(handlers: { fetch?: FetchHandler; stream?: StreamHandler }): Pl
   };
 }
 
-function snapshot(privateData: JsonValue): ResourceSnapshot {
+function snapshot(privateData: JsonValue, id = "resource-1"): ResourceSnapshot {
   return {
-    id: "resource-1",
+    id,
     type: RESOURCE_TYPE,
     key: "kimi:user-1",
     privateData,
@@ -480,4 +486,273 @@ Deno.test("invoke maps authorization failures to an invalid resource error", asy
   );
   assert(result.status === "resource-error", `expected resource-error, received ${result.status}`);
   assert(result.patch.state?.status === "invalid", "auth failure should invalidate the resource");
+});
+
+Deno.test("refreshAccessToken rotates tokens through the refresh grant", async () => {
+  const draft = await credentialDraft({
+    accessToken: jwt({ sub: "user-1" }),
+    refreshToken: "refresh-old",
+    displayName: null,
+  });
+  let requestedBody = "";
+  const refreshed = await refreshAccessToken(
+    accountData(snapshot(draft.privateData)),
+    context({
+      fetch: (url, init) => {
+        assertEquals(url, "https://auth.kimi.com/api/oauth/token");
+        requestedBody = init?.body ?? "";
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({ access_token: "token-new", refresh_token: "refresh-new" }),
+        };
+      },
+    }),
+  );
+  assert(requestedBody.includes("grant_type=refresh_token"), "must use the refresh_token grant");
+  assert(
+    requestedBody.includes("client_id=17e5f671-d194-4dfb-9706-5516cb48c098"),
+    "must send the official Kimi Code client id",
+  );
+  assert(requestedBody.includes("refresh_token=refresh-old"), "must send the stored refresh token");
+  assertEquals(refreshed?.accessToken, "token-new");
+  assertEquals(refreshed?.refreshToken, "refresh-new");
+});
+
+Deno.test("refreshAccessToken returns null when the refresh grant is rejected", async () => {
+  const draft = await credentialDraft({
+    accessToken: jwt({ sub: "user-1" }),
+    refreshToken: "refresh-old",
+    displayName: null,
+  });
+  const refreshed = await refreshAccessToken(
+    accountData(snapshot(draft.privateData)),
+    context({
+      fetch: () => ({ status: 401, headers: {}, body: "{}" }),
+    }),
+  );
+  assertEquals(refreshed, null);
+});
+
+Deno.test("tokenExpiring tracks the JWT exp claim with a refresh skew", async () => {
+  const now = 1_800_000_000_000;
+  const data = async (payload: Record<string, unknown>) =>
+    accountData(snapshot(
+      (await credentialDraft({ accessToken: jwt(payload), refreshToken: null, displayName: null }))
+        .privateData,
+    ));
+  assert(!tokenExpiring(await data({ sub: "user-1" }), now), "missing exp never expires");
+  assert(tokenExpiring(await data({ sub: "user-1", exp: now / 1000 - 10 }), now));
+  assert(
+    tokenExpiring(await data({ sub: "user-1", exp: (now + 30_000) / 1000 }), now),
+    "within the 60s skew counts as expiring",
+  );
+  assert(!tokenExpiring(await data({ sub: "user-1", exp: (now + 120_000) / 1000 }), now));
+});
+
+Deno.test("invoke refreshes an expiring token before calling and persists it", async () => {
+  const expired = jwt({ sub: "user-1", exp: Math.floor(Date.now() / 1000) - 60 });
+  const draft = await credentialDraft({
+    accessToken: expired,
+    refreshToken: "refresh-old",
+    displayName: null,
+  });
+  let streamCalls = 0;
+  const result = await kimiProvider.invoke(
+    {
+      model: { id: "kimi-for-coding", displayName: "Kimi for Coding" },
+      resource: snapshot(draft.privateData, "resource-expiring"),
+      request: request(),
+    },
+    { emit: () => {} },
+    context({
+      fetch: (url) => {
+        assertEquals(url, "https://auth.kimi.com/api/oauth/token");
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({ access_token: "token-new", refresh_token: "refresh-new" }),
+        };
+      },
+      stream: (_url, init) => {
+        streamCalls++;
+        assertEquals(init?.headers?.authorization, "Bearer token-new");
+        return {
+          status: 200,
+          headers: {},
+          lines: sse([
+            'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+            "data: [DONE]",
+          ]),
+        };
+      },
+    }),
+  );
+  assertEquals(streamCalls, 1);
+  assert(result.status === "completed", `expected completed, received ${result.status}`);
+  const data = result.patch?.privateData as Record<string, unknown>;
+  assertEquals(data.accessToken, "token-new");
+  assertEquals(data.refreshToken, "refresh-new");
+});
+
+Deno.test("invoke refreshes once and retries after an authorization failure", async () => {
+  const token = jwt({ sub: "user-1" });
+  const draft = await credentialDraft({
+    accessToken: token,
+    refreshToken: "refresh-old",
+    displayName: null,
+  });
+  let streamCalls = 0;
+  const result = await kimiProvider.invoke(
+    {
+      model: { id: "kimi-for-coding", displayName: "Kimi for Coding" },
+      resource: snapshot(draft.privateData, "resource-retry"),
+      request: request(),
+    },
+    { emit: () => {} },
+    context({
+      fetch: () => ({
+        status: 200,
+        headers: {},
+        body: JSON.stringify({ access_token: "token-new", refresh_token: "refresh-new" }),
+      }),
+      stream: (_url, init) => {
+        streamCalls++;
+        if (streamCalls === 1) {
+          assertEquals(init?.headers?.authorization, `Bearer ${token}`);
+          return { status: 401, headers: {}, lines: sse(['{"error":"expired"}']) };
+        }
+        assertEquals(init?.headers?.authorization, "Bearer token-new");
+        return {
+          status: 200,
+          headers: {},
+          lines: sse([
+            'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+            "data: [DONE]",
+          ]),
+        };
+      },
+    }),
+  );
+  assertEquals(streamCalls, 2);
+  assert(result.status === "completed", `expected completed, received ${result.status}`);
+  const data = result.patch?.privateData as Record<string, unknown>;
+  assertEquals(data.accessToken, "token-new");
+});
+
+Deno.test("invoke marks the account invalid when the refresh grant is rejected", async () => {
+  const draft = await credentialDraft({
+    accessToken: jwt({ sub: "user-1" }),
+    refreshToken: "refresh-old",
+    displayName: null,
+  });
+  const result = await kimiProvider.invoke(
+    {
+      model: { id: "kimi-for-coding", displayName: "Kimi for Coding" },
+      resource: snapshot(draft.privateData, "resource-rejected"),
+      request: request(),
+    },
+    { emit: () => {} },
+    context({
+      fetch: () => ({ status: 401, headers: {}, body: "{}" }),
+      stream: () => ({ status: 401, headers: {}, lines: sse(['{"error":"expired"}']) }),
+    }),
+  );
+  assert(result.status === "resource-error", `expected resource-error, received ${result.status}`);
+  assertEquals(result.patch.state, {
+    status: "invalid",
+    message: "Kimi authorization expired; sign in again",
+  });
+});
+
+Deno.test("concurrent invokes of the same account share a single refresh", async () => {
+  const expired = jwt({ sub: "user-1", exp: Math.floor(Date.now() / 1000) - 60 });
+  const draft = await credentialDraft({
+    accessToken: expired,
+    refreshToken: "refresh-shared",
+    displayName: null,
+  });
+  let refreshCalls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const sharedContext = context({
+    fetch: () => {
+      refreshCalls++;
+      return gate.then(() => ({
+        status: 200,
+        headers: {},
+        body: JSON.stringify({ access_token: "token-new", refresh_token: "refresh-new" }),
+      }));
+    },
+    stream: () => ({
+      status: 200,
+      headers: {},
+      lines: sse([
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+        "data: [DONE]",
+      ]),
+    }),
+  });
+  const invokeInput = () => ({
+    model: { id: "kimi-for-coding", displayName: "Kimi for Coding" },
+    resource: snapshot(draft.privateData, "resource-shared"),
+    request: request(),
+  });
+  const first = kimiProvider.invoke(invokeInput(), { emit: () => {} }, sharedContext);
+  const second = kimiProvider.invoke(invokeInput(), { emit: () => {} }, sharedContext);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  release();
+  const results = await Promise.all([first, second]);
+  assertEquals(refreshCalls, 1);
+  for (const result of results) {
+    assert(
+      result.status === "completed",
+      `expected completed, received ${result.status}`,
+    );
+  }
+});
+
+Deno.test("refresh recovers an expired account through the refresh grant", async () => {
+  const expired = jwt({ sub: "user-1", exp: Math.floor(Date.now() / 1000) - 60 });
+  const draft = await credentialDraft({
+    accessToken: expired,
+    refreshToken: "refresh-old",
+    displayName: null,
+  });
+  const requests: Array<{ url: string; authorization: string }> = [];
+  const patch = await refreshAccount(
+    snapshot(draft.privateData, "resource-recover"),
+    context({
+      fetch: (url, init) => {
+        const authorization = init?.headers?.authorization ?? "";
+        requests.push({ url, authorization });
+        if (url.endsWith("/models")) {
+          return authorization === "Bearer token-new"
+            ? { status: 200, headers: {}, body: '{"data":[]}' }
+            : { status: 401, headers: {}, body: "{}" };
+        }
+        if (url.endsWith("/usages")) {
+          return { status: 500, headers: {}, body: "{}" };
+        }
+        assertEquals(url, "https://auth.kimi.com/api/oauth/token");
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({ access_token: "token-new", refresh_token: "refresh-new" }),
+        };
+      },
+    }),
+  );
+  assertEquals(
+    requests.filter((request) => request.url.endsWith("/models")).map((request) =>
+      request.authorization
+    ),
+    [`Bearer ${expired}`, "Bearer token-new"],
+  );
+  const data = patch.privateData as Record<string, unknown>;
+  assertEquals(data.accessToken, "token-new");
+  assertEquals(data.refreshToken, "refresh-new");
+  assertEquals(patch.state, undefined);
 });
