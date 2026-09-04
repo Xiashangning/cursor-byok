@@ -254,21 +254,30 @@ mod tests {
     fn explicit_buckets_cover_calendar_day_and_month_windows() {
         let day_start_ms = 1_800_000_000_000;
 
-        let (granularity, bucket_ms, series_start_ms, bucket_count) =
-            token_usage_buckets(Some(day_start_ms), Some(day_start_ms + DAY_MS), Some(15 * MINUTE_MS));
+        let (granularity, bucket_ms, series_start_ms, bucket_count) = token_usage_buckets(
+            Some(day_start_ms),
+            Some(day_start_ms + DAY_MS),
+            Some(15 * MINUTE_MS),
+        );
         assert_eq!(granularity, TokenUsageGranularity::Minute);
         assert_eq!(bucket_ms, 15 * MINUTE_MS);
         assert_eq!(series_start_ms, day_start_ms);
         assert_eq!(bucket_count, 96);
 
-        let (_, bucket_ms, series_start_ms, bucket_count) =
-            token_usage_buckets(Some(day_start_ms), Some(day_start_ms + DAY_MS), Some(30 * MINUTE_MS));
+        let (_, bucket_ms, series_start_ms, bucket_count) = token_usage_buckets(
+            Some(day_start_ms),
+            Some(day_start_ms + DAY_MS),
+            Some(30 * MINUTE_MS),
+        );
         assert_eq!(bucket_ms, 30 * MINUTE_MS);
         assert_eq!(series_start_ms, day_start_ms);
         assert_eq!(bucket_count, 48);
 
-        let (granularity, bucket_ms, _, bucket_count) =
-            token_usage_buckets(Some(day_start_ms), Some(day_start_ms + 30 * DAY_MS), Some(HOUR_MS));
+        let (granularity, bucket_ms, _, bucket_count) = token_usage_buckets(
+            Some(day_start_ms),
+            Some(day_start_ms + 30 * DAY_MS),
+            Some(HOUR_MS),
+        );
         assert_eq!(granularity, TokenUsageGranularity::Hour);
         assert_eq!(bucket_ms, HOUR_MS);
         assert_eq!(bucket_count, 720);
@@ -394,12 +403,38 @@ mod tests {
         .await
         .unwrap();
         let base_ms = 1_800_000_000_000;
-        insert_call(&store, "before", "anthropic", base_ms - HOUR_MS, [500, 0, 0, 0]).await;
-        insert_call(&store, "first", "anthropic", base_ms + MINUTE_MS, [10, 0, 0, 0]).await;
-        insert_call(&store, "second", "anthropic", base_ms + 20 * MINUTE_MS, [30, 0, 0, 0]).await;
+        insert_call(
+            &store,
+            "before",
+            "anthropic",
+            base_ms - HOUR_MS,
+            [500, 0, 0, 0],
+        )
+        .await;
+        insert_call(
+            &store,
+            "first",
+            "anthropic",
+            base_ms + MINUTE_MS,
+            [10, 0, 0, 0],
+        )
+        .await;
+        insert_call(
+            &store,
+            "second",
+            "anthropic",
+            base_ms + 20 * MINUTE_MS,
+            [30, 0, 0, 0],
+        )
+        .await;
 
         let overview = store
-            .overview(Some(base_ms), Some(base_ms + HOUR_MS), None, Some(15 * MINUTE_MS))
+            .overview(
+                Some(base_ms),
+                Some(base_ms + HOUR_MS),
+                None,
+                Some(15 * MINUTE_MS),
+            )
             .await
             .unwrap();
 
