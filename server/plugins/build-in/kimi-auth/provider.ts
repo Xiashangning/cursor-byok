@@ -5,7 +5,7 @@ import type {
   ProviderResult,
   ProviderSupport,
 } from "cursor-byok:provider";
-import { HttpError, streamOpenAiChat } from "cursor-byok:protocol/openai-chat";
+import { HttpError, streamOpenAiResponses } from "cursor-byok:protocol/openai-responses";
 import { kimiModels } from "./models.ts";
 import {
   type AccountData,
@@ -17,7 +17,7 @@ import {
   tokenExpiryMs,
 } from "./resources.ts";
 
-const CHAT_URL = "https://api.kimi.com/coding/v1/chat/completions";
+const RESPONSES_URL = "https://api.kimi.com/coding/v1/responses";
 const EXPIRED_MESSAGE = "Kimi authorization expired; sign in again";
 
 function invalidResult(message: string, stateMessage: string): ProviderResult {
@@ -88,11 +88,11 @@ async function invoke(
   }
   for (let attempt = 0;; attempt++) {
     try {
-      await streamOpenAiChat(
+      await streamOpenAiResponses(
         {
-          url: CHAT_URL,
+          url: RESPONSES_URL,
           model: input.model.id,
-          // Kimi Code 端点是否接受 reasoning_effort 与 service_tier 未验证;思考由模型自身决定。
+          // Kimi Code 端点是否接受 reasoning 与 service_tier 未验证;思考由模型自身决定。
           request: {
             ...input.request,
             reasoning: { enabled: false, effort: null },

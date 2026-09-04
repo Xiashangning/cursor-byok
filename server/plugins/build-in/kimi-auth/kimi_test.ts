@@ -400,7 +400,7 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
   assertEquals(requestNumber, 3);
 });
 
-Deno.test("invoke streams normalized events from the Kimi Code Chat Completions API", async () => {
+Deno.test("invoke streams normalized events from the Kimi Code Responses API", async () => {
   const token = jwt({ sub: "user-1" });
   const draft = await credentialDraft({
     accessToken: token,
@@ -419,17 +419,17 @@ Deno.test("invoke streams normalized events from the Kimi Code Chat Completions 
     { emit: (event) => events.push(event) },
     context({
       stream: (url, init) => {
-        assertEquals(url, "https://api.kimi.com/coding/v1/chat/completions");
+        assertEquals(url, "https://api.kimi.com/coding/v1/responses");
         requestBody = init?.body ?? "";
         requestHeaders = init?.headers ?? {};
         return {
           status: 200,
           headers: {},
           lines: sse([
-            'data: {"choices":[{"delta":{"content":"Hel"}}]}',
-            'data: {"choices":[{"delta":{"content":"lo"}}]}',
-            'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}',
-            "data: [DONE]",
+            'data: {"type":"response.output_text.delta","output_index":0,"delta":"Hel"}',
+            'data: {"type":"response.output_text.delta","output_index":0,"delta":"lo"}',
+            'data: {"type":"response.output_text.done","output_index":0,"text":"Hello"}',
+            'data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":2}}}',
           ]),
         };
       },
@@ -439,8 +439,14 @@ Deno.test("invoke streams normalized events from the Kimi Code Chat Completions 
   const body = JSON.parse(requestBody) as Record<string, unknown>;
   assertEquals(body.model, "kimi-for-coding");
   assertEquals(body.stream, true);
-  assert(!("reasoning_effort" in body), "Kimi Code endpoint receives no reasoning_effort");
+  assert(!("reasoning" in body), "Kimi Code endpoint receives no reasoning field");
   assert(!("service_tier" in body), "Kimi Code endpoint receives no service_tier");
+  assertEquals(body.input, [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+  ]);
+  assertEquals(body.include, ["reasoning.encrypted_content"]);
+  assertEquals(body.max_output_tokens, 32_000);
+  assertEquals(body.prompt_cache_key, "conversation-1");
   assertEquals(requestHeaders["authorization"], `Bearer ${token}`);
   assertEquals(events, [
     { type: "text-start" },
@@ -581,8 +587,9 @@ Deno.test("invoke refreshes an expiring token before calling and persists it", a
           status: 200,
           headers: {},
           lines: sse([
-            'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
-            "data: [DONE]",
+            'data: {"type":"response.output_text.delta","output_index":0,"delta":"ok"}',
+            'data: {"type":"response.output_text.done","output_index":0,"text":"ok"}',
+            'data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}',
           ]),
         };
       },
@@ -627,8 +634,9 @@ Deno.test("invoke refreshes once and retries after an authorization failure", as
           status: 200,
           headers: {},
           lines: sse([
-            'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
-            "data: [DONE]",
+            'data: {"type":"response.output_text.delta","output_index":0,"delta":"ok"}',
+            'data: {"type":"response.output_text.done","output_index":0,"text":"ok"}',
+            'data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}',
           ]),
         };
       },
@@ -690,8 +698,9 @@ Deno.test("concurrent invokes of the same account share a single refresh", async
       status: 200,
       headers: {},
       lines: sse([
-        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
-        "data: [DONE]",
+        'data: {"type":"response.output_text.delta","output_index":0,"delta":"ok"}',
+        'data: {"type":"response.output_text.done","output_index":0,"text":"ok"}',
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}',
       ]),
     }),
   });
