@@ -75,8 +75,10 @@ async fn background_subagent_completion_starts_a_simulated_parent_turn() {
         .await
         .unwrap();
     assert!(messages.iter().any(|message| {
-        message.runtime_event_id.as_deref()
-            == Some("background-completed:BACKGROUND_TASK_KIND_SUBAGENT:child-id:task-call")
+        message
+            .runtime_event_id
+            .as_deref()
+            .is_some_and(|event_id| event_id.starts_with("background-completed:"))
             && matches!(&message.content, MessageContent::Parts { parts } if !parts.is_empty())
     }));
 
@@ -109,32 +111,7 @@ async fn background_subagent_completion_starts_a_simulated_parent_turn() {
         Some("child-id")
     );
 
-    provider.push(stop_response("model-call-2", "followed up again"));
-    let second = registry
-        .get_or_create("completion-request-2")
-        .await
-        .unwrap();
-    drive_completion(
-        &second,
-        completion_run("child-id-2", "reusable-parent-run-2", checkpoint),
-    )
-    .await;
-
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
-    let runtime_ids = requests[1]
-        .history
-        .iter()
-        .map(|message| message.message_id.as_str())
-        .filter(|id| id.starts_with("runtime:"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        runtime_ids,
-        [
-            "runtime:background-completed:BACKGROUND_TASK_KIND_SUBAGENT:child-id:task-call",
-            "runtime:background-completed:BACKGROUND_TASK_KIND_SUBAGENT:child-id-2:task-call"
-        ]
-    );
+    assert_eq!(provider.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -219,7 +196,7 @@ async fn retrying_one_background_completion_reuses_its_runtime_message() {
         PromptCompiler::new(assets),
     );
     let first = registry.get_or_create("completion-retry-1").await.unwrap();
-    let (checkpoint, _) = drive_completion(
+    let (_checkpoint, _) = drive_completion(
         &first,
         completion_run(
             "retry-child",
@@ -232,14 +209,18 @@ async fn retrying_one_background_completion_reuses_its_runtime_message() {
     )
     .await;
 
-    provider.push(stop_response("model-call-2", "followed up again"));
     let second = registry.get_or_create("completion-retry-2").await.unwrap();
-    drive_completion(
+    drive_ignored_completion(
         &second,
-        completion_run("retry-child", "completion-retry-run-2", checkpoint),
+        completion_run(
+            "retry-child",
+            "completion-retry-run-2",
+            pb::ConversationStateStructure::default(),
+        ),
     )
     .await;
 
+    assert_eq!(provider.requests().len(), 1);
     let messages = store
         .load_current_messages(&cursor_server::model::ConversationId::new(
             "parent-conversation",
@@ -250,10 +231,10 @@ async fn retrying_one_background_completion_reuses_its_runtime_message() {
         messages
             .iter()
             .filter(|message| {
-                message.runtime_event_id.as_deref()
-                    == Some(
-                        "background-completed:BACKGROUND_TASK_KIND_SUBAGENT:retry-child:task-call",
-                    )
+                message
+                    .runtime_event_id
+                    .as_deref()
+                    .is_some_and(|event_id| event_id.starts_with("background-completed:"))
             })
             .count(),
         1
@@ -261,7 +242,82 @@ async fn retrying_one_background_completion_reuses_its_runtime_message() {
 }
 
 #[tokio::test]
-async fn completion_already_consumed_by_await_does_not_start_another_parent_turn() {
+async fn conflicting_terminal_status_fails_without_another_provider_call() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    provider.push(stop_response("first-call", "processed success"));
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+    let first = registry.get_or_create("conflict-request-1").await.unwrap();
+    let (checkpoint, _) = drive_completion(
+        &first,
+        completion_run(
+            "conflict-task",
+            "conflict-run-1",
+            pb::ConversationStateStructure::default(),
+        ),
+    )
+    .await;
+
+    let mut conflicting = subagent_completion("conflict-task", "another-call", "failed later");
+    conflicting.status = pb::BackgroundTaskStatus::Error as i32;
+    let second = registry.get_or_create("conflict-request-2").await.unwrap();
+    drive_failed_completion(
+        &second,
+        completion_batch_run("conflict-run-2", checkpoint, vec![conflicting]),
+    )
+    .await;
+
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn missing_conversation_id_keeps_completion_claims_request_scoped() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    provider.push(stop_response("missing-1", "first"));
+    provider.push(stop_response("missing-2", "second"));
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+
+    for request_id in ["missing-conversation-1", "missing-conversation-2"] {
+        let handle = registry.get_or_create(request_id).await.unwrap();
+        let mut request = completion_run(
+            "same-task",
+            request_id,
+            pb::ConversationStateStructure::default(),
+        );
+        let Some(pb::agent_client_message::Message::RunRequest(run)) = request.message.as_mut()
+        else {
+            unreachable!()
+        };
+        run.conversation_id = None;
+        drive_completion(&handle, request).await;
+    }
+
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn persisted_await_consumption_does_not_start_another_parent_turn() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();
     let assets = PromptAssets::load(
@@ -275,6 +331,20 @@ async fn completion_already_consumed_by_await_does_not_start_another_parent_turn
         Arc::new(provider.clone()),
         PromptCompiler::new(assets),
     );
+    store
+        .ensure_conversation(&cursor_server::model::ConversationId::new(
+            "parent-conversation",
+        ))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO background_completion_claims(
+             conversation_id, task_kind, task_id, terminal_status, disposition, created_at_ms
+         ) VALUES ('parent-conversation', 'subagent', 'consumed-child', 'success', 'consumed', 1)",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
     let handle = registry.get_or_create("consumed-completion").await.unwrap();
     let state = pb::ConversationStateStructure {
         subagent_runs_by_parent_tool_call_id: HashMap::from([(
@@ -317,6 +387,81 @@ async fn completion_already_consumed_by_await_does_not_start_another_parent_turn
     .await
     .unwrap();
     assert_eq!(run_count, 0);
+}
+
+#[tokio::test]
+async fn partially_consumed_batch_projects_each_remaining_lifecycle_once() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let provider = fake_provider::FakeProvider::default();
+    provider.push(stop_response("batch-call", "processed remaining task"));
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = TransportRegistry::new(
+        store.clone(),
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+    store
+        .ensure_conversation(&cursor_server::model::ConversationId::new(
+            "parent-conversation",
+        ))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO background_completion_claims(
+             conversation_id, task_kind, task_id, terminal_status, disposition, created_at_ms
+         ) VALUES ('parent-conversation', 'subagent', 'task-1', 'success', 'consumed', 1)",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let action = vec![
+        subagent_completion("task-1", "shared-call", "already awaited"),
+        subagent_completion("task-2", "shared-call", "new result"),
+    ];
+    let first = registry.get_or_create("batch-request-1").await.unwrap();
+    drive_forwarded_completion(
+        &first,
+        completion_batch_run(
+            "batch-run-1",
+            pb::ConversationStateStructure::default(),
+            action.clone(),
+        ),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while provider.requests().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    let retry = registry.get_or_create("batch-request-2").await.unwrap();
+    drive_ignored_completion(
+        &retry,
+        completion_batch_run(
+            "batch-run-2",
+            pb::ConversationStateStructure::default(),
+            action,
+        ),
+    )
+    .await;
+
+    assert_eq!(provider.requests().len(), 1);
+    let history = serde_json::to_string(&provider.requests()[0].history).unwrap();
+    assert!(!history.contains("already awaited"));
+    assert!(history.contains("new result"));
+    let projected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM background_completion_claims
+         WHERE conversation_id = 'parent-conversation' AND disposition = 'projected'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(projected, 1);
 }
 
 #[tokio::test]
@@ -402,6 +547,34 @@ async fn background_shell_completion_wakes_the_parent_with_the_captured_notifica
         Some("Start Python HTTP server on 9000")
     );
     assert_eq!(metadata.task_id.as_deref(), Some("977679"));
+}
+
+async fn drive_failed_completion(handle: &TransportHandle, message: pb::AgentClientMessage) {
+    let mut output = handle.subscribe();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(message),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        if flags & connect::END_STREAM_FLAG != 0 {
+            assert_ne!(payload.as_ref(), b"{}");
+            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert!(payload["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("conflicting terminal completion"));
+            return;
+        }
+    }
 }
 
 async fn drive_ignored_completion(handle: &TransportHandle, message: pb::AgentClientMessage) {
@@ -644,26 +817,44 @@ fn completion_run_with_detail(
     conversation_state: pb::ConversationStateStructure,
     detail: &str,
 ) -> pb::AgentClientMessage {
+    completion_batch_run(
+        run_id,
+        conversation_state,
+        vec![subagent_completion(child_id, "task-call", detail)],
+    )
+}
+
+fn subagent_completion(
+    task_id: &str,
+    tool_call_id: &str,
+    detail: &str,
+) -> pb::BackgroundTaskCompletion {
+    pb::BackgroundTaskCompletion {
+        task_id: task_id.into(),
+        kind: pb::BackgroundTaskKind::Subagent as i32,
+        status: pb::BackgroundTaskStatus::Success as i32,
+        title: "Inspect protocol".into(),
+        detail: Some(detail.into()),
+        output_path: Some("/tmp/child.jsonl".into()),
+        reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
+        subagent_id: Some(task_id.into()),
+        tool_call_id: Some(tool_call_id.into()),
+        ..Default::default()
+    }
+}
+
+fn completion_batch_run(
+    run_id: &str,
+    conversation_state: pb::ConversationStateStructure,
+    completions: Vec<pb::BackgroundTaskCompletion>,
+) -> pb::AgentClientMessage {
     pb::AgentClientMessage {
         message: Some(pb::agent_client_message::Message::RunRequest(
             pb::AgentRunRequest {
                 action: Some(pb::ConversationAction {
                     action: Some(
                         pb::conversation_action::Action::BackgroundTaskCompletionAction(
-                            pb::BackgroundTaskCompletionAction {
-                                completions: vec![pb::BackgroundTaskCompletion {
-                                    task_id: child_id.into(),
-                                    kind: pb::BackgroundTaskKind::Subagent as i32,
-                                    status: pb::BackgroundTaskStatus::Success as i32,
-                                    title: "Inspect protocol".into(),
-                                    detail: Some(detail.into()),
-                                    output_path: Some("/tmp/child.jsonl".into()),
-                                    reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
-                                    subagent_id: Some(child_id.into()),
-                                    tool_call_id: Some("task-call".into()),
-                                    ..Default::default()
-                                }],
-                            },
+                            pb::BackgroundTaskCompletionAction { completions },
                         ),
                     ),
                     ..Default::default()

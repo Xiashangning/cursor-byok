@@ -606,7 +606,7 @@ fn finish_transport(handle: &TransportHandle, finish: TransportFinish) {
 fn spawn_run_request(
     registry: ConversationRegistry,
     handle: TransportHandle,
-    mut request: pb::AgentRunRequest,
+    request: pb::AgentRunRequest,
     dependencies: ConversationDependencies,
     blob_sync: BlobSynchronizer,
     context_sync: RequestContextSynchronizer,
@@ -627,36 +627,61 @@ fn spawn_run_request(
         if generation.superseded.is_cancelled() {
             return;
         }
-        if let Err(error) =
-            hydrate_consumed_subagent_completions(&dependencies.store, &mut request).await
-        {
-            let _ = handle
-                .command(TransportCommand::RunFinished {
-                    generation: generation.id,
-                    finish: RunFinish::Transport(TransportFinish::Failed(error)),
-                })
-                .await;
-            return;
-        }
-        if compile::background_completion_fully_consumed(&request) {
-            let _ = handle
-                .command(TransportCommand::RunFinished {
-                    generation: generation.id,
-                    finish: RunFinish::Transport(TransportFinish::Success),
-                })
-                .await;
-            return;
+        let conversation_id = compile::request_conversation_id(handle.request_id(), &request);
+        let terminal_completions = match compile::background_terminal_completions(&request) {
+            Ok(completions) => completions,
+            Err(error) => {
+                let _ = handle
+                    .command(TransportCommand::RunFinished {
+                        generation: generation.id,
+                        finish: RunFinish::Transport(TransportFinish::Failed(error)),
+                    })
+                    .await;
+                return;
+            }
+        };
+        if let Some(completions) = terminal_completions.as_deref() {
+            match dependencies
+                .store
+                .background_completions_processed(&conversation_id, completions)
+                .await
+            {
+                Ok(true) => {
+                    let _ = handle
+                        .command(TransportCommand::RunFinished {
+                            generation: generation.id,
+                            finish: RunFinish::Transport(TransportFinish::Success),
+                        })
+                        .await;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = handle
+                        .command(TransportCommand::RunFinished {
+                            generation: generation.id,
+                            finish: RunFinish::Transport(TransportFinish::Failed(error)),
+                        })
+                        .await;
+                    return;
+                }
+            }
         }
 
         let mut checkpoint = CheckpointBuilder::new(
             dependencies.store.clone(),
-            crate::model::ConversationId::new(
-                request.conversation_id.as_deref().unwrap_or_default(),
-            ),
             blob_sync.clone(),
             handle.parent().map(|parent| parent.tool_call_id.clone()),
             request.conversation_state.clone(),
         );
+        if let Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)) =
+            request
+                .action
+                .as_ref()
+                .and_then(|action| action.action.as_ref())
+        {
+            checkpoint.record_background_completion_action(action);
+        }
         let prepared = tokio::select! {
             biased;
             _ = generation.superseded.cancelled() => return,
@@ -848,111 +873,6 @@ fn spawn_run_request(
                 .await;
         }
     });
-}
-
-async fn hydrate_consumed_subagent_completions(
-    store: &crate::store::Store,
-    request: &mut pb::AgentRunRequest,
-) -> crate::Result<()> {
-    let Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)) = request
-        .action
-        .as_ref()
-        .and_then(|action| action.action.as_ref())
-    else {
-        return Ok(());
-    };
-    let completions = action
-        .completions
-        .iter()
-        .filter(|completion| {
-            completion.kind == pb::BackgroundTaskKind::Subagent as i32
-                && completion.reason == pb::BackgroundTaskCompletionReason::TaskFinished as i32
-        })
-        .filter_map(|completion| {
-            let subagent_id = completion
-                .subagent_id
-                .as_deref()
-                .filter(|id| !id.is_empty())?;
-            let parent_tool_call_id = completion
-                .tool_call_id
-                .as_deref()
-                .filter(|id| !id.is_empty())?;
-            let status = match pb::BackgroundTaskStatus::try_from(completion.status).ok()? {
-                pb::BackgroundTaskStatus::Success => pb::SubagentRunStatus::Success,
-                pb::BackgroundTaskStatus::Error => pb::SubagentRunStatus::Error,
-                pb::BackgroundTaskStatus::Aborted => pb::SubagentRunStatus::Aborted,
-                pb::BackgroundTaskStatus::Unspecified => return None,
-            };
-            Some((
-                subagent_id.to_owned(),
-                parent_tool_call_id.to_owned(),
-                status,
-                completion.title.clone(),
-                completion.detail.clone(),
-                completion.output_path.clone(),
-            ))
-        })
-        .collect::<Vec<_>>();
-    let conversation_id =
-        crate::model::ConversationId::new(request.conversation_id.as_deref().unwrap_or_default());
-    for (subagent_id, parent_tool_call_id, status, title, detail, output_path) in completions {
-        let state_consumed = request
-            .conversation_state
-            .as_ref()
-            .and_then(|state| {
-                state
-                    .subagent_runs_by_parent_tool_call_id
-                    .get(&parent_tool_call_id)
-            })
-            .is_some_and(|run| {
-                run.subagent_id.as_deref() == Some(subagent_id.as_str())
-                    && run.completion_reason
-                        == Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32)
-                    && matches!(
-                        pb::SubagentRunStatus::try_from(run.status),
-                        Ok(pb::SubagentRunStatus::Success
-                            | pb::SubagentRunStatus::Error
-                            | pb::SubagentRunStatus::Aborted)
-                    )
-            });
-        if state_consumed {
-            store.ensure_conversation(&conversation_id).await?;
-            store
-                .record_consumed_subagent_completion(
-                    &conversation_id,
-                    &subagent_id,
-                    &parent_tool_call_id,
-                )
-                .await?;
-            continue;
-        }
-        let persisted_consumed = store
-            .consumed_subagent_completion(&conversation_id, &subagent_id, &parent_tool_call_id)
-            .await?;
-        if !persisted_consumed {
-            continue;
-        }
-        request
-            .conversation_state
-            .get_or_insert_with(Default::default)
-            .subagent_runs_by_parent_tool_call_id
-            .insert(
-                parent_tool_call_id.clone(),
-                pb::SubagentRunState {
-                    parent_tool_call_id,
-                    subagent_id: Some(subagent_id),
-                    status: status as i32,
-                    title: Some(title),
-                    detail,
-                    output_path,
-                    completion_reason: Some(
-                        pb::BackgroundTaskCompletionReason::TaskFinished as i32,
-                    ),
-                    ..Default::default()
-                },
-            );
-    }
-    Ok(())
 }
 
 fn unsupported_runtime_action_error(action: &pb::conversation_action::Action) -> crate::Error {

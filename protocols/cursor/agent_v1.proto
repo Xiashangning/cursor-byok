@@ -7507,6 +7507,7 @@ message SubagentRunState {
   optional string output_path = 8;
   optional uint64 completed_timestamp_ms = 9;
   optional BackgroundTaskCompletionReason completion_reason = 10;
+  optional string task_id = 11;
 }
 
 // Copied from: local:agent.v1.SubagentRunStatus (var: lP)

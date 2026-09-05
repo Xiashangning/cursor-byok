@@ -1,7 +1,13 @@
-//! Compiles non-interrupting runtime information into append-only Messages.
+//! Compiles terminal background-task notifications into append-only runtime events.
+
 use std::collections::BTreeMap;
 
-use crate::{cursor::protocol::proto::agent::v1 as pb, Error, Result};
+use prost::Message;
+
+use crate::{
+    cursor::protocol::proto::agent::v1 as pb, model::TerminalCompletion, store::BlobId, Error,
+    Result,
+};
 
 pub(super) const FOLLOW_UP: &str = concat!(
     "Perform any necessary follow-up actions in response to the subagent completion above. ",
@@ -22,14 +28,19 @@ pub(super) const SHELL_FOLLOW_UP: &str = concat!(
 
 #[derive(Debug)]
 pub(super) struct Projection {
+    pub completions: Vec<ProjectedCompletion>,
+}
+
+#[derive(Debug)]
+pub(super) struct ProjectedCompletion {
     pub context: String,
     pub turn_user: pb::UserMessage,
+    pub terminal: TerminalCompletion,
 }
 
 pub(super) fn project(
     action: &pb::BackgroundTaskCompletionAction,
     mode: i32,
-    state: Option<&pb::ConversationStateStructure>,
 ) -> Result<Projection> {
     if action.completions.is_empty() {
         return Err(Error::Protocol(
@@ -38,169 +49,125 @@ pub(super) fn project(
     }
 
     let mut completions = BTreeMap::new();
-    let mut has_shell = false;
-    let mut has_subagent = false;
     for completion in &action.completions {
-        let kind = pb::BackgroundTaskKind::try_from(completion.kind).map_err(|_| {
-            Error::Protocol(format!("unknown background task kind: {}", completion.kind))
-        })?;
-        if kind == pb::BackgroundTaskKind::Unspecified {
-            return Err(Error::Protocol(format!(
-                "background task completion has invalid kind: {}",
-                kind.as_str_name()
-            )));
-        }
-        let reason =
-            pb::BackgroundTaskCompletionReason::try_from(completion.reason).map_err(|_| {
-                Error::Protocol(format!(
-                    "unknown background task completion reason: {}",
-                    completion.reason
-                ))
-            })?;
-        if reason != pb::BackgroundTaskCompletionReason::TaskFinished {
-            // Progress and reparenting notifications are informational; the
-            // client batches them together with the real finish notification.
+        let Some(projected) = project_completion(completion, mode)? else {
             continue;
-        }
-        if completion_consumed(completion, state) {
-            continue;
-        }
-        if completion.task_id.is_empty() || completion.title.is_empty() {
-            return Err(Error::Protocol(
-                "background task completion requires task_id and title".into(),
-            ));
-        }
-        let agent_id = match kind {
-            pb::BackgroundTaskKind::Shell => {
-                has_shell = true;
-                None
-            }
-            pb::BackgroundTaskKind::Subagent => {
-                has_subagent = true;
-                Some(
-                    completion
-                        .subagent_id
-                        .as_deref()
-                        .filter(|id| !id.is_empty())
-                        .ok_or_else(|| {
-                            Error::Protocol(
-                                "background subagent completion has no subagent_id".into(),
-                            )
-                        })?,
-                )
-            }
-            pb::BackgroundTaskKind::Unspecified => unreachable!(),
         };
-        let tool_call_id = completion
-            .tool_call_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                Error::Protocol("background task completion has no tool_call_id".into())
-            })?;
-        let task_identity = agent_id.unwrap_or(&completion.task_id);
-        let identity = format!("{}:{task_identity}:{tool_call_id}", kind.as_str_name());
-        let context = completion_context(completion, kind, agent_id)?;
         if completions
-            .insert(identity.clone(), (completion, context))
+            .insert(projected.terminal.event_id.clone(), projected)
             .is_some()
         {
             return Err(Error::Protocol(format!(
-                "duplicate background task completion: {identity}"
+                "duplicate background task completion lifecycle: {}",
+                completion.task_id
             )));
         }
     }
-
-    let (first, _) = completions.values().next().ok_or_else(|| {
-        Error::Protocol("background task notification contains no finished task".into())
-    })?;
-    let text = match (has_shell, has_subagent) {
-        (true, false) => SHELL_FOLLOW_UP.into(),
-        (false, true) => FOLLOW_UP.into(),
-        (true, true) => format!("{SHELL_FOLLOW_UP}\n\n{FOLLOW_UP}"),
-        (false, false) => unreachable!(),
-    };
+    if completions.is_empty() {
+        return Err(Error::Protocol(
+            "background task notification contains no finished task".into(),
+        ));
+    }
     Ok(Projection {
-        context: completions
-            .values()
-            .map(|(_, context)| context.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
+        completions: completions.into_values().collect(),
+    })
+}
+
+pub(super) fn terminal_completions(
+    action: &pb::BackgroundTaskCompletionAction,
+) -> Result<Vec<TerminalCompletion>> {
+    Ok(project(action, pb::AgentMode::Agent as i32)?
+        .completions
+        .into_iter()
+        .map(|completion| completion.terminal)
+        .collect())
+}
+
+fn project_completion(
+    completion: &pb::BackgroundTaskCompletion,
+    mode: i32,
+) -> Result<Option<ProjectedCompletion>> {
+    let kind = pb::BackgroundTaskKind::try_from(completion.kind).map_err(|_| {
+        Error::Protocol(format!("unknown background task kind: {}", completion.kind))
+    })?;
+    if kind == pb::BackgroundTaskKind::Unspecified {
+        return Err(Error::Protocol(format!(
+            "background task completion has invalid kind: {}",
+            kind.as_str_name()
+        )));
+    }
+    let reason = pb::BackgroundTaskCompletionReason::try_from(completion.reason).map_err(|_| {
+        Error::Protocol(format!(
+            "unknown background task completion reason: {}",
+            completion.reason
+        ))
+    })?;
+    if reason != pb::BackgroundTaskCompletionReason::TaskFinished {
+        return Ok(None);
+    }
+    if completion.task_id.is_empty() || completion.title.is_empty() {
+        return Err(Error::Protocol(
+            "background task completion requires task_id and title".into(),
+        ));
+    }
+    let agent_id = match kind {
+        pb::BackgroundTaskKind::Shell => None,
+        pb::BackgroundTaskKind::Subagent => Some(
+            completion
+                .subagent_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    Error::Protocol("background subagent completion has no subagent_id".into())
+                })?,
+        ),
+        pb::BackgroundTaskKind::Unspecified => unreachable!(),
+    };
+    completion
+        .tool_call_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Error::Protocol("background task completion has no tool_call_id".into()))?;
+    let status = status(completion)?;
+    let kind_name = match kind {
+        pb::BackgroundTaskKind::Subagent => "subagent",
+        pb::BackgroundTaskKind::Shell => "shell",
+        pb::BackgroundTaskKind::Unspecified => unreachable!(),
+    };
+    let lifecycle = serde_json::to_vec(&(kind_name, completion.task_id.as_str()))?;
+    let event_id = format!(
+        "background-completed:{}",
+        BlobId::digest(&lifecycle).to_base64()
+    );
+    let terminal = TerminalCompletion {
+        task_id: completion.task_id.clone(),
+        kind: kind_name.into(),
+        status: status_name(status).into(),
+        payload_digest: Some(BlobId::digest(&completion.encode_to_vec()).to_base64()),
+        event_id: event_id.clone(),
+    };
+    let follow_up = match kind {
+        pb::BackgroundTaskKind::Subagent => FOLLOW_UP,
+        pb::BackgroundTaskKind::Shell => SHELL_FOLLOW_UP,
+        pb::BackgroundTaskKind::Unspecified => unreachable!(),
+    };
+    Ok(Some(ProjectedCompletion {
+        context: completion_context(completion, kind, agent_id)?,
         turn_user: pb::UserMessage {
-            text,
-            message_id: format!(
-                "background-completed:{}",
-                completions.keys().cloned().collect::<Vec<_>>().join(":")
-            ),
+            text: follow_up.into(),
+            message_id: event_id,
             mode,
             is_simulated_msg: Some(true),
             simulated_msg_reason: Some(pb::SimulatedMsgReason::BackgroundTaskCompletion as i32),
             simulated_message_metadata: Some(pb::user_message::SimulatedMessageMetadata {
-                title: Some(first.title.clone()),
-                task_id: Some(first.task_id.clone()),
+                title: Some(completion.title.clone()),
+                task_id: Some(completion.task_id.clone()),
                 ..Default::default()
             }),
             ..Default::default()
         },
-    })
-}
-
-pub(super) fn fully_consumed(
-    action: &pb::BackgroundTaskCompletionAction,
-    state: Option<&pb::ConversationStateStructure>,
-) -> bool {
-    let finished = action.completions.iter().filter(|completion| {
-        completion.reason == pb::BackgroundTaskCompletionReason::TaskFinished as i32
-    });
-    let mut count = 0;
-    for completion in finished {
-        count += 1;
-        if !completion_consumed(completion, state) {
-            return false;
-        }
-    }
-    count > 0
-}
-
-fn completion_consumed(
-    completion: &pb::BackgroundTaskCompletion,
-    state: Option<&pb::ConversationStateStructure>,
-) -> bool {
-    if completion.kind != pb::BackgroundTaskKind::Subagent as i32 {
-        return false;
-    }
-    let (Some(agent_id), Some(tool_call_id), Some(state)) = (
-        completion
-            .subagent_id
-            .as_deref()
-            .filter(|id| !id.is_empty()),
-        completion
-            .tool_call_id
-            .as_deref()
-            .filter(|id| !id.is_empty()),
-        state,
-    ) else {
-        return false;
-    };
-    let Some(run) = state.subagent_runs_by_parent_tool_call_id.get(tool_call_id) else {
-        return false;
-    };
-    if run.subagent_id.as_deref() != Some(agent_id)
-        || run.completion_reason != Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32)
-    {
-        return false;
-    }
-    matches!(
-        pb::SubagentRunStatus::try_from(run.status),
-        Ok(pb::SubagentRunStatus::Success
-            | pb::SubagentRunStatus::Error
-            | pb::SubagentRunStatus::Aborted)
-    ) && matches!(
-        pb::BackgroundTaskStatus::try_from(completion.status),
-        Ok(pb::BackgroundTaskStatus::Success
-            | pb::BackgroundTaskStatus::Error
-            | pb::BackgroundTaskStatus::Aborted)
-    )
+        terminal,
+    }))
 }
 
 fn status(completion: &pb::BackgroundTaskCompletion) -> Result<pb::BackgroundTaskStatus> {
@@ -274,75 +241,62 @@ fn status_name(status: pb::BackgroundTaskStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
-    fn completion(agent_id: &str, tool_call_id: &str) -> pb::BackgroundTaskCompletion {
+    fn completion(task_id: &str, tool_call_id: &str) -> pb::BackgroundTaskCompletion {
         pb::BackgroundTaskCompletion {
-            task_id: agent_id.into(),
+            task_id: task_id.into(),
             kind: pb::BackgroundTaskKind::Subagent as i32,
             status: pb::BackgroundTaskStatus::Success as i32,
-            title: format!("Agent {agent_id}"),
+            title: format!("Task {task_id}"),
             reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
-            subagent_id: Some(agent_id.into()),
+            subagent_id: Some("reused-agent".into()),
             tool_call_id: Some(tool_call_id.into()),
             ..Default::default()
         }
     }
 
-    fn state(agent_id: &str, tool_call_id: &str) -> pb::ConversationStateStructure {
-        pb::ConversationStateStructure {
-            subagent_runs_by_parent_tool_call_id: HashMap::from([(
-                tool_call_id.into(),
-                pb::SubagentRunState {
-                    parent_tool_call_id: tool_call_id.into(),
-                    subagent_id: Some(agent_id.into()),
-                    status: pb::SubagentRunStatus::Success as i32,
-                    completion_reason: Some(
-                        pb::BackgroundTaskCompletionReason::TaskFinished as i32,
-                    ),
-                    ..Default::default()
-                },
-            )]),
-            ..Default::default()
-        }
-    }
-
     #[test]
-    fn terminal_result_consumed_by_await_suppresses_the_follow_up_action() {
-        let action = pb::BackgroundTaskCompletionAction {
-            completions: vec![completion("agent-1", "task-call-1")],
-        };
-        let state = state("agent-1", "task-call-1");
-
-        assert!(fully_consumed(&action, Some(&state)));
-    }
-
-    #[test]
-    fn mixed_batch_keeps_only_unconsumed_completions() {
+    fn lifecycle_identity_uses_task_id_not_reusable_call_or_agent_ids() {
         let action = pb::BackgroundTaskCompletionAction {
             completions: vec![
-                completion("agent-1", "task-call-1"),
-                completion("agent-2", "task-call-2"),
+                completion("task-1", "reused-call"),
+                completion("task-2", "reused-call"),
             ],
         };
-        let state = state("agent-1", "task-call-1");
-
-        assert!(!fully_consumed(&action, Some(&state)));
-        let projection = project(&action, pb::AgentMode::Agent as i32, Some(&state)).unwrap();
-        assert!(!projection.context.contains("agent-1"));
-        assert!(projection.context.contains("agent-2"));
-        assert!(!projection.turn_user.message_id.contains("agent-1"));
-        assert!(projection.turn_user.message_id.contains("agent-2"));
+        let projection = project(&action, pb::AgentMode::Agent as i32).unwrap();
+        assert_eq!(projection.completions.len(), 2);
+        assert_ne!(
+            projection.completions[0].terminal.event_id,
+            projection.completions[1].terminal.event_id
+        );
     }
 
     #[test]
-    fn consumed_terminal_result_suppresses_a_later_terminal_status() {
-        let mut action = pb::BackgroundTaskCompletionAction {
-            completions: vec![completion("agent-1", "task-call-1")],
-        };
-        action.completions[0].status = pb::BackgroundTaskStatus::Error as i32;
-        let state = state("agent-1", "task-call-1");
-
-        assert!(fully_consumed(&action, Some(&state)));
+    fn completion_event_id_is_stable_when_another_batch_item_is_consumed() {
+        let first = completion("task-1", "call-1");
+        let second = completion("task-2", "call-2");
+        let batch = project(
+            &pb::BackgroundTaskCompletionAction {
+                completions: vec![first, second.clone()],
+            },
+            pb::AgentMode::Agent as i32,
+        )
+        .unwrap();
+        let retry = project(
+            &pb::BackgroundTaskCompletionAction {
+                completions: vec![second],
+            },
+            pb::AgentMode::Agent as i32,
+        )
+        .unwrap();
+        let batch_second = batch
+            .completions
+            .iter()
+            .find(|item| item.terminal.task_id == "task-2")
+            .unwrap();
+        assert_eq!(
+            batch_second.terminal.event_id,
+            retry.completions[0].terminal.event_id
+        );
     }
 }

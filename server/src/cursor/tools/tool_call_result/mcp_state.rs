@@ -112,6 +112,7 @@ pub(super) fn complete(
             content,
             is_error,
             image: None,
+            consumed_completion: None,
         },
         pb::tool_call::Tool::GetMcpToolsToolCall(pb::GetMcpToolsToolCall {
             args: Some(args),

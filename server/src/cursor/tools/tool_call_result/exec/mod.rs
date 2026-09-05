@@ -105,6 +105,7 @@ pub(crate) fn from_exec(
             content,
             is_error,
             image: None,
+            consumed_completion: None,
         },
         tool,
     )
@@ -156,7 +157,7 @@ fn subagent_await(
     let Some(pb::tool_call::Tool::AwaitToolCall(mut tool)) = rendered.tool.take() else {
         return Err(Error::Protocol("AWAIT has no Await representation".into()));
     };
-    let (content, is_error, await_result) = match result.result.as_ref() {
+    let (content, is_error, await_result, _consumed_task_id) = match result.result.as_ref() {
         Some(pb::subagent_await_result::Result::Complete(value)) => (
             value
                 .final_message
@@ -168,6 +169,7 @@ fn subagent_await(
                 output_file_path: value.transcript_path.clone().unwrap_or_default(),
                 ..Default::default()
             }),
+            Some(value.agent_id.clone()),
         ),
         Some(pb::subagent_await_result::Result::StillRunning(value)) => (
             "background agent is still running".into(),
@@ -177,6 +179,7 @@ fn subagent_await(
                 output_file_path: value.transcript_path.clone().unwrap_or_default(),
                 ..Default::default()
             }),
+            None,
         ),
         Some(pb::subagent_await_result::Result::NotFound(value)) => (
             format!("background agent not found: {}", value.agent_id),
@@ -184,6 +187,7 @@ fn subagent_await(
             pb::await_result::Result::Error(pb::AwaitError {
                 error: format!("background agent not found: {}", value.agent_id),
             }),
+            None,
         ),
         Some(pb::subagent_await_result::Result::Error(value)) => (
             value.error.clone(),
@@ -191,6 +195,7 @@ fn subagent_await(
             pb::await_result::Result::Error(pb::AwaitError {
                 error: value.error.clone(),
             }),
+            None,
         ),
         None => return Err(Error::Protocol("AWAIT returned no result".into())),
     };
@@ -220,6 +225,7 @@ fn orchestration_completion(
             content,
             is_error,
             image: None,
+            consumed_completion: None,
         },
         tool,
     )
@@ -280,6 +286,7 @@ pub(crate) fn edit_failure(pending: PendingExec, error: String) -> Result<ToolCo
             content: error,
             is_error: true,
             image: None,
+            consumed_completion: None,
         },
         pb::tool_call::Tool::EditToolCall(tool),
     ))

@@ -224,6 +224,51 @@ impl Store {
         expected: CheckpointId,
         message: &CanonicalMessage,
     ) -> Result<(CheckpointId, bool)> {
+        if let Some(completion) = message.terminal_completion.as_ref() {
+            let _write = self.writes.lock().await;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let claim = Self::claim_completion_tx(
+                &mut tx,
+                conversation_id,
+                completion,
+                super::CompletionDisposition::Projected,
+            )
+            .await?;
+            if claim != super::CompletionClaim::Acquired {
+                tx.commit().await?;
+                return Ok((expected, false));
+            }
+            let existing = Self::load_checkpoint_messages_tx(&mut tx, expected.0).await?;
+            if let Some(existing) = existing.iter().find(|existing| {
+                existing.message_id == message.message_id
+                    || existing.runtime_event_id == message.runtime_event_id
+            }) {
+                if existing.message_id != message.message_id
+                    || existing.runtime_event_id != message.runtime_event_id
+                    || existing.role != message.role
+                    || existing.origin != message.origin
+                    || existing.content != message.content
+                {
+                    return Err(Error::Store(format!(
+                        "message id or runtime event reused with different content: {}",
+                        message.message_id
+                    )));
+                }
+                tx.commit().await?;
+                return Ok((expected, false));
+            }
+            let checkpoint = Self::append_checkpoint_tx(
+                &mut tx,
+                conversation_id,
+                run_id,
+                expected,
+                std::slice::from_ref(message),
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok((checkpoint, true));
+        }
+
         let existing = self.load_checkpoint_messages(expected).await?;
         if let Some(existing) = existing.iter().find(|existing| {
             existing.message_id == message.message_id

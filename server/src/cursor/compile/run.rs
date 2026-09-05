@@ -31,7 +31,7 @@ struct ActionProjection {
     input_id: Option<String>,
     starts_turn: bool,
     compacting: bool,
-    background_completion: bool,
+    background_completions: Vec<insert_messages::ProjectedCompletion>,
 }
 
 pub struct CursorRunContext {
@@ -70,12 +70,7 @@ pub(crate) async fn prepare(
     checkpoint
         .import_prefetched(&request.pre_fetched_blobs)
         .await?;
-    let conversation_id = ConversationId::new(
-        request
-            .conversation_id
-            .clone()
-            .unwrap_or_else(|| request_id.into()),
-    );
+    let conversation_id = request_conversation_id(request_id, request);
     let run_id = execution_run_id(request_id);
     let mut base_messages = if request.conversation_state.is_some() {
         Some(
@@ -139,8 +134,9 @@ pub(crate) async fn prepare(
         input_id,
         starts_turn,
         compacting,
-        background_completion,
+        background_completions,
     } = action(request)?;
+    let background_completion = !background_completions.is_empty();
     let pending_tool_round = if !starts_turn && !compacting {
         match request
             .conversation_state
@@ -294,29 +290,43 @@ pub(crate) async fn prepare(
     };
     let mut initial_messages = if compacting {
         Vec::new()
+    } else if background_completion {
+        let mut messages = Vec::with_capacity(background_completions.len());
+        let mut checkpoint_text = Vec::with_capacity(background_completions.len());
+        let mut checkpoint_user = None;
+        for projected in background_completions {
+            let event_id = projected.terminal.event_id.clone();
+            let existing = store
+                .message(&conversation_id, &format!("runtime:{event_id}"))
+                .await?;
+            let (mut message, text) = match existing {
+                Some(message) => {
+                    let text = runtime_message_text(&message)?;
+                    (message, text)
+                }
+                None => {
+                    break_messages::compile_background(
+                        event_id,
+                        &projected.turn_user,
+                        &request_context,
+                        &projected.context,
+                        blob_sync,
+                    )
+                    .await?
+                }
+            };
+            message.terminal_completion = Some(projected.terminal);
+            checkpoint_text.push(text);
+            checkpoint_user.get_or_insert(projected.turn_user);
+            messages.push(message);
+        }
+        if let Some(mut user) = checkpoint_user {
+            user.text = checkpoint_text.join("\n\n");
+            turn_user = Some(user);
+        }
+        messages
     } else {
         match (turn_user.clone(), event_id) {
-            (Some(mut user), Some(event_id)) if background_completion => {
-                let (message, text) = match existing_runtime {
-                    Some(message) => {
-                        let text = runtime_message_text(&message)?;
-                        (message, text)
-                    }
-                    None => {
-                        break_messages::compile_background(
-                            event_id,
-                            &user,
-                            &request_context,
-                            &action_context,
-                            blob_sync,
-                        )
-                        .await?
-                    }
-                };
-                user.text = text;
-                turn_user = Some(user);
-                vec![message]
-            }
             (Some(user), Some(event_id)) => {
                 let runtime = match existing_runtime {
                     Some(message) => message,
@@ -553,20 +563,34 @@ fn validate_prompt_root(messages: &[CanonicalMessage]) -> Result<()> {
     Ok(())
 }
 
-fn execution_run_id(request_id: &str) -> RunId {
-    let execution_id = Uuid::new_v4().simple().to_string();
-    RunId::new(format!("{request_id}:{}", &execution_id[..8]))
+pub(crate) fn request_conversation_id(
+    request_id: &str,
+    request: &pb::AgentRunRequest,
+) -> ConversationId {
+    ConversationId::new(
+        request
+            .conversation_id
+            .clone()
+            .unwrap_or_else(|| request_id.into()),
+    )
 }
 
-pub(crate) fn background_completion_fully_consumed(request: &pb::AgentRunRequest) -> bool {
+pub(crate) fn background_terminal_completions(
+    request: &pb::AgentRunRequest,
+) -> Result<Option<Vec<crate::model::TerminalCompletion>>> {
     let Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)) = request
         .action
         .as_ref()
         .and_then(|action| action.action.as_ref())
     else {
-        return false;
+        return Ok(None);
     };
-    insert_messages::fully_consumed(action, request.conversation_state.as_ref())
+    insert_messages::terminal_completions(action).map(Some)
+}
+
+fn execution_run_id(request_id: &str) -> RunId {
+    let execution_id = Uuid::new_v4().simple().to_string();
+    RunId::new(format!("{request_id}:{}", &execution_id[..8]))
 }
 
 fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
@@ -588,7 +612,7 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
             input_id: None,
             starts_turn: false,
             compacting: false,
-            background_completion: false,
+            background_completions: Vec::new(),
         });
     };
     match action {
@@ -615,7 +639,7 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
                     input_id: None,
                     starts_turn: false,
                     compacting: true,
-                    background_completion: false,
+                    background_completions: Vec::new(),
                 });
             }
             let mut context = action
@@ -640,22 +664,24 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
                 input_id: Some(input_id),
                 starts_turn: true,
                 compacting: false,
-                background_completion: false,
+                background_completions: Vec::new(),
             })
         }
         pb::conversation_action::Action::BackgroundTaskCompletionAction(action) => {
-            let projection =
-                insert_messages::project(action, mode, request.conversation_state.as_ref())?;
-            let event_id = projection.turn_user.message_id.clone();
+            let projection = insert_messages::project(action, mode)?;
+            let turn_user = projection
+                .completions
+                .first()
+                .map(|completion| completion.turn_user.clone());
             Ok(ActionProjection {
                 mode,
-                action_context: projection.context,
-                event_id: Some(event_id),
+                action_context: String::new(),
+                event_id: None,
                 input_id: None,
-                turn_user: Some(projection.turn_user),
+                turn_user,
                 starts_turn: true,
                 compacting: false,
-                background_completion: true,
+                background_completions: projection.completions,
             })
         }
         pb::conversation_action::Action::ExecutePlanAction(action) => execute_plan(action),
@@ -667,7 +693,7 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
             input_id: None,
             starts_turn: false,
             compacting: true,
-            background_completion: false,
+            background_completions: Vec::new(),
         }),
         _ => Ok(ActionProjection {
             mode,
@@ -677,7 +703,7 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
             input_id: None,
             starts_turn: false,
             compacting: false,
-            background_completion: false,
+            background_completions: Vec::new(),
         }),
     }
 }
@@ -726,7 +752,7 @@ fn execute_plan(action: &pb::ExecutePlanAction) -> Result<ActionProjection> {
         input_id: None,
         starts_turn: true,
         compacting: false,
-        background_completion: false,
+        background_completions: Vec::new(),
     })
 }
 
@@ -963,6 +989,19 @@ mod tests {
         assert_eq!(first.input_id.as_deref(), Some("cursor:user:message-one"));
         assert_eq!(second.input_id.as_deref(), Some("cursor:user:message-two"));
         assert_ne!(first.input_id, second.input_id);
+    }
+
+    #[test]
+    fn missing_conversation_id_is_scoped_to_the_request() {
+        let request = pb::AgentRunRequest::default();
+        assert_eq!(
+            request_conversation_id("request-1", &request).as_str(),
+            "request-1"
+        );
+        assert_eq!(
+            request_conversation_id("request-2", &request).as_str(),
+            "request-2"
+        );
     }
 
     #[test]

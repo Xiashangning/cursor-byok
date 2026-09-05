@@ -18,6 +18,8 @@ mod storage;
 mod tool_rounds;
 mod writer;
 
+pub(crate) use background_completions::{CompletionClaim, CompletionDisposition};
+
 pub use cas::*;
 pub(crate) use cursor_traces::BufferedCursorTraceChunk;
 pub(crate) use llm_calls::{BufferedLlmChunk, ContextUsageAnchor};

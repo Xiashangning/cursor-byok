@@ -126,6 +126,7 @@ pub(crate) async fn compile_injection(
                     }],
                 },
                 runtime_event_id: Some(event_id),
+                terminal_completion: None,
             })
         }
         None => Err(Error::Protocol(
@@ -328,6 +329,7 @@ async fn message(
             parts: images::parts(user, text, blobs).await?,
         },
         runtime_event_id: Some(event_id),
+        terminal_completion: None,
     })
 }
 

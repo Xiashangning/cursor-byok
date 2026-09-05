@@ -497,7 +497,7 @@ mod tests {
             let consumed_completion_table_exists: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM sqlite_master
-                    WHERE type = 'table' AND name = 'consumed_background_completions'
+                    WHERE type = 'table' AND name = 'background_completion_claims'
                  )",
             )
             .fetch_one(&pool)
@@ -582,7 +582,7 @@ mod tests {
             let consumed_completion_table_exists: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM sqlite_master
-                    WHERE type = 'table' AND name = 'consumed_background_completions'
+                    WHERE type = 'table' AND name = 'background_completion_claims'
                  )",
             )
             .fetch_one(&pool)

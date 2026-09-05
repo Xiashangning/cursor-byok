@@ -83,6 +83,7 @@ fn assistant_text_and_thinking_remain_separate_during_projection() {
             tool_calls: Vec::new(),
         },
         runtime_event_id: None,
+        terminal_completion: None,
     }];
 
     let projected = project_messages(&messages).unwrap();
@@ -592,6 +593,7 @@ fn tool_result_with_call(
             provider_parts: Vec::new(),
         }),
         runtime_event_id: None,
+        terminal_completion: None,
     }
 }
 
@@ -609,6 +611,7 @@ fn named_tool_result(name: &str, output: &str) -> CanonicalMessage {
             provider_parts: Vec::new(),
         }),
         runtime_event_id: None,
+        terminal_completion: None,
     }
 }
 
@@ -637,5 +640,6 @@ fn assistant_tool_pair(
             }],
         },
         runtime_event_id: None,
+        terminal_completion: None,
     }
 }

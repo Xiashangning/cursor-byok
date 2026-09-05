@@ -64,6 +64,7 @@ struct PendingInjection {
 struct InjectionState<'a> {
     active_round: Option<&'a ToolRoundId>,
     active_tool_calls: &'a HashSet<String>,
+    preserved_tool_calls: &'a HashSet<String>,
     completions: &'a HashMap<String, ToolCompletion>,
     interrupted_rounds: &'a mut HashSet<ToolRoundId>,
     interrupted_tool_calls: &'a mut HashSet<String>,
@@ -163,6 +164,7 @@ impl ConversationOutput {
         let mut response_thinking = String::new();
         let mut active_round = None::<ToolRoundId>;
         let mut active_tool_calls = HashSet::<String>::new();
+        let mut preserved_tool_calls = HashSet::<String>::new();
         let mut interrupted_rounds = HashSet::<ToolRoundId>::new();
         let mut interrupted_tool_calls = HashSet::<String>::new();
         let mut final_checkpoint = None::<FinalCheckpoints>;
@@ -226,6 +228,7 @@ impl ConversationOutput {
                             action,
                             active_round.as_ref(),
                             &active_tool_calls,
+                            &preserved_tool_calls,
                             &completions,
                             &mut interrupted_rounds,
                             &mut interrupted_tool_calls,
@@ -237,6 +240,7 @@ impl ConversationOutput {
                             action,
                             active_round.as_ref(),
                             &active_tool_calls,
+                            &preserved_tool_calls,
                             &completions,
                             &mut interrupted_rounds,
                             &mut interrupted_tool_calls,
@@ -441,22 +445,43 @@ impl ConversationOutput {
                             .iter()
                             .map(|call| call.call_id.clone())
                             .collect();
+                        preserved_tool_calls = round_calls
+                            .iter()
+                            .filter(|call| call.name.eq_ignore_ascii_case("Task"))
+                            .map(|call| call.call_id.clone())
+                            .collect();
                         // Runtime actions are deliberately prioritized over core events. An
                         // injection can therefore be observed before the already-queued
-                        // ToolRoundStarted event reaches this session. In that case the
-                        // accepted injection is still pending delivery and this round must be
-                        // detached without starting any root tools.
-                        if interrupted_rounds.contains(&round_id)
-                            || !self.pending_injections.is_empty()
-                        {
+                        // ToolRoundStarted event reaches this session. Preserve Task calls in
+                        // both the runtime and the core tool round; every other root tool is
+                        // detached from the interrupted parent message.
+                        let interrupted = interrupted_rounds.contains(&round_id)
+                            || !self.pending_injections.is_empty();
+                        let calls_to_start = if interrupted {
                             interrupted_rounds.insert(round_id.clone());
-                            interrupted_tool_calls.extend(active_tool_calls.iter().cloned());
-                            continue;
-                        }
+                            let task_calls = round_calls
+                                .iter()
+                                .filter(|call| call.name.eq_ignore_ascii_case("Task"))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            let task_ids = task_calls
+                                .iter()
+                                .map(|call| call.call_id.as_str())
+                                .collect::<HashSet<_>>();
+                            interrupted_tool_calls.extend(
+                                active_tool_calls
+                                    .iter()
+                                    .filter(|call_id| !task_ids.contains(call_id.as_str()))
+                                    .cloned(),
+                            );
+                            task_calls
+                        } else {
+                            round_calls
+                        };
                         for dispatched in self
                             .tools
                             .start_batch(
-                                &round_calls,
+                                &calls_to_start,
                                 ToolBatchState {
                                     completed: &completed,
                                     started: &HashSet::new(),
@@ -676,6 +701,7 @@ impl ConversationOutput {
                                 interrupted_rounds.remove(&round_id);
                             }
                             active_tool_calls.clear();
+                            preserved_tool_calls.clear();
                             self.tool_runtime.clear_completed().await;
                         } else if !matches!(&state.cause, CommitCause::ToolResult { .. })
                             && active_round.is_some()
@@ -835,6 +861,7 @@ impl ConversationOutput {
         action: pb::UserMessageAction,
         active_round: Option<&ToolRoundId>,
         active_tool_calls: &HashSet<String>,
+        preserved_tool_calls: &HashSet<String>,
         completions: &HashMap<String, ToolCompletion>,
         interrupted_rounds: &mut HashSet<ToolRoundId>,
         interrupted_tool_calls: &mut HashSet<String>,
@@ -857,6 +884,7 @@ impl ConversationOutput {
             InjectionState {
                 active_round,
                 active_tool_calls,
+                preserved_tool_calls,
                 completions,
                 interrupted_rounds,
                 interrupted_tool_calls,
@@ -870,6 +898,7 @@ impl ConversationOutput {
         action: pb::InjectContextAction,
         active_round: Option<&ToolRoundId>,
         active_tool_calls: &HashSet<String>,
+        preserved_tool_calls: &HashSet<String>,
         completions: &HashMap<String, ToolCompletion>,
         interrupted_rounds: &mut HashSet<ToolRoundId>,
         interrupted_tool_calls: &mut HashSet<String>,
@@ -909,6 +938,7 @@ impl ConversationOutput {
             InjectionState {
                 active_round,
                 active_tool_calls,
+                preserved_tool_calls,
                 completions,
                 interrupted_rounds,
                 interrupted_tool_calls,
@@ -935,13 +965,12 @@ impl ConversationOutput {
         );
         self.handle
             .emit(&events::context_injection_queued(injection_id.clone()))?;
-        state.interrupted_tool_calls.extend(
-            state
-                .active_tool_calls
-                .iter()
-                .filter(|call_id| !state.completions.contains_key(*call_id))
-                .cloned(),
-        );
+        for call_id in state.active_tool_calls.iter().filter(|call_id| {
+            !state.completions.contains_key(*call_id)
+                && !state.preserved_tool_calls.contains(*call_id)
+        }) {
+            state.interrupted_tool_calls.insert(call_id.clone());
+        }
         if let Some(round_id) = state.active_round {
             state.interrupted_rounds.insert(round_id.clone());
         }
