@@ -248,6 +248,8 @@ export async function streamOpenAiResponses(
 
   let textOpen = false;
   let streamedText = "";
+  /** streamedText 所属的输出 item;切换 item 即清空,缺 output_index 沿用。 */
+  let textIndex: number | null = null;
   let thinkingOpen = false;
   const tools = new Map<number, ToolState>();
   const reasoningItems: JsonValue[] = [];
@@ -278,6 +280,19 @@ export async function streamOpenAiResponses(
       streamedText = finalText;
     }
   };
+  // 与宿主 Rust 侧 #421 修复同源:output_text.done/output_item.done 报告的
+  // 终态文本只描述单个输出 item,补全基线必须是该 item 自己的增量。整条流
+  // 累积的基线让第 2 个文本 item 起 starts_with 恒为假,补齐(以及只发终态
+  // 的中继的整段文本)被静默丢弃。切换 output_index 清空基线;事件缺
+  // output_index 沿用当前作用域;同 item 重复终态因基线已等于终态而不重放。
+  const enterTextItem = (value: Record<string, unknown>) => {
+    const index = count(value.output_index);
+    if (index === null) return;
+    if (textIndex !== index) {
+      textIndex = index;
+      streamedText = "";
+    }
+  };
   const endStartedTools = () => {
     for (const [index, tool] of tools) {
       if (tool.started && !tool.ended) {
@@ -306,6 +321,7 @@ export async function streamOpenAiResponses(
     }
     switch (value.type) {
       case "response.output_text.delta": {
+        enterTextItem(value);
         closeThinking();
         if (!textOpen) {
           textOpen = true;
@@ -319,6 +335,7 @@ export async function streamOpenAiResponses(
         break;
       }
       case "response.output_text.done": {
+        enterTextItem(value);
         const finalText = text(value.text);
         if (finalText !== null) reconcileText(finalText);
         closeText();
@@ -354,6 +371,7 @@ export async function streamOpenAiResponses(
           reasoningItems.push(item as JsonValue);
         } else if (item?.type === "message") {
           sawCompletedItem = true;
+          enterTextItem(value);
           const finalText = itemText(item);
           if (finalText !== null) reconcileText(finalText);
           closeText();

@@ -468,6 +468,67 @@ Deno.test("invoke streams normalized events from the Kimi Code Responses API", a
   ]);
 });
 
+Deno.test("invoke reconciles each output item's text against its own deltas", async () => {
+  const token = jwt({ sub: "user-1" });
+  const draft = await credentialDraft({
+    accessToken: token,
+    refreshToken: null,
+    displayName: null,
+  });
+  const events: ModelEvent[] = [];
+  // 中继只发终态(done/output_item.done,无 output_text.delta):第 2 个文本
+  // item 的终态若与整条流的基线比对会因前缀不匹配被丢弃,文本整段丢失。
+  const result = await kimiProvider.invoke(
+    {
+      model: { id: "kimi-for-coding", displayName: "Kimi for Coding" },
+      resource: snapshot(draft.privateData),
+      request: request(),
+    },
+    { emit: (event) => events.push(event) },
+    context({
+      stream: () => ({
+        status: 200,
+        headers: {},
+        lines: sse([
+          'data: {"type":"response.output_text.done","output_index":0,"text":"checking the file"}',
+          'data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call-1","name":"shell","arguments":""}}',
+          'data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"echo hi"}',
+          'data: {"type":"response.function_call_arguments.done","output_index":1,"arguments":"echo hi"}',
+          'data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call-1","name":"shell","arguments":"echo hi"}}',
+          'data: {"type":"response.output_item.done","output_index":2,"item":{"type":"message","content":[{"type":"output_text","text":"the file looks fine"}]}}',
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":2}}}',
+        ]),
+      }),
+    }),
+  );
+  assertEquals(result, { status: "completed" });
+  // 第 1 个 item 的终态文本补发,工具调用完整,第 2 个 item 的终态文本也
+  // 必须整段补发(回归点:旧实现把全流文本当基线,这里会静默丢失)。
+  assertEquals(events, [
+    { type: "text-start" },
+    { type: "text-delta", text: "checking the file" },
+    { type: "text-end" },
+    { type: "tool-call-start", index: 1, callId: "call-1", name: "shell" },
+    { type: "tool-call-arguments-delta", index: 1, delta: "echo hi" },
+    { type: "tool-call-end", index: 1 },
+    { type: "text-start" },
+    { type: "text-delta", text: "the file looks fine" },
+    { type: "text-end" },
+    {
+      type: "usage",
+      usage: {
+        inputTokens: 10,
+        outputTokens: 2,
+        totalTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        reasoningTokens: null,
+      },
+    },
+    { type: "done", reason: "tool-use" },
+  ]);
+});
+
 Deno.test("invoke maps authorization failures to an invalid resource error", async () => {
   const token = jwt({ sub: "user-1" });
   const draft = await credentialDraft({
