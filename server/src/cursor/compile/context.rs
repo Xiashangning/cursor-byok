@@ -197,6 +197,21 @@ pub fn request_context(request: &pb::AgentRunRequest) -> Option<&pb::RequestCont
         })
 }
 
+pub fn is_remote_ssh(request: &pb::AgentRunRequest, context: &pb::RequestContext) -> bool {
+    context
+        .repository_info
+        .iter()
+        .map(|repository| repository.workspace_uri.as_str())
+        .chain(
+            request
+                .conversation_state
+                .as_ref()
+                .into_iter()
+                .flat_map(|state| state.previous_workspace_uris.iter().map(String::as_str)),
+        )
+        .any(|uri| uri.starts_with("vscode-remote://ssh-remote+"))
+}
+
 pub fn compile_context(context: &pb::RequestContext, today: &str) -> String {
     let mut sections = Vec::new();
     let mut transcripts = None;
@@ -620,6 +635,33 @@ mod tests {
             ["  shared rule  ", "local only rule"],
             "IDE-sent duplicate is kept once and blank local rules are skipped"
         );
+    }
+
+    #[test]
+    fn detects_remote_ssh_from_current_or_persisted_workspace_uri() {
+        let current = pb::RequestContext {
+            repository_info: vec![pb::RepositoryIndexingInfo {
+                workspace_uri: "vscode-remote://ssh-remote+buildbox/work/repo".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(is_remote_ssh(&pb::AgentRunRequest::default(), &current));
+
+        let persisted = pb::AgentRunRequest {
+            conversation_state: Some(pb::ConversationStateStructure {
+                previous_workspace_uris: vec![
+                    "vscode-remote://ssh-remote+buildbox/work/repo".into()
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(is_remote_ssh(&persisted, &pb::RequestContext::default()));
+        assert!(!is_remote_ssh(
+            &pb::AgentRunRequest::default(),
+            &pb::RequestContext::default()
+        ));
     }
 
     #[test]

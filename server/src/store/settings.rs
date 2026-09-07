@@ -167,7 +167,7 @@ impl PluginModelOverride {
                 .map(|values| {
                     values
                         .into_iter()
-                        .map(|value| value.trim().to_owned())
+                        .map(|value| value.trim().to_ascii_lowercase())
                         .filter(|value| !value.is_empty())
                         .collect::<Vec<_>>()
                 })

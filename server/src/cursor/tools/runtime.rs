@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     cursor::protocol::proto::agent::v1 as pb,
-    model::{SubagentKind, ToolCall},
+    model::{ModelVariantAxis, ModelVariantParts, SubagentKind, ToolCall},
     Error, Result,
 };
 
@@ -48,13 +48,42 @@ pub struct ExecContext {
     pub root_conversation_id: String,
     pub default_subagent_model: String,
     pub default_subagent_model_variant: Option<String>,
-    pub model_aliases: HashMap<String, String>,
-    pub model_variant_defaults: HashMap<String, (String, String)>,
+    pub model_directory: ModelDirectory,
     pub subagent_models: HashMap<SubagentKind, SubagentModel>,
     pub allow_subagents: bool,
     pub terminals_folder: String,
     pub admin_command_denylist: Vec<String>,
     pub mcp_routes: HashMap<(String, String), McpRoute>,
+}
+
+/// 一次运行可见的模型目录:别名、变体轴与展示名,供编排工具解析模型选择。
+#[derive(Clone, Debug, Default)]
+pub struct ModelDirectory {
+    pub aliases: HashMap<String, String>,
+    pub variants: HashMap<String, ModelVariantAxis>,
+    pub display_names: HashMap<String, String>,
+}
+
+impl ModelDirectory {
+    /// 解析模型选择:变体 slug 归一到 base hash 并保留变体分量,别名归一到
+    /// base hash,未知值原样透传(由回程解析报错)。
+    pub(crate) fn resolve(&self, key: &str) -> (String, Option<ModelVariantParts>) {
+        for (hash, axis) in &self.variants {
+            if let Some(parts) = axis
+                .parse_slug(hash, key)
+                .or_else(|| axis.parse_slug(hash, &key.to_ascii_lowercase()))
+            {
+                return (hash.clone(), Some(parts));
+            }
+        }
+        let canonical = self
+            .aliases
+            .get(key)
+            .or_else(|| self.aliases.get(&key.to_ascii_lowercase()))
+            .cloned()
+            .unwrap_or_else(|| key.to_string());
+        (canonical, None)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -89,32 +118,59 @@ pub(crate) fn subagent_kind(value: &str) -> SubagentKind {
     }
 }
 
-fn task_parameter(
+/// 解析 Task 的 model_parameters:形状、id 白名单与重复 id 在此统一校验,
+/// 值归一小写;值是否落在模型档位轴上由 prepare_call 对照变体轴校验。
+pub(crate) fn parse_task_model_parameters(
     arguments: &serde_json::Map<String, serde_json::Value>,
-    id: &str,
-) -> Option<String> {
-    let value = arguments.get("model_parameters")?;
-    let values = match value {
-        serde_json::Value::Array(values) => values.iter().collect::<Vec<_>>(),
-        serde_json::Value::Object(_) => vec![value],
-        _ => return None,
+) -> Result<Vec<(String, String)>> {
+    let Some(value) = arguments.get("model_parameters") else {
+        return Ok(Vec::new());
     };
-    values.into_iter().find_map(|value| {
-        let object = value.as_object()?;
-        (object.get("id").and_then(serde_json::Value::as_str) == Some(id))
-            .then(|| object.get("value").and_then(serde_json::Value::as_str))
-            .flatten()
-            .map(str::to_string)
-    })
+    let entries: Vec<&serde_json::Value> = match value {
+        serde_json::Value::Array(values) => values.iter().collect(),
+        serde_json::Value::Object(_) => vec![value],
+        _ => {
+            return Err(Error::Protocol(
+                "Task model_parameters must be an object or array".into(),
+            ))
+        }
+    };
+    let mut parameters: Vec<(String, String)> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let object = entry.as_object().ok_or_else(|| {
+            Error::Protocol("Task model_parameters entries must be objects".into())
+        })?;
+        let id = object
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| matches!(*id, "reasoning" | "context"))
+            .ok_or_else(|| {
+                Error::Protocol("Task model_parameters id must be reasoning or context".into())
+            })?;
+        let value = object
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Error::Protocol(format!("Task model parameter {id} is missing value"))
+            })?;
+        if parameters.iter().any(|(existing, _)| existing == id) {
+            return Err(Error::Protocol(format!(
+                "Task model_parameters repeats {id}"
+            )));
+        }
+        parameters.push((id.to_string(), value.trim().to_ascii_lowercase()));
+    }
+    Ok(parameters)
 }
 
 impl ExecContext {
-    fn canonical_model(&self, model: &str) -> String {
-        self.model_aliases
-            .get(model)
-            .or_else(|| self.model_aliases.get(&model.to_ascii_lowercase()))
-            .cloned()
-            .unwrap_or_else(|| model.to_string())
+    /// 归一模型选择:别名归到 base hash;变体 slug 归一后保留变体分量。
+    pub(crate) fn canonical_model(&self, model: &str) -> String {
+        let (base, parts) = self.model_directory.resolve(model);
+        match (parts, self.model_directory.variants.get(&base)) {
+            (Some(parts), Some(axis)) => axis.bake_slug(&base, &parts),
+            _ => base,
+        }
     }
 
     pub(crate) fn subagent_model_for(&self, subagent_type: &str) -> Option<&SubagentModel> {
@@ -152,54 +208,51 @@ impl ExecContext {
             return Ok(call.clone());
         }
         let override_model = self.subagent_model_for(subagent_type);
-        let inherits_default = match override_model {
-            Some(SubagentModel::Model(_)) | Some(SubagentModel::Disabled) => false,
-            Some(SubagentModel::Inherit) => true,
-            None => arguments
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|model| model == "inherit"),
+        let inherited = || {
+            self.default_subagent_model_variant
+                .clone()
+                .unwrap_or_else(|| self.default_subagent_model.clone())
         };
         let model = match override_model {
             Some(SubagentModel::Model(model)) => model.clone(),
-            Some(SubagentModel::Inherit) => self
-                .default_subagent_model_variant
-                .clone()
-                .unwrap_or_else(|| self.default_subagent_model.clone()),
+            Some(SubagentModel::Inherit) => inherited(),
             Some(SubagentModel::Disabled) => unreachable!("disabled Task returned above"),
             None => arguments
                 .get("model")
                 .and_then(serde_json::Value::as_str)
-                .filter(|model| *model != "inherit")
-                .map_or_else(
-                    || {
-                        self.default_subagent_model_variant
-                            .clone()
-                            .unwrap_or_else(|| self.default_subagent_model.clone())
-                    },
-                    str::to_owned,
-                ),
+                .filter(|model| !model.eq_ignore_ascii_case("inherit"))
+                .map_or_else(inherited, str::to_owned),
         };
-        let model = if inherits_default {
-            model
-        } else {
-            self.canonical_model(&model)
-        };
-        let model = if let Some((default_context, default_effort)) =
-            self.model_variant_defaults.get(&model)
-        {
-            let has_parameters = arguments.contains_key("model_parameters");
-            if has_parameters {
-                let context =
-                    task_parameter(arguments, "context").unwrap_or_else(|| default_context.clone());
-                let effort =
-                    task_parameter(arguments, "effort").unwrap_or_else(|| default_effort.clone());
-                format!("{model}-{context}-{effort}")
-            } else {
-                model
+        let parameters = parse_task_model_parameters(arguments)?;
+        let (base, parts) = self.model_directory.resolve(&model);
+        let mut display_name = None;
+        let model = match self.model_directory.variants.get(&base) {
+            Some(axis) => {
+                display_name = self.model_directory.display_names.get(&base).cloned();
+                // 继承的父变体或显式变体 slug 作为默认,LLM 显式参数逐项覆盖。
+                let mut effective = parts.clone().or_else(|| axis.default_parts());
+                match effective.as_mut() {
+                    Some(effective) => {
+                        for (id, value) in &parameters {
+                            match id.as_str() {
+                                "context" => effective.context = axis.validate_context(value)?,
+                                "reasoning" => {
+                                    effective.effort = Some(axis.validate_effort(value)?)
+                                }
+                                _ => unreachable!("parameter ids are validated above"),
+                            }
+                        }
+                        // 无参数且无显式变体时透传 base hash;其余情况烘焙变体 slug。
+                        if parts.is_some() || !parameters.is_empty() {
+                            axis.bake_slug(&base, effective)
+                        } else {
+                            base
+                        }
+                    }
+                    None => base,
+                }
             }
-        } else {
-            model
+            None => base,
         };
         if model.is_empty() {
             return Err(Error::Protocol(format!(
@@ -207,11 +260,17 @@ impl ExecContext {
             )));
         }
         let mut prepared = call.clone();
-        prepared
+        let prepared_arguments = prepared
             .arguments
             .as_object_mut()
-            .expect("Task arguments were validated")
-            .insert("model".into(), serde_json::Value::String(model));
+            .expect("Task arguments were validated");
+        prepared_arguments.insert("model".into(), serde_json::Value::String(model));
+        if let Some(display_name) = display_name {
+            prepared_arguments.insert(
+                "model_display".into(),
+                serde_json::Value::String(display_name),
+            );
+        }
         Ok(prepared)
     }
 }
@@ -497,20 +556,60 @@ mod tests {
         }
     }
 
+    fn directory(
+        hash: &str,
+        display_name: &str,
+        context_options: &[&str],
+        effort_options: &[&str],
+    ) -> ModelDirectory {
+        ModelDirectory {
+            aliases: HashMap::from([
+                (display_name.to_string(), hash.to_string()),
+                (display_name.to_ascii_lowercase(), hash.to_string()),
+            ]),
+            variants: HashMap::from([(
+                hash.to_string(),
+                ModelVariantAxis {
+                    context_options: context_options
+                        .iter()
+                        .map(|value| (*value).into())
+                        .collect(),
+                    effort_options: effort_options.iter().map(|value| (*value).into()).collect(),
+                },
+            )]),
+            display_names: HashMap::from([(hash.to_string(), display_name.to_string())]),
+        }
+    }
+
     #[test]
     fn inherited_task_keeps_the_parent_model_variant() {
         let context = ExecContext {
             default_subagent_model: "deepseek-hash".into(),
             default_subagent_model_variant: Some("deepseek-hash-1m-max".into()),
-            model_variant_defaults: HashMap::from([(
-                "deepseek-hash".into(),
-                ("1m".into(), "high".into()),
-            )]),
+            model_directory: directory("deepseek-hash", "DeepSeek", &["1m"], &["high", "max"]),
             ..ExecContext::default()
         };
         let call = task(serde_json::json!({
             "prompt": "inspect",
             "model": "inherit"
+        }));
+
+        let prepared = context.prepare_call(&call).unwrap();
+        assert_eq!(prepared.arguments["model"], "deepseek-hash-1m-max");
+        assert_eq!(prepared.arguments["model_display"], "DeepSeek");
+    }
+
+    #[test]
+    fn inherit_is_matched_case_insensitively() {
+        let context = ExecContext {
+            default_subagent_model: "deepseek-hash".into(),
+            default_subagent_model_variant: Some("deepseek-hash-1m-max".into()),
+            model_directory: directory("deepseek-hash", "DeepSeek", &["1m"], &["high", "max"]),
+            ..ExecContext::default()
+        };
+        let call = task(serde_json::json!({
+            "prompt": "inspect",
+            "model": "Inherit"
         }));
 
         assert_eq!(
@@ -520,31 +619,140 @@ mod tests {
     }
 
     #[test]
+    fn inherited_task_bakes_explicit_model_parameters_over_the_parent_variant() {
+        let context = ExecContext {
+            default_subagent_model: "deepseek-hash".into(),
+            default_subagent_model_variant: Some("deepseek-hash-1m-max".into()),
+            model_directory: directory(
+                "deepseek-hash",
+                "DeepSeek",
+                &["200k", "1m"],
+                &["high", "max"],
+            ),
+            ..ExecContext::default()
+        };
+        let call = task(serde_json::json!({
+            "prompt": "inspect",
+            "model_parameters": [{"id": "reasoning", "value": "high"}]
+        }));
+
+        // 父变体提供 context 默认值,LLM 的 reasoning 覆盖 effort 分量。
+        assert_eq!(
+            context.prepare_call(&call).unwrap().arguments["model"],
+            "deepseek-hash-1m-high"
+        );
+    }
+
+    #[test]
+    fn model_parameter_values_are_validated_against_the_model_axis() {
+        let context = ExecContext {
+            default_subagent_model: "hash-deepseek".into(),
+            model_directory: directory(
+                "hash-deepseek",
+                "DeepSeek Flash",
+                &["200k", "1m"],
+                &["low", "high"],
+            ),
+            ..ExecContext::default()
+        };
+        let invalid = task(serde_json::json!({
+            "prompt": "inspect",
+            "model_parameters": [{"id": "reasoning", "value": "gone"}]
+        }));
+        let error = context.prepare_call(&invalid).unwrap_err();
+        assert!(
+            matches!(&error, Error::Protocol(message) if message.contains("low, high")),
+            "unexpected error: {error}"
+        );
+
+        // 值归一小写后再校验与烘焙,"HIGH" 不会原样发给供应商。
+        let upper = task(serde_json::json!({
+            "prompt": "inspect",
+            "model_parameters": [{"id": "reasoning", "value": "HIGH"}]
+        }));
+        assert_eq!(
+            context.prepare_call(&upper).unwrap().arguments["model"],
+            "hash-deepseek-200k-high"
+        );
+    }
+
+    #[test]
+    fn model_parameters_reject_duplicate_ids_and_unknown_ids() {
+        let duplicate = serde_json::json!({
+            "model_parameters": [
+                {"id": "reasoning", "value": "low"},
+                {"id": "reasoning", "value": "high"}
+            ]
+        });
+        assert!(matches!(
+            parse_task_model_parameters(duplicate.as_object().unwrap()),
+            Err(Error::Protocol(message)) if message.contains("repeats reasoning")
+        ));
+        let unknown = serde_json::json!({
+            "model_parameters": [{"id": "effort", "value": "low"}]
+        });
+        assert!(matches!(
+            parse_task_model_parameters(unknown.as_object().unwrap()),
+            Err(Error::Protocol(message)) if message.contains("reasoning or context")
+        ));
+        let wrong_shape = serde_json::json!({"model_parameters": "low"});
+        assert!(parse_task_model_parameters(wrong_shape.as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn model_without_a_reasoning_axis_bakes_slugs_without_an_effort_segment() {
+        let context = ExecContext {
+            default_subagent_model: "plugin-hash".into(),
+            model_directory: directory("plugin-hash", "Plugin Model", &["200k", "1m"], &[]),
+            ..ExecContext::default()
+        };
+        let call = task(serde_json::json!({
+            "prompt": "inspect",
+            "model_parameters": [{"id": "context", "value": "1m"}]
+        }));
+        assert_eq!(
+            context.prepare_call(&call).unwrap().arguments["model"],
+            "plugin-hash-1m"
+        );
+        let reasoning = task(serde_json::json!({
+            "prompt": "inspect",
+            "model_parameters": [{"id": "reasoning", "value": "high"}]
+        }));
+        assert!(matches!(
+            context.prepare_call(&reasoning),
+            Err(Error::Protocol(message)) if message.contains("not supported")
+        ));
+    }
+
+    #[test]
     fn model_aliases_canonicalize_display_names_and_slugs() {
         let context = ExecContext {
             default_subagent_model: "parent-model".into(),
-            model_aliases: HashMap::from([
-                ("DeepSeek Flash".into(), "hash-deepseek".into()),
-                ("deepseek flash".into(), "hash-deepseek".into()),
-                ("hash-deepseek-1m-low".into(), "hash-deepseek".into()),
-            ]),
-            model_variant_defaults: HashMap::from([(
-                "hash-deepseek".into(),
-                ("1m".into(), "high".into()),
-            )]),
+            model_directory: directory(
+                "hash-deepseek",
+                "DeepSeek Flash",
+                &["1m"],
+                &["low", "high"],
+            ),
             ..ExecContext::default()
         };
-        for model in ["DeepSeek Flash", "hash-deepseek-1m-low"] {
-            let call = task(serde_json::json!({"prompt":"inspect", "model": model}));
-            assert_eq!(
-                context.prepare_call(&call).unwrap().arguments["model"],
-                "hash-deepseek"
-            );
-        }
+        // 展示名别名归一到 base hash;不带参数时不烘焙变体。
+        let call = task(serde_json::json!({"prompt":"inspect", "model": "DeepSeek Flash"}));
+        assert_eq!(
+            context.prepare_call(&call).unwrap().arguments["model"],
+            "hash-deepseek"
+        );
+        // 显式变体 slug 保留变体分量,不再折叠到 base hash。
+        let variant =
+            task(serde_json::json!({"prompt":"inspect", "model": "hash-deepseek-1m-low"}));
+        assert_eq!(
+            context.prepare_call(&variant).unwrap().arguments["model"],
+            "hash-deepseek-1m-low"
+        );
         let parameterized = task(serde_json::json!({
             "prompt":"inspect",
             "model":"DeepSeek Flash",
-            "model_parameters":[{"id":"effort","value":"low"}]
+            "model_parameters":[{"id":"reasoning","value":"low"}]
         }));
         assert_eq!(
             context.prepare_call(&parameterized).unwrap().arguments["model"],

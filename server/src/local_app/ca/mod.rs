@@ -70,6 +70,10 @@ impl CaManager {
         }
     }
 
+    pub fn certificate_pem(&self) -> Result<String> {
+        Ok(fs::read_to_string(self.cert_path())?)
+    }
+
     pub fn load(&self) -> Result<LoadedCa> {
         let cert = fs::read_to_string(self.cert_path())?;
         let key = fs::read_to_string(self.key_path())?;

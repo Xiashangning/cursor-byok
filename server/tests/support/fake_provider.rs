@@ -65,6 +65,10 @@ impl FakeProvider {
     pub fn requests(&self) -> Vec<ModelRequest> {
         self.requests.lock().unwrap().clone()
     }
+    /// Number of recorded requests without cloning their histories.
+    pub fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
 }
 
 impl Provider for FakeProvider {

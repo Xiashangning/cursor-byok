@@ -80,22 +80,10 @@ impl Store {
     }
 
     fn model_variant_slug_matches(key: &str, model: &ModelConfig) -> bool {
-        let Some(suffix) = key.strip_prefix(&format!("{}-", model.model_hash)) else {
-            return false;
-        };
-        let mut contexts = model.context_options.clone();
-        if let Some(tokens) = model.context_window_tokens {
-            let bare = tokens.to_string();
-            if !contexts.iter().any(|value| value == &bare) {
-                contexts.push(bare);
-            }
-        }
-        contexts.iter().any(|context| {
-            model.effort_options.iter().any(|effort| {
-                suffix == format!("{context}-{effort}")
-                    || suffix == format!("{context}-{effort}-fast")
-            })
-        })
+        model
+            .variant_axis()
+            .parse_slug(&model.model_hash, key)
+            .is_some()
     }
 
     pub async fn create_model(&self, input: &ModelConfigInput) -> Result<ModelConfig> {
@@ -545,6 +533,32 @@ mod tests {
         );
         assert!(store
             .resolve_model("unknown-model")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn resolves_variant_slugs_for_models_without_a_reasoning_axis() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let mut model_input = input("Model A");
+        model_input.effort_options = Vec::new();
+        let saved = store.create_model(&model_input).await.unwrap();
+
+        for variant in [
+            format!("{}-1m", saved.model_hash),
+            format!("{}-200k-fast", saved.model_hash),
+        ] {
+            let resolved = store.resolve_model(&variant).await.unwrap();
+            assert_eq!(
+                resolved.as_ref().map(|model| model.model_hash.as_str()),
+                Some(saved.model_hash.as_str()),
+                "key {variant} must resolve"
+            );
+        }
+        // 无推理轴的模型不接受带 effort 段的 slug。
+        assert!(store
+            .resolve_model(&format!("{}-1m-high", saved.model_hash))
             .await
             .unwrap()
             .is_none());

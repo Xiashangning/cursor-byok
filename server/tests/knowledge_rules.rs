@@ -1,7 +1,6 @@
 //! Verifies KnowledgeBase rules CRUD falls back to local markdown storage
 //! when the Cursor upstream is unreachable or rejects the request.
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
 use axum::{
     body::{to_bytes, Body},
@@ -13,6 +12,7 @@ use cursor_server::{
     cursor::services::knowledge::{self, KnowledgeService},
 };
 use prost::Message;
+use support::temp_store;
 
 // 测试侧的镜像消息定义,同时充当 wire 兼容性检查。
 #[derive(Clone, PartialEq, Message)]
@@ -105,7 +105,7 @@ async fn decode<M: Message + Default>(response: Response<Body>) -> M {
 /// 覆盖 md 持久化、离线日志压缩与增删改查闭环。
 #[tokio::test]
 async fn offline_crud_round_trip_persists_markdown() {
-    let (_store_dir, store) = fixtures::temp_store().await;
+    let (_store_dir, store) = temp_store().await;
     let upstream = CursorProxy::cursor(cursor_server::network::NetworkClients::new(store));
     let rules_dir = tempfile::tempdir().unwrap();
     let rules_root = rules_dir.path().join("rules");
@@ -195,7 +195,7 @@ async fn offline_crud_round_trip_persists_markdown() {
 
 #[tokio::test]
 async fn updating_missing_rule_reports_failure() {
-    let (_store_dir, store) = fixtures::temp_store().await;
+    let (_store_dir, store) = temp_store().await;
     let upstream = CursorProxy::cursor(cursor_server::network::NetworkClients::new(store));
     let rules_dir = tempfile::tempdir().unwrap();
     let service = KnowledgeService::with_root(rules_dir.path().join("rules")).unwrap();

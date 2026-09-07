@@ -1250,6 +1250,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "walkdir",
  "windows-sys 0.61.2",
  "x509-parser",
  "zip",

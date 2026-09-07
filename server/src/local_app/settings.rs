@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::{Error, Result};
 
-const KEYS: [&str; 5] = [
+const PROXY_KEYS: [&str; 5] = [
     "http.proxy",
     "http.proxyKerberosServicePrincipal",
     "http.proxySupport",
@@ -32,7 +32,7 @@ fn path() -> Result<PathBuf> {
     }
 }
 
-fn read() -> Result<BTreeMap<String, Value>> {
+pub(super) fn read() -> Result<BTreeMap<String, Value>> {
     let path = path()?;
     let data = match fs::read_to_string(path) {
         Ok(data) => data,
@@ -46,7 +46,7 @@ fn read() -> Result<BTreeMap<String, Value>> {
         .map_err(|error| Error::Config(format!("parse Cursor settings JSONC: {error}")))
 }
 
-fn write(settings: &BTreeMap<String, Value>) -> Result<()> {
+pub(super) fn write(settings: &BTreeMap<String, Value>) -> Result<()> {
     let path = path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -58,52 +58,56 @@ fn write(settings: &BTreeMap<String, Value>) -> Result<()> {
     Ok(())
 }
 
-pub fn write_proxy_settings(proxy_url: &str) -> Result<()> {
-    let mut settings = read()?;
-    settings.insert(KEYS[0].into(), Value::String(proxy_url.into()));
-    settings.insert(KEYS[1].into(), Value::String(proxy_url.into()));
-    settings.insert(KEYS[2].into(), Value::String("on".into()));
-    settings.insert(KEYS[3].into(), Value::Bool(true));
-    settings.insert(KEYS[4].into(), Value::Bool(true));
-    write(&settings)
+pub(super) fn set_managed_integration(
+    settings: &mut BTreeMap<String, Value>,
+    proxy_url: &str,
+    remote_ssh_config: &std::path::Path,
+) {
+    settings.insert(PROXY_KEYS[0].into(), Value::String(proxy_url.into()));
+    settings.insert(PROXY_KEYS[1].into(), Value::String(proxy_url.into()));
+    settings.insert(PROXY_KEYS[2].into(), Value::String("on".into()));
+    settings.insert(PROXY_KEYS[3].into(), Value::Bool(true));
+    settings.insert(PROXY_KEYS[4].into(), Value::Bool(true));
+    settings.insert(
+        "remote.SSH.configFile".into(),
+        Value::String(remote_ssh_config.to_string_lossy().into_owned()),
+    );
+    settings.insert("remote.SSH.enableRemoteCommand".into(), Value::Bool(true));
 }
 
-pub fn clear_proxy_settings() -> Result<()> {
-    let mut settings = read()?;
-    let before = settings.len();
-    for key in KEYS {
+pub(super) fn clear_proxy_values(settings: &mut BTreeMap<String, Value>) {
+    for key in PROXY_KEYS {
         settings.remove(key);
     }
-    if settings.len() != before {
-        write(&settings)?;
-    }
-    Ok(())
 }
 
-pub fn settings_match(proxy_url: &str) -> Result<bool> {
-    let settings = read()?;
-    Ok(
-        settings.get(KEYS[0]) == Some(&Value::String(proxy_url.into()))
-            && settings.get(KEYS[1]) == Some(&Value::String(proxy_url.into()))
-            && settings.get(KEYS[2]) == Some(&Value::String("on".into()))
-            && settings.get(KEYS[3]) == Some(&Value::Bool(true))
-            && settings.get(KEYS[4]) == Some(&Value::Bool(true)),
-    )
+pub(super) fn proxy_values_match(settings: &BTreeMap<String, Value>, proxy_url: &str) -> bool {
+    settings.get(PROXY_KEYS[0]) == Some(&Value::String(proxy_url.into()))
+        && settings.get(PROXY_KEYS[1]) == Some(&Value::String(proxy_url.into()))
+        && settings.get(PROXY_KEYS[2]) == Some(&Value::String("on".into()))
+        && settings.get(PROXY_KEYS[3]) == Some(&Value::Bool(true))
+        && settings.get(PROXY_KEYS[4]) == Some(&Value::Bool(true))
 }
 
-pub fn clear_stale_managed_settings() -> Result<()> {
-    let settings = read()?;
-    let managed_signature = settings.get(KEYS[2]) == Some(&Value::String("on".into()))
-        && settings.get(KEYS[3]) == Some(&Value::Bool(true))
-        && settings.get(KEYS[4]) == Some(&Value::Bool(true));
+pub(super) fn managed_proxy_values(settings: &BTreeMap<String, Value>) -> bool {
+    let managed_signature = settings.get(PROXY_KEYS[2]) == Some(&Value::String("on".into()))
+        && settings.get(PROXY_KEYS[3]) == Some(&Value::Bool(true))
+        && settings.get(PROXY_KEYS[4]) == Some(&Value::Bool(true));
     let loopback = settings
-        .get(KEYS[0])
+        .get(PROXY_KEYS[0])
         .and_then(Value::as_str)
         .and_then(|value| value.parse::<reqwest::Url>().ok())
         .and_then(|url| url.host_str().map(str::to_owned))
         .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
-    if managed_signature && loopback {
-        clear_proxy_settings()?;
+    managed_signature && loopback
+}
+
+pub fn clear_stale_proxy_settings() -> Result<()> {
+    let settings = read()?;
+    if managed_proxy_values(&settings) {
+        let mut settings = settings;
+        clear_proxy_values(&mut settings);
+        write(&settings)?;
     }
     Ok(())
 }

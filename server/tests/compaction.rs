@@ -1,59 +1,34 @@
 //! Verifies explicit and automatic context compaction behavior.
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::collections::HashMap;
+
+use support::{
+    drive, openai_model_input, registry, run_request, temp_store, text_response_with_usage,
+    user_message_action, FakeProvider,
+};
 
 use cursor_server::{
-    cursor::prompting::{PromptAssets, PromptCompiler},
-    cursor::{
-        protocol::{connect, proto::agent::v1 as pb},
-        TransportCommand, TransportRegistry,
-    },
-    model::{
-        ContentPart, ConversationId, MessageContent, ModelConfigInput, ModelType, Origin,
-        ProjectedContent, Role, Usage, OPENAI_CHAT_ENDPOINT,
-    },
+    cursor::{protocol::proto::agent::v1 as pb, TransportCommand, TransportRegistry},
+    model::{ContentPart, ConversationId, MessageContent, Origin, ProjectedContent, Role, Usage},
     provider::{FinishReason, ModelEvent},
 };
 use prost::Message;
 
 #[tokio::test]
 async fn summarize_replaces_model_history_and_preserves_cursor_history() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let model = store
-        .create_model(&ModelConfigInput {
-            sort_order: 0,
-            display_name: "Test Model".into(),
-            group_name: None,
-            model_type: ModelType::OpenAi,
-            base_url: "https://example.com/v1/chat/completions".into(),
-            use_full_url: true,
-            api_key: "test-key".into(),
-            tooltip_data: "Test Model".into(),
-            model_id: "test-model".into(),
-            reasoning_effort: None,
-            effort_options: Vec::new(),
-            context_options: Vec::new(),
-            openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
-            openai_extra_params_enabled: false,
-            openai_extra_params: serde_json::json!({}),
-            custom_headers_enabled: false,
-            custom_headers: serde_json::json!({}),
-            anthropic_extra_params_enabled: false,
-            anthropic_extra_params: serde_json::json!({}),
-            context_window_tokens: None,
-            max_completion_tokens: None,
-            anthropic_max_tokens: None,
-            anthropic_thinking_effort: None,
-            thinking_budget_tokens: None,
-        })
+        .create_model(&openai_model_input("test-model", None))
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(text_response("old answer", 4_000, 12));
+    let provider = FakeProvider::default();
+    provider.push(text_response_with_usage(
+        "call-old answer",
+        "old answer",
+        4_000,
+        12,
+    ));
     provider.push(vec![
         ModelEvent::Start {
             model_call_id: "summary-call".into(),
@@ -71,18 +46,13 @@ async fn summarize_replaces_model_history_and_preserves_cursor_history() {
         }),
         ModelEvent::Done(FinishReason::Stop),
     ]);
-    provider.push(text_response("new answer", 900, 5));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    provider.push(text_response_with_usage(
+        "call-new answer",
+        "new answer",
+        900,
+        5,
+    ));
+    let registry = registry(store.clone(), provider.clone());
 
     let first = run(
         &registry,
@@ -200,51 +170,32 @@ async fn summarize_replaces_model_history_and_preserves_cursor_history() {
 
 #[tokio::test]
 async fn automatic_compaction_preflights_provider_input_and_records_rebuilt_tokens() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let model = store
-        .create_model(&ModelConfigInput {
-            sort_order: 0,
-            display_name: "Auto Compact Model".into(),
-            group_name: None,
-            model_type: ModelType::OpenAi,
-            base_url: "https://example.com/v1/chat/completions".into(),
-            use_full_url: true,
-            api_key: "test-key".into(),
-            tooltip_data: "Auto Compact Model".into(),
-            model_id: "auto-compact-model".into(),
-            reasoning_effort: None,
-            effort_options: Vec::new(),
-            context_options: Vec::new(),
-            openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
-            openai_extra_params_enabled: false,
-            openai_extra_params: serde_json::json!({}),
-            custom_headers_enabled: false,
-            custom_headers: serde_json::json!({}),
-            anthropic_extra_params_enabled: false,
-            anthropic_extra_params: serde_json::json!({}),
-            context_window_tokens: Some(100_000),
-            max_completion_tokens: None,
-            anthropic_max_tokens: None,
-            anthropic_thinking_effort: None,
-            thinking_budget_tokens: None,
-        })
+        .create_model(&openai_model_input("auto-compact-model", Some(100_000)))
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(text_response(&"x".repeat(400_000), 150_000, 1_000));
-    provider.push(text_response("automatic durable summary", 120_000, 20));
-    provider.push(text_response("continued after compaction", 20_000, 20));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let provider = FakeProvider::default();
+    let long_answer = "x".repeat(400_000);
+    provider.push(text_response_with_usage(
+        &format!("call-{long_answer}"),
+        &long_answer,
+        150_000,
+        1_000,
+    ));
+    provider.push(text_response_with_usage(
+        "call-automatic durable summary",
+        "automatic durable summary",
+        120_000,
+        20,
+    ));
+    provider.push(text_response_with_usage(
+        "call-continued after compaction",
+        "continued after compaction",
+        20_000,
+        20,
+    ));
+    let registry = registry(store, provider.clone());
 
     let first = run(
         &registry,
@@ -317,79 +268,29 @@ async fn automatic_compaction_preflights_provider_input_and_records_rebuilt_toke
 
 #[tokio::test]
 async fn incremental_preflight_uses_conversation_anchor_across_model_switch() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let model_a = store
-        .create_model(&ModelConfigInput {
-            sort_order: 0,
-            display_name: "Anchor Model A".into(),
-            group_name: None,
-            model_type: ModelType::OpenAi,
-            base_url: "https://example.com/v1/chat/completions".into(),
-            use_full_url: true,
-            api_key: "test-key".into(),
-            tooltip_data: "Anchor Model A".into(),
-            model_id: "anchor-model-a".into(),
-            reasoning_effort: None,
-            effort_options: Vec::new(),
-            context_options: Vec::new(),
-            openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
-            openai_extra_params_enabled: false,
-            openai_extra_params: serde_json::json!({}),
-            custom_headers_enabled: false,
-            custom_headers: serde_json::json!({}),
-            anthropic_extra_params_enabled: false,
-            anthropic_extra_params: serde_json::json!({}),
-            context_window_tokens: None,
-            max_completion_tokens: None,
-            anthropic_max_tokens: None,
-            anthropic_thinking_effort: None,
-            thinking_budget_tokens: None,
-        })
+        .create_model(&openai_model_input("anchor-model-a", None))
         .await
         .unwrap();
     let model_b = store
-        .create_model(&ModelConfigInput {
-            sort_order: 1,
-            display_name: "Anchor Model B".into(),
-            group_name: None,
-            model_type: ModelType::OpenAi,
-            base_url: "https://example.com/v1/chat/completions".into(),
-            use_full_url: true,
-            api_key: "test-key".into(),
-            tooltip_data: "Anchor Model B".into(),
-            model_id: "anchor-model-b".into(),
-            reasoning_effort: None,
-            effort_options: Vec::new(),
-            context_options: Vec::new(),
-            openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
-            openai_extra_params_enabled: false,
-            openai_extra_params: serde_json::json!({}),
-            custom_headers_enabled: false,
-            custom_headers: serde_json::json!({}),
-            anthropic_extra_params_enabled: false,
-            anthropic_extra_params: serde_json::json!({}),
-            context_window_tokens: Some(200_000),
-            max_completion_tokens: None,
-            anthropic_max_tokens: None,
-            anthropic_thinking_effort: None,
-            thinking_budget_tokens: None,
-        })
+        .create_model(&openai_model_input("anchor-model-b", Some(200_000)))
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(text_response("old answer", 103_904, 12));
-    provider.push(text_response("new answer", 104_000, 12));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let provider = FakeProvider::default();
+    provider.push(text_response_with_usage(
+        "call-old answer",
+        "old answer",
+        103_904,
+        12,
+    ));
+    provider.push(text_response_with_usage(
+        "call-new answer",
+        "new answer",
+        104_000,
+        12,
+    ));
+    let registry = registry(store, provider.clone());
 
     let first = run(
         &registry,
@@ -423,48 +324,13 @@ async fn incremental_preflight_uses_conversation_anchor_across_model_switch() {
 
 #[tokio::test]
 async fn irreducibly_oversized_current_input_fails_before_provider_dispatch() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let model = store
-        .create_model(&ModelConfigInput {
-            sort_order: 0,
-            display_name: "Overflow Model".into(),
-            group_name: None,
-            model_type: ModelType::OpenAi,
-            base_url: "https://example.com/v1/chat/completions".into(),
-            use_full_url: true,
-            api_key: "test-key".into(),
-            tooltip_data: "Overflow Model".into(),
-            model_id: "overflow-model".into(),
-            reasoning_effort: None,
-            effort_options: Vec::new(),
-            context_options: Vec::new(),
-            openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
-            openai_extra_params_enabled: false,
-            openai_extra_params: serde_json::json!({}),
-            custom_headers_enabled: false,
-            custom_headers: serde_json::json!({}),
-            anthropic_extra_params_enabled: false,
-            anthropic_extra_params: serde_json::json!({}),
-            context_window_tokens: Some(100_000),
-            max_completion_tokens: None,
-            anthropic_max_tokens: None,
-            anthropic_thinking_effort: None,
-            thinking_budget_tokens: None,
-        })
+        .create_model(&openai_model_input("overflow-model", Some(100_000)))
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let provider = FakeProvider::default();
+    let registry = registry(store, provider.clone());
 
     let output = run(
         &registry,
@@ -484,65 +350,41 @@ async fn irreducibly_oversized_current_input_fails_before_provider_dispatch() {
     assert_eq!(output.summary_completed, 0);
 }
 
-fn windowed_model(model_id: &str, context_window_tokens: Option<u64>) -> ModelConfigInput {
-    ModelConfigInput {
-        sort_order: 0,
-        display_name: model_id.into(),
-        group_name: None,
-        model_type: ModelType::OpenAi,
-        base_url: "https://example.com/v1/chat/completions".into(),
-        use_full_url: true,
-        api_key: "test-key".into(),
-        tooltip_data: model_id.into(),
-        model_id: model_id.into(),
-        reasoning_effort: None,
-        effort_options: Vec::new(),
-        context_options: Vec::new(),
-        openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
-        openai_extra_params_enabled: false,
-        openai_extra_params: serde_json::json!({}),
-        custom_headers_enabled: false,
-        custom_headers: serde_json::json!({}),
-        anthropic_extra_params_enabled: false,
-        anthropic_extra_params: serde_json::json!({}),
-        context_window_tokens,
-        max_completion_tokens: None,
-        anthropic_max_tokens: None,
-        anthropic_thinking_effort: None,
-        thinking_budget_tokens: None,
-    }
-}
-
 #[tokio::test]
 async fn provider_overflow_refusal_compacts_and_retries_once() {
     // The estimate cleared the compaction check, but the provider counted
     // more and refused. The refusal is the trigger the estimate missed.
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let model = store
-        .create_model(&windowed_model("refusal-model", Some(1_000_000)))
+        .create_model(&openai_model_input("refusal-model", Some(1_000_000)))
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(text_response("first answer", 4_000, 12));
+    let provider = FakeProvider::default();
+    provider.push(text_response_with_usage(
+        "call-first answer",
+        "first answer",
+        4_000,
+        12,
+    ));
     provider.push_error(cursor_server::Error::Provider(
         "Anthropic 400 Bad Request: {\"type\":\"error\",\"error\":{\"type\":\
          \"invalid_request_error\",\"message\":\"prompt is too long: 1002148 tokens > \
          1000000 maximum\"}}"
             .into(),
     ));
-    provider.push(text_response("durable summary", 3_000, 20));
-    provider.push(text_response("answer after compaction", 500, 20));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    provider.push(text_response_with_usage(
+        "call-durable summary",
+        "durable summary",
+        3_000,
+        20,
+    ));
+    provider.push(text_response_with_usage(
+        "call-answer after compaction",
+        "answer after compaction",
+        500,
+        20,
+    ));
+    let registry = registry(store, provider.clone());
 
     let first = run(
         &registry,
@@ -603,25 +445,25 @@ async fn resumed_history_stays_user_terminated_without_persisting_phantom_tails(
     // (cursor/compile/break_messages.rs), so the user_terminated projection
     // must not stack a second, phantom tail on top. Whatever tail the run
     // projects is provider-visible only and must never reach the store.
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let model = store
-        .create_model(&windowed_model("tail-model", None))
+        .create_model(&openai_model_input("tail-model", None))
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(text_response("first answer", 400, 12));
-    provider.push(text_response("resumed answer", 450, 12));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let provider = FakeProvider::default();
+    provider.push(text_response_with_usage(
+        "call-first answer",
+        "first answer",
+        400,
+        12,
+    ));
+    provider.push(text_response_with_usage(
+        "call-resumed answer",
+        "resumed answer",
+        450,
+        12,
+    ));
+    let registry = registry(store.clone(), provider.clone());
 
     let first = run(
         &registry,
@@ -638,8 +480,9 @@ async fn resumed_history_stays_user_terminated_without_persisting_phantom_tails(
     let resumed = run(
         &registry,
         "tail-resume",
-        request(
+        run_request(
             "tail-conversation",
+            "reusable-wire-run-id",
             &model.model_hash,
             first.checkpoints.last().cloned(),
             pb::conversation_action::Action::ResumeAction(pb::ResumeAction::default()),
@@ -707,79 +550,36 @@ async fn run(
         .await
         .unwrap();
     let mut append_seqno = 1;
-    let mut output = Output::default();
-    loop {
-        let frame = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            return output;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        match server.message {
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                if let Some(pb::kv_server_message::Message::SetBlobArgs(set)) = kv.message {
-                    output.blobs.insert(set.blob_id, set.blob_data);
-                }
-                handle
-                    .command(TransportCommand::Append {
-                        seqno: append_seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                append_seqno += 1;
+    let streamed = drive(&handle, &mut receiver, &mut append_seqno, |_| vec![]).await;
+    let mut output = Output {
+        checkpoints: streamed.checkpoints,
+        blobs: streamed.blobs,
+        ..Default::default()
+    };
+    for update in streamed.interactions {
+        match update.message {
+            Some(pb::interaction_update::Message::SummaryStarted(_)) => {
+                output.summary_started += 1;
+                output.interaction_events.push("summary_started".into());
             }
-            Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(state)) => {
-                output.checkpoints.push(state)
+            Some(pb::interaction_update::Message::Summary(delta)) => {
+                output.summary.push_str(&delta.summary)
             }
-            Some(pb::agent_server_message::Message::InteractionUpdate(update)) => {
-                match update.message {
-                    Some(pb::interaction_update::Message::SummaryStarted(_)) => {
-                        output.summary_started += 1;
-                        output.interaction_events.push("summary_started".into());
-                    }
-                    Some(pb::interaction_update::Message::Summary(delta)) => {
-                        output.summary.push_str(&delta.summary)
-                    }
-                    Some(pb::interaction_update::Message::SummaryCompleted(_)) => {
-                        output.summary_completed += 1;
-                        output.interaction_events.push("summary_completed".into());
-                    }
-                    Some(pb::interaction_update::Message::TurnEnded(_)) => output.turn_ended += 1,
-                    Some(pb::interaction_update::Message::TokenDelta(delta)) => {
-                        output.token_delta += 1;
-                        output
-                            .interaction_events
-                            .push(format!("token_delta:{}", delta.tokens));
-                    }
-                    _ => {}
-                }
+            Some(pb::interaction_update::Message::SummaryCompleted(_)) => {
+                output.summary_completed += 1;
+                output.interaction_events.push("summary_completed".into());
+            }
+            Some(pb::interaction_update::Message::TurnEnded(_)) => output.turn_ended += 1,
+            Some(pb::interaction_update::Message::TokenDelta(delta)) => {
+                output.token_delta += 1;
+                output
+                    .interaction_events
+                    .push(format!("token_delta:{}", delta.tokens));
             }
             _ => {}
         }
     }
-}
-
-fn text_response(text: &str, input: u64, output: u64) -> Vec<ModelEvent> {
-    vec![
-        ModelEvent::Start {
-            model_call_id: format!("call-{text}"),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta(text.into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Usage(Usage {
-            input_tokens: Some(input),
-            context_input_tokens: Some(input),
-            output_tokens: Some(output),
-            total_tokens: Some(input + output),
-            ..Default::default()
-        }),
-        ModelEvent::Done(FinishReason::Stop),
-    ]
+    output
 }
 
 fn user_request(
@@ -789,21 +589,12 @@ fn user_request(
     model_id: &str,
     state: Option<pb::ConversationStateStructure>,
 ) -> pb::AgentClientMessage {
-    let user = pb::UserMessage {
-        text: text.into(),
-        message_id: message_id.into(),
-        mode: pb::AgentMode::Agent as i32,
-        ..Default::default()
-    };
-    request(
+    run_request(
         conversation_id,
+        "reusable-wire-run-id",
         model_id,
         state,
-        pb::conversation_action::Action::UserMessageAction(pb::UserMessageAction {
-            user_message: Some(user),
-            request_context: Some(pb::RequestContext::default()),
-            ..Default::default()
-        }),
+        user_message_action(text, message_id, Some(pb::RequestContext::default())),
     )
 }
 
@@ -812,59 +603,15 @@ fn summary_request(
     model_id: &str,
     state: pb::ConversationStateStructure,
 ) -> pb::AgentClientMessage {
-    let user = pb::UserMessage {
-        text: "/summarize".into(),
-        message_id: "summary-command".into(),
-        mode: pb::AgentMode::Agent as i32,
-        ..Default::default()
-    };
-    request(
+    run_request(
         conversation_id,
+        "reusable-wire-run-id",
         model_id,
         Some(state),
-        pb::conversation_action::Action::UserMessageAction(pb::UserMessageAction {
-            user_message: Some(user),
-            request_context: Some(pb::RequestContext::default()),
-            ..Default::default()
-        }),
+        user_message_action(
+            "/summarize",
+            "summary-command",
+            Some(pb::RequestContext::default()),
+        ),
     )
-}
-
-fn request(
-    conversation_id: &str,
-    model_id: &str,
-    state: Option<pb::ConversationStateStructure>,
-    action: pb::conversation_action::Action,
-) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                requested_model: Some(pb::RequestedModel {
-                    model_id: model_id.into(),
-                    ..Default::default()
-                }),
-                action: Some(pb::ConversationAction {
-                    action: Some(action),
-                    ..Default::default()
-                }),
-                conversation_id: Some(conversation_id.into()),
-                conversation_state: state,
-                run_id: Some("reusable-wire-run-id".into()),
-                ..Default::default()
-            },
-        )),
-    }
-}
-
-fn kv_ack(id: u32) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::KvClientMessage(
-            pb::KvClientMessage {
-                id,
-                message: Some(pb::kv_client_message::Message::SetBlobResult(
-                    pb::SetBlobResult { error: None },
-                )),
-            },
-        )),
-    }
 }

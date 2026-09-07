@@ -1,40 +1,28 @@
 //! Verifies unique persisted and streamed terminal outcomes.
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
-
-use std::sync::Arc;
+mod support;
 
 use axum::http::StatusCode;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use cursor_server::{
-    cursor::prompting::{PromptAssets, PromptCompiler},
     cursor::protocol::{
         connect,
         proto::{agent::v1 as pb, aiserver::v1 as ai},
     },
-    cursor::{TransportCommand, TransportParent, TransportRegistry},
+    cursor::{TransportCommand, TransportParent},
     model::{MessageContent, Role},
     provider::{FinishReason, ModelEvent},
     Error,
 };
 use prost::Message;
+use support::{
+    acknowledge_kv, drive, read_success, registry, run_request, temp_store, text_response,
+    tool_response, user_message_action, FakeProvider,
+};
 
 #[tokio::test]
 async fn abort_command_cancels_the_run_and_closes_output() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(fake_provider::FakeProvider::default()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let registry = registry(store, FakeProvider::default());
     let handle = registry.get_or_create("abort-request").await.unwrap();
     let mut output = handle.subscribe();
 
@@ -53,8 +41,8 @@ async fn abort_command_cancels_the_run_and_closes_output() {
 
 #[tokio::test]
 async fn provider_failure_retries_from_the_current_checkpoint_without_hiding_partial_output() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     provider.push_results(vec![
         Ok(ModelEvent::Start {
             model_call_id: "attempt-0".into(),
@@ -72,26 +60,8 @@ async fn provider_failure_retries_from_the_current_checkpoint_without_hiding_par
         }),
         Err(Error::Provider("stream disconnected".into())),
     ]);
-    provider.push(vec![
-        ModelEvent::Start {
-            model_call_id: "attempt-1".into(),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta("completed".into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Done(FinishReason::Stop),
-    ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    provider.push(text_response("attempt-1", "completed"));
+    let registry = registry(store.clone(), provider.clone());
     let handle = registry.get_or_create("retry-request").await.unwrap();
     let mut output = handle.subscribe();
     handle
@@ -120,15 +90,8 @@ async fn provider_failure_retries_from_the_current_checkpoint_without_hiding_par
         }
         let server = pb::AgentServerMessage::decode(payload).unwrap();
         match server.message {
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
+            Some(pb::agent_server_message::Message::KvServerMessage(_)) => {
+                acknowledge_kv(&handle, &mut seqno, &frame).await;
             }
             Some(pb::agent_server_message::Message::InteractionUpdate(update)) => {
                 match update.message {
@@ -172,25 +135,15 @@ async fn provider_failure_retries_from_the_current_checkpoint_without_hiding_par
 
 #[tokio::test]
 async fn provider_failure_keeps_the_initial_checkpoint_then_returns_structured_error() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     provider.push(vec![
         ModelEvent::Start {
             model_call_id: "length-limited".into(),
         },
         ModelEvent::Done(FinishReason::Length),
     ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let registry = registry(store.clone(), provider.clone());
     let handle = registry.get_or_create("failed-request").await.unwrap();
     let mut output = handle.subscribe();
     handle
@@ -202,46 +155,20 @@ async fn provider_failure_keeps_the_initial_checkpoint_then_returns_structured_e
         .unwrap();
 
     let mut append_seqno = 1;
-    let mut checkpoints = Vec::new();
-    let mut saw_turn_ended = false;
-    let error_json = loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .expect("RunSSE closed before EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            break serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+    let out = drive(&handle, &mut output, &mut append_seqno, |_| vec![]).await;
+    let checkpoints = &out.checkpoints;
+    let saw_turn_ended = out.interactions.iter().any(|update| {
+        matches!(
+            update.message,
+            Some(pb::interaction_update::Message::TurnEnded(_))
+        )
+    });
+    for update in &out.interactions {
+        if let Some(pb::interaction_update::Message::TextDelta(delta)) = &update.message {
+            assert!(!delta.text.contains("Cursor server error"));
         }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        match server.message {
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                handle
-                    .command(TransportCommand::Append {
-                        seqno: append_seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                append_seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(state)) => {
-                checkpoints.push(state);
-            }
-            Some(pb::agent_server_message::Message::InteractionUpdate(update)) => {
-                if matches!(
-                    update.message,
-                    Some(pb::interaction_update::Message::TurnEnded(_))
-                ) {
-                    saw_turn_ended = true;
-                }
-                if let Some(pb::interaction_update::Message::TextDelta(delta)) = update.message {
-                    assert!(!delta.text.contains("Cursor server error"));
-                }
-            }
-            _ => {}
-        }
-    };
+    }
+    let error_json = out.terminal;
 
     assert_eq!(
         checkpoints.len(),
@@ -291,33 +218,15 @@ async fn provider_failure_keeps_the_initial_checkpoint_then_returns_structured_e
 
 #[tokio::test]
 async fn rejected_provider_request_is_reported_after_one_attempt() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     provider.push_error(Error::ProviderStatus {
         status: StatusCode::UNAUTHORIZED,
         message: "OpenAI Chat 401 Unauthorized: invalid api key".into(),
     });
     // A retry would consume this response and finish the run successfully.
-    provider.push(vec![
-        ModelEvent::Start {
-            model_call_id: "retried".into(),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta("retried".into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Done(FinishReason::Stop),
-    ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    provider.push(text_response("retried", "retried"));
+    let registry = registry(store, provider.clone());
     let handle = registry.get_or_create("failed-request").await.unwrap();
     let mut output = handle.subscribe();
     handle
@@ -329,27 +238,9 @@ async fn rejected_provider_request_is_reported_after_one_attempt() {
         .unwrap();
 
     let mut append_seqno = 1;
-    let error_json = loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), output.recv())
-            .await
-            .unwrap()
-            .expect("RunSSE closed before EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            break serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        if let Some(pb::agent_server_message::Message::KvServerMessage(kv)) = server.message {
-            handle
-                .command(TransportCommand::Append {
-                    seqno: append_seqno,
-                    message: Box::new(kv_ack(kv.id)),
-                })
-                .await
-                .unwrap();
-            append_seqno += 1;
-        }
-    };
+    let error_json = drive(&handle, &mut output, &mut append_seqno, |_| vec![])
+        .await
+        .terminal;
 
     assert_eq!(
         provider.requests().len(),
@@ -370,44 +261,16 @@ async fn rejected_provider_request_is_reported_after_one_attempt() {
 
 #[tokio::test]
 async fn unknown_tool_response_id_is_ignored_and_the_run_continues() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(vec![
-        ModelEvent::Start {
-            model_call_id: "model-call".into(),
-        },
-        ModelEvent::ToolCallStart {
-            index: 0,
-            call_id: "call-1".into(),
-            name: "Read".into(),
-        },
-        ModelEvent::ToolCallArgumentsDelta {
-            index: 0,
-            delta: "{\"path\":\"/tmp/a\"}".into(),
-        },
-        ModelEvent::ToolCallEnd { index: 0 },
-        ModelEvent::Done(FinishReason::ToolUse),
-    ]);
-    provider.push(vec![
-        ModelEvent::Start {
-            model_call_id: "model-call-2".into(),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta("done".into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Done(FinishReason::Stop),
-    ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(tool_response(
+        "model-call",
+        "call-1",
+        "Read",
+        "{\"path\":\"/tmp/a\"}",
+    ));
+    provider.push(text_response("model-call-2", "done"));
+    let registry = registry(store.clone(), provider);
     let handle = registry
         .get_or_create("protocol-failed-request")
         .await
@@ -422,81 +285,36 @@ async fn unknown_tool_response_id_is_ignored_and_the_run_continues() {
         .unwrap();
 
     let mut append_seqno = 1;
-    let mut saw_turn_ended = false;
-    let end_stream = loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .expect("RunSSE closed before Error EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            break serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        match server.message {
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                handle
-                    .command(TransportCommand::Append {
-                        seqno: append_seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                append_seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => {
-                // Unknown bridge ids are ignored; the valid response still completes the tool.
-                for message in [
+    let out = drive(&handle, &mut output, &mut append_seqno, |exec| {
+        // Unknown bridge ids are ignored; the valid response still completes the tool.
+        vec![
+            pb::AgentClientMessage {
+                message: Some(pb::agent_client_message::Message::ExecClientMessage(
                     pb::ExecClientMessage {
                         id: exec.id + 1_000,
                         exec_id: String::new(),
                         message: None,
                         ..Default::default()
                     },
-                    pb::ExecClientMessage {
-                        id: exec.id,
-                        exec_id: String::new(),
-                        message: Some(pb::exec_client_message::Message::ReadResult(
-                            pb::ReadResult {
-                                result: Some(pb::read_result::Result::Success(pb::ReadSuccess {
-                                    path: "/tmp/a".into(),
-                                    output: Some(pb::read_success::Output::Content("value".into())),
-                                    ..Default::default()
-                                })),
-                            },
-                        )),
-                        ..Default::default()
-                    },
-                ] {
-                    handle
-                        .command(TransportCommand::Append {
-                            seqno: append_seqno,
-                            message: Box::new(pb::AgentClientMessage {
-                                message: Some(
-                                    pb::agent_client_message::Message::ExecClientMessage(message),
-                                ),
-                            }),
-                        })
-                        .await
-                        .unwrap();
-                    append_seqno += 1;
-                }
-            }
-            Some(pb::agent_server_message::Message::InteractionUpdate(update)) => {
-                if matches!(
-                    update.message,
-                    Some(pb::interaction_update::Message::TurnEnded(_))
-                ) {
-                    saw_turn_ended = true;
-                }
-                if let Some(pb::interaction_update::Message::TextDelta(delta)) = update.message {
-                    assert!(!delta.text.contains("unknown tool result"));
-                    assert!(!delta.text.contains("protocol error"));
-                }
-            }
-            _ => {}
+                )),
+            },
+            read_success(exec.id, "/tmp/a", "value"),
+        ]
+    })
+    .await;
+    let saw_turn_ended = out.interactions.iter().any(|update| {
+        matches!(
+            update.message,
+            Some(pb::interaction_update::Message::TurnEnded(_))
+        )
+    });
+    for update in &out.interactions {
+        if let Some(pb::interaction_update::Message::TextDelta(delta)) = &update.message {
+            assert!(!delta.text.contains("unknown tool result"));
+            assert!(!delta.text.contains("protocol error"));
         }
-    };
+    }
+    let end_stream = out.terminal;
 
     assert!(saw_turn_ended);
     assert_eq!(end_stream, serde_json::json!({}));
@@ -519,44 +337,19 @@ async fn unknown_tool_response_id_is_ignored_and_the_run_continues() {
 
 #[tokio::test]
 async fn newer_run_request_on_one_bidi_stream_replaces_the_active_run() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(vec![
-        ModelEvent::Start {
-            model_call_id: "model-call".into(),
-        },
-        ModelEvent::ToolCallStart {
-            index: 0,
-            call_id: "call-1".into(),
-            name: "Read".into(),
-        },
-        ModelEvent::ToolCallArgumentsDelta {
-            index: 0,
-            delta: "{\"path\":\"/tmp/a\"}".into(),
-        },
-        ModelEvent::ToolCallEnd { index: 0 },
-        ModelEvent::Done(FinishReason::ToolUse),
-    ]);
-    provider.push(vec![
-        ModelEvent::Start {
-            model_call_id: "replacement-model-call".into(),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta("replacement completed".into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Done(FinishReason::Stop),
-    ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(tool_response(
+        "model-call",
+        "call-1",
+        "Read",
+        "{\"path\":\"/tmp/a\"}",
+    ));
+    provider.push(text_response(
+        "replacement-model-call",
+        "replacement completed",
+    ));
+    let registry = registry(store.clone(), provider.clone());
     let handle = registry
         .get_or_create("protocol-failed-request")
         .await
@@ -586,15 +379,8 @@ async fn newer_run_request_on_one_bidi_stream_replaces_the_active_run() {
         }
         let server = pb::AgentServerMessage::decode(payload).unwrap();
         match server.message {
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
+            Some(pb::agent_server_message::Message::KvServerMessage(_)) => {
+                acknowledge_kv(&handle, &mut seqno, &frame).await;
             }
             Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(mut state)) => {
                 state.root_prompt_messages_json.truncate(1);
@@ -704,28 +490,13 @@ async fn assert_run_starts_without_parent_dependency(
     parent: Option<TransportParent>,
     subagent_type_name: Option<&str>,
 ) {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(vec![
-        ModelEvent::Start {
-            model_call_id: "independent-model-call".into(),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta("continued independently".into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Done(FinishReason::Stop),
-    ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(text_response(
+        "independent-model-call",
+        "continued independently",
+    ));
+    let registry = registry(store.clone(), provider.clone());
     let handle = registry.get_or_create(request_id).await.unwrap();
     if let Some(parent) = parent {
         handle.set_parent(parent).unwrap();
@@ -747,27 +518,9 @@ async fn assert_run_starts_without_parent_dependency(
         .unwrap();
 
     let mut seqno = 1;
-    let terminal_json = loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .expect("RunSSE closed before EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            break serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        if let Some(pb::agent_server_message::Message::KvServerMessage(kv)) = server.message {
-            handle
-                .command(TransportCommand::Append {
-                    seqno,
-                    message: Box::new(kv_ack(kv.id)),
-                })
-                .await
-                .unwrap();
-            seqno += 1;
-        }
-    };
+    let terminal_json = drive(&handle, &mut output, &mut seqno, |_| vec![])
+        .await
+        .terminal;
 
     assert!(terminal_json.get("error").is_none(), "{terminal_json}");
     assert_eq!(provider.requests().len(), 1);
@@ -782,74 +535,21 @@ async fn assert_run_starts_without_parent_dependency(
 }
 
 fn client_run() -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                action: Some(pb::ConversationAction {
-                    action: Some(pb::conversation_action::Action::UserMessageAction(
-                        pb::UserMessageAction {
-                            user_message: Some(pb::UserMessage {
-                                text: "hello".into(),
-                                message_id: "failed-user".into(),
-                                mode: pb::AgentMode::Agent as i32,
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                }),
-                conversation_id: Some("failed-conversation".into()),
-                run_id: Some("failed-request".into()),
-                requested_model: Some(pb::RequestedModel {
-                    model_id: "test-model".into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )),
-    }
+    run_request(
+        "failed-conversation",
+        "failed-request",
+        "test-model",
+        None,
+        user_message_action("hello", "failed-user", None),
+    )
 }
 
 fn protocol_client_run(text: &str, message_id: &str) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                action: Some(pb::ConversationAction {
-                    action: Some(pb::conversation_action::Action::UserMessageAction(
-                        pb::UserMessageAction {
-                            user_message: Some(pb::UserMessage {
-                                text: text.into(),
-                                message_id: message_id.into(),
-                                mode: pb::AgentMode::Agent as i32,
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                }),
-                conversation_id: Some("protocol-failed-conversation".into()),
-                run_id: Some("protocol-failed-request".into()),
-                requested_model: Some(pb::RequestedModel {
-                    model_id: "test-model".into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )),
-    }
-}
-
-fn kv_ack(id: u32) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::KvClientMessage(
-            pb::KvClientMessage {
-                id,
-                message: Some(pb::kv_client_message::Message::SetBlobResult(
-                    pb::SetBlobResult { error: None },
-                )),
-            },
-        )),
-    }
+    run_request(
+        "protocol-failed-conversation",
+        "protocol-failed-request",
+        "test-model",
+        None,
+        user_message_action(text, message_id, None),
+    )
 }

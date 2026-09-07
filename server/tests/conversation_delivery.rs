@@ -1,42 +1,27 @@
 //! Verifies message delivery before, during, and after a Run.
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use cursor_server::{
-    cursor::{
-        prompting::{PromptAssets, PromptCompiler},
-        protocol::connect,
-        protocol::proto::agent::v1 as pb,
-        TransportCommand, TransportHandle, TransportRegistry,
-    },
+    cursor::{protocol::proto::agent::v1 as pb, TransportCommand, TransportHandle},
     model::{ContentPart, MessageContent, ProjectedContent, Role},
-    provider::{FinishReason, ModelEvent},
 };
 use prost::Message;
+use support::{
+    drive, registry, request_context_success, run_request, stream_close, temp_store, text_response,
+    wait_for_provider_requests, FakeProvider,
+};
 
 const FOLLOW_UP: &str = "Perform any necessary follow-up actions in response to the subagent completion above. If no follow-up work is needed, no further action is required. If you mention an agent or subagent in your response, link it with the `[Name](id)` Don't use generic label such as `[agent]`, `[worker]`, or `[subagent]`.";
 const SHELL_FOLLOW_UP: &str = "Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.";
 
 #[tokio::test]
 async fn background_subagent_completion_starts_a_simulated_parent_turn() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(stop_response("model-call", "followed up"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(text_response("model-call", "followed up"));
+    let registry = registry(store.clone(), provider.clone());
     let handle = registry.get_or_create("completion-request").await.unwrap();
     let (checkpoint, blobs) = drive_completion(
         &handle,
@@ -116,21 +101,11 @@ async fn background_subagent_completion_starts_a_simulated_parent_turn() {
 
 #[tokio::test]
 async fn background_completion_joins_the_active_run_instead_of_replacing_it() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    let first_ready = provider.push_gated(stop_response("model-call-1", "first response"));
-    provider.push(stop_response("model-call-2", "processed both completions"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    let first_ready = provider.push_gated(text_response("model-call-1", "first response"));
+    provider.push(text_response("model-call-2", "processed both completions"));
+    let registry = registry(store.clone(), provider.clone());
     let first = registry.get_or_create("active-completion-1").await.unwrap();
     let first_run = tokio::spawn(async move {
         drive_completion(
@@ -143,11 +118,11 @@ async fn background_completion_joins_the_active_run_instead_of_replacing_it() {
         )
         .await
     });
-    while provider.requests().is_empty() {
-        tokio::task::yield_now().await;
-    }
-
     let second = registry.get_or_create("active-completion-2").await.unwrap();
+    let mut wait_output = second.subscribe();
+    let mut wait_seqno = 0;
+    wait_for_provider_requests(&provider, &second, &mut wait_output, &mut wait_seqno, 1).await;
+
     let second_run = tokio::spawn(async move {
         drive_forwarded_completion(
             &second,
@@ -181,20 +156,10 @@ async fn background_completion_joins_the_active_run_instead_of_replacing_it() {
 
 #[tokio::test]
 async fn retrying_one_background_completion_reuses_its_runtime_message() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(stop_response("model-call", "followed up"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(text_response("model-call", "followed up"));
+    let registry = registry(store.clone(), provider.clone());
     let first = registry.get_or_create("completion-retry-1").await.unwrap();
     let (_checkpoint, _) = drive_completion(
         &first,
@@ -243,20 +208,10 @@ async fn retrying_one_background_completion_reuses_its_runtime_message() {
 
 #[tokio::test]
 async fn conflicting_terminal_status_fails_without_another_provider_call() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(stop_response("first-call", "processed success"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(text_response("first-call", "processed success"));
+    let registry = registry(store, provider.clone());
     let first = registry.get_or_create("conflict-request-1").await.unwrap();
     let (checkpoint, _) = drive_completion(
         &first,
@@ -282,21 +237,11 @@ async fn conflicting_terminal_status_fails_without_another_provider_call() {
 
 #[tokio::test]
 async fn missing_conversation_id_keeps_completion_claims_request_scoped() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(stop_response("missing-1", "first"));
-    provider.push(stop_response("missing-2", "second"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(text_response("missing-1", "first"));
+    provider.push(text_response("missing-2", "second"));
+    let registry = registry(store, provider.clone());
 
     for request_id in ["missing-conversation-1", "missing-conversation-2"] {
         let handle = registry.get_or_create(request_id).await.unwrap();
@@ -318,19 +263,9 @@ async fn missing_conversation_id_keeps_completion_claims_request_scoped() {
 
 #[tokio::test]
 async fn persisted_await_consumption_does_not_start_another_parent_turn() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    let registry = registry(store.clone(), provider.clone());
     store
         .ensure_conversation(&cursor_server::model::ConversationId::new(
             "parent-conversation",
@@ -391,20 +326,10 @@ async fn persisted_await_consumption_does_not_start_another_parent_turn() {
 
 #[tokio::test]
 async fn partially_consumed_batch_projects_each_remaining_lifecycle_once() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(stop_response("batch-call", "processed remaining task"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(text_response("batch-call", "processed remaining task"));
+    let registry = registry(store.clone(), provider.clone());
     store
         .ensure_conversation(&cursor_server::model::ConversationId::new(
             "parent-conversation",
@@ -434,12 +359,10 @@ async fn partially_consumed_batch_projects_each_remaining_lifecycle_once() {
         ),
     )
     .await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while provider.requests().is_empty() {
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::task::yield_now().await;
-    }
     let retry = registry.get_or_create("batch-request-2").await.unwrap();
+    let mut output = retry.subscribe();
+    let mut seqno = 0;
+    wait_for_provider_requests(&provider, &retry, &mut output, &mut seqno, 1).await;
     drive_ignored_completion(
         &retry,
         completion_batch_run(
@@ -466,23 +389,13 @@ async fn partially_consumed_batch_projects_each_remaining_lifecycle_once() {
 
 #[tokio::test]
 async fn background_shell_completion_wakes_the_parent_with_the_captured_notification() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(stop_response(
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(text_response(
         "shell-wakeup",
         "The background server was stopped.",
     ));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let registry = registry(store, provider.clone());
     let handle = registry
         .get_or_create("shell-completion-request")
         .await
@@ -558,23 +471,12 @@ async fn drive_failed_completion(handle: &TransportHandle, message: pb::AgentCli
         })
         .await
         .unwrap();
-
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_ne!(payload.as_ref(), b"{}");
-            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-            assert!(payload["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("conflicting terminal completion"));
-            return;
-        }
-    }
+    let mut seqno = 1;
+    let out = drive(handle, &mut output, &mut seqno, |_| vec![]).await;
+    assert!(out.terminal["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("conflicting terminal completion"));
 }
 
 async fn drive_ignored_completion(handle: &TransportHandle, message: pb::AgentClientMessage) {
@@ -586,18 +488,9 @@ async fn drive_ignored_completion(handle: &TransportHandle, message: pb::AgentCl
         })
         .await
         .unwrap();
-
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(payload.as_ref(), b"{}");
-            return;
-        }
-    }
+    let mut seqno = 1;
+    let out = drive(handle, &mut output, &mut seqno, |_| vec![]).await;
+    assert_eq!(out.terminal, serde_json::json!({}));
 }
 
 async fn drive_completion(
@@ -612,103 +505,24 @@ async fn drive_completion(
         })
         .await
         .unwrap();
-
-    let mut append_seqno = 1;
-    let mut blobs = HashMap::new();
-    let mut final_checkpoint = None;
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        match server.message {
-            Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => {
-                assert_eq!(exec.id, 0);
-                assert!(matches!(
-                    exec.message,
-                    Some(pb::exec_server_message::Message::RequestContextArgs(_))
-                ));
-                handle
-                    .command(TransportCommand::Append {
-                        seqno: append_seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(
-                                pb::agent_client_message::Message::ExecClientControlMessage(
-                                    pb::ExecClientControlMessage {
-                                        message: Some(
-                                            pb::exec_client_control_message::Message::StreamClose(
-                                                pb::ExecClientStreamClose { id: 0 },
-                                            ),
-                                        ),
-                                    },
-                                ),
-                            ),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                append_seqno += 1;
-                handle
-                    .command(TransportCommand::Append {
-                        seqno: append_seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(pb::agent_client_message::Message::ExecClientMessage(
-                                pb::ExecClientMessage {
-                                    id: 0,
-                                    message: Some(
-                                        pb::exec_client_message::Message::RequestContextResult(
-                                            pb::RequestContextResult {
-                                                result: Some(
-                                                    pb::request_context_result::Result::Success(
-                                                        pb::RequestContextSuccess {
-                                                            request_context: Some(
-                                                                pb::RequestContext::default(),
-                                                            ),
-                                                            ..Default::default()
-                                                        },
-                                                    ),
-                                                ),
-                                            },
-                                        ),
-                                    ),
-                                    ..Default::default()
-                                },
-                            )),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                append_seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                if let Some(pb::kv_server_message::Message::SetBlobArgs(set)) = &kv.message {
-                    blobs.insert(set.blob_id.clone(), set.blob_data.clone());
-                }
-                handle
-                    .command(TransportCommand::Append {
-                        seqno: append_seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                append_seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(state))
-                if state.pending_tool_calls.is_empty() =>
-            {
-                final_checkpoint = Some(state);
-            }
-            _ => {}
-        }
-    }
+    let mut seqno = 1;
+    let out = drive(handle, &mut output, &mut seqno, |exec| {
+        assert_eq!(exec.id, 0);
+        assert!(matches!(
+            exec.message,
+            Some(pb::exec_server_message::Message::RequestContextArgs(_))
+        ));
+        vec![stream_close(0), request_context_success(0)]
+    })
+    .await;
     (
-        final_checkpoint.expect("settled completion checkpoint"),
-        blobs,
+        out.checkpoints
+            .iter()
+            .rev()
+            .find(|state| state.pending_tool_calls.is_empty())
+            .expect("settled completion checkpoint")
+            .clone(),
+        out.blobs,
     )
 }
 
@@ -721,86 +535,13 @@ async fn drive_forwarded_completion(handle: &TransportHandle, message: pb::Agent
         })
         .await
         .unwrap();
-    let mut append_seqno = 1;
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(payload.as_ref(), b"{}");
-            return;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        match server.message {
-            Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => {
-                assert_eq!(exec.id, 0);
-                handle
-                    .command(TransportCommand::Append {
-                        seqno: append_seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(
-                                pb::agent_client_message::Message::ExecClientControlMessage(
-                                    pb::ExecClientControlMessage {
-                                        message: Some(
-                                            pb::exec_client_control_message::Message::StreamClose(
-                                                pb::ExecClientStreamClose { id: 0 },
-                                            ),
-                                        ),
-                                    },
-                                ),
-                            ),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                append_seqno += 1;
-                handle
-                    .command(TransportCommand::Append {
-                        seqno: append_seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(pb::agent_client_message::Message::ExecClientMessage(
-                                pb::ExecClientMessage {
-                                    id: 0,
-                                    message: Some(
-                                        pb::exec_client_message::Message::RequestContextResult(
-                                            pb::RequestContextResult {
-                                                result: Some(
-                                                    pb::request_context_result::Result::Success(
-                                                        pb::RequestContextSuccess {
-                                                            request_context: Some(
-                                                                pb::RequestContext::default(),
-                                                            ),
-                                                            ..Default::default()
-                                                        },
-                                                    ),
-                                                ),
-                                            },
-                                        ),
-                                    ),
-                                    ..Default::default()
-                                },
-                            )),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                append_seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                handle
-                    .command(TransportCommand::Append {
-                        seqno: append_seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                append_seqno += 1;
-            }
-            _ => {}
-        }
-    }
+    let mut seqno = 1;
+    let out = drive(handle, &mut output, &mut seqno, |exec| {
+        assert_eq!(exec.id, 0);
+        vec![stream_close(0), request_context_success(0)]
+    })
+    .await;
+    assert_eq!(out.terminal, serde_json::json!({}));
 }
 
 fn completion_run(
@@ -848,90 +589,39 @@ fn completion_batch_run(
     conversation_state: pb::ConversationStateStructure,
     completions: Vec<pb::BackgroundTaskCompletion>,
 ) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                action: Some(pb::ConversationAction {
-                    action: Some(
-                        pb::conversation_action::Action::BackgroundTaskCompletionAction(
-                            pb::BackgroundTaskCompletionAction { completions },
-                        ),
-                    ),
-                    ..Default::default()
-                }),
-                conversation_id: Some("parent-conversation".into()),
-                requested_model: Some(pb::RequestedModel {
-                    model_id: "test-model".into(),
-                    ..Default::default()
-                }),
-                conversation_state: Some(conversation_state),
-                run_id: Some(run_id.into()),
-                ..Default::default()
-            },
-        )),
-    }
+    run_request(
+        "parent-conversation",
+        run_id,
+        "test-model",
+        Some(conversation_state),
+        pb::conversation_action::Action::BackgroundTaskCompletionAction(
+            pb::BackgroundTaskCompletionAction { completions },
+        ),
+    )
 }
 
 fn shell_completion_run(
     conversation_state: pb::ConversationStateStructure,
 ) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                action: Some(pb::ConversationAction {
-                    action: Some(
-                        pb::conversation_action::Action::BackgroundTaskCompletionAction(
-                            pb::BackgroundTaskCompletionAction {
-                                completions: vec![pb::BackgroundTaskCompletion {
-                                    task_id: "977679".into(),
-                                    kind: pb::BackgroundTaskKind::Shell as i32,
-                                    status: pb::BackgroundTaskStatus::Aborted as i32,
-                                    title: "Start Python HTTP server on 9000".into(),
-                                    detail: Some("terminated_by_user".into()),
-                                    output_path: Some("/tmp/977679.txt".into()),
-                                    reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
-                                    tool_call_id: Some("shell-call".into()),
-                                    ..Default::default()
-                                }],
-                            },
-                        ),
-                    ),
+    run_request(
+        "parent-conversation",
+        "shell-parent-run",
+        "test-model",
+        Some(conversation_state),
+        pb::conversation_action::Action::BackgroundTaskCompletionAction(
+            pb::BackgroundTaskCompletionAction {
+                completions: vec![pb::BackgroundTaskCompletion {
+                    task_id: "977679".into(),
+                    kind: pb::BackgroundTaskKind::Shell as i32,
+                    status: pb::BackgroundTaskStatus::Aborted as i32,
+                    title: "Start Python HTTP server on 9000".into(),
+                    detail: Some("terminated_by_user".into()),
+                    output_path: Some("/tmp/977679.txt".into()),
+                    reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
+                    tool_call_id: Some("shell-call".into()),
                     ..Default::default()
-                }),
-                conversation_id: Some("parent-conversation".into()),
-                requested_model: Some(pb::RequestedModel {
-                    model_id: "test-model".into(),
-                    ..Default::default()
-                }),
-                conversation_state: Some(conversation_state),
-                run_id: Some("shell-parent-run".into()),
-                ..Default::default()
+                }],
             },
-        )),
-    }
-}
-
-fn stop_response(model_call_id: &str, text: &str) -> Vec<ModelEvent> {
-    vec![
-        ModelEvent::Start {
-            model_call_id: model_call_id.into(),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta(text.into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Done(FinishReason::Stop),
-    ]
-}
-
-fn kv_ack(id: u32) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::KvClientMessage(
-            pb::KvClientMessage {
-                id,
-                message: Some(pb::kv_client_message::Message::SetBlobResult(
-                    pb::SetBlobResult { error: None },
-                )),
-            },
-        )),
-    }
+        ),
+    )
 }

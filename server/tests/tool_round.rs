@@ -1,33 +1,27 @@
 //! Verifies Tool dispatch, completion gating, and result continuation.
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
-use std::{
-    collections::{BTreeMap, HashSet},
-    sync::Arc,
+use std::collections::{BTreeMap, HashSet};
+
+use support::{
+    drive, openai_model_input, read_success, registry, run_request, stream_close, temp_store,
+    text_response, tool_response, user_message_action, FakeProvider,
 };
 
 use cursor_server::{
-    cursor::prompting::{PromptAssets, PromptCompiler},
     cursor::{
-        protocol::{connect, proto::agent::v1 as pb},
+        protocol::proto::agent::v1 as pb,
         tools::{
             codec,
             runtime::{CursorToolRuntime, ExecContext},
             ClientToolEvent, ToolBatchState, ToolDispatcher,
         },
+        TransportCommand,
     },
-    cursor::{TransportCommand, TransportRegistry},
-    model::{
-        MessageContent, ModelConfigInput, ModelType, ProjectedContent, ToolCall,
-        OPENAI_CHAT_ENDPOINT,
-    },
+    model::{MessageContent, ProjectedContent, ToolCall},
     provider::{FinishReason, ModelEvent},
     run::consume_model_cycle,
 };
-use prost::Message;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -49,8 +43,7 @@ fn exec_context() -> ExecContext {
         root_conversation_id: "conversation".into(),
         default_subagent_model: "model".into(),
         default_subagent_model_variant: None,
-        model_aliases: std::collections::HashMap::new(),
-        model_variant_defaults: std::collections::HashMap::new(),
+        model_directory: Default::default(),
         subagent_models: std::collections::HashMap::new(),
         terminals_folder: "/tmp/terminals".into(),
         admin_command_denylist: Vec::new(),
@@ -828,53 +821,21 @@ async fn unknown_exec_id_is_ignored() {
 
 #[tokio::test]
 async fn one_run_can_auto_compact_again_after_more_tool_output() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let model = store
-        .create_model(&ModelConfigInput {
-            sort_order: 0,
-            display_name: "Repeated compaction".into(),
-            group_name: None,
-            model_type: ModelType::OpenAi,
-            base_url: "https://example.com/v1/chat/completions".into(),
-            use_full_url: true,
-            api_key: "test-key".into(),
-            tooltip_data: "Repeated compaction".into(),
-            model_id: "repeated-compaction-model".into(),
-            reasoning_effort: None,
-            effort_options: Vec::new(),
-            context_options: Vec::new(),
-            openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
-            openai_extra_params_enabled: false,
-            openai_extra_params: json!({}),
-            custom_headers_enabled: false,
-            custom_headers: json!({}),
-            anthropic_extra_params_enabled: false,
-            anthropic_extra_params: json!({}),
-            context_window_tokens: Some(25_000),
-            max_completion_tokens: None,
-            anthropic_max_tokens: None,
-            anthropic_thinking_effort: None,
-            thinking_budget_tokens: None,
-        })
+        .create_model(&openai_model_input(
+            "repeated-compaction-model",
+            Some(25_000),
+        ))
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
+    let provider = FakeProvider::default();
     provider.push(tool_call_response("repeat-call-1"));
-    provider.push(text_events("first summary"));
+    provider.push(text_response("model-first summary", "first summary"));
     provider.push(tool_call_response("repeat-call-2"));
-    provider.push(text_events("second summary"));
-    provider.push(text_events("done"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    provider.push(text_response("model-second summary", "second summary"));
+    provider.push(text_response("model-done", "done"));
+    let registry = registry(store, provider.clone());
     let handle = registry
         .get_or_create("repeated-compaction-request")
         .await
@@ -892,87 +853,17 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
         .await
         .unwrap();
     let mut seqno = 1;
-    let oversized = format!("HEAD{}TAIL", "x".repeat(4 * 1024 * 1024));
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), output.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        match server.message {
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => {
-                let exec_id = exec.id;
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(pb::agent_client_message::Message::ExecClientMessage(
-                                pb::ExecClientMessage {
-                                    id: exec_id,
-                                    exec_id: String::new(),
-                                    message: Some(pb::exec_client_message::Message::ReadResult(
-                                        pb::ReadResult {
-                                            result: Some(pb::read_result::Result::Success(
-                                                pb::ReadSuccess {
-                                                    path: "/tmp/large.txt".into(),
-                                                    total_lines: 1,
-                                                    file_size: oversized.len() as i64,
-                                                    output: Some(
-                                                        pb::read_success::Output::Content(
-                                                            oversized.clone(),
-                                                        ),
-                                                    ),
-                                                    ..Default::default()
-                                                },
-                                            )),
-                                        },
-                                    )),
-                                    ..Default::default()
-                                },
-                            )),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(
-                                pb::agent_client_message::Message::ExecClientControlMessage(
-                                    pb::ExecClientControlMessage {
-                                        message: Some(
-                                            pb::exec_client_control_message::Message::StreamClose(
-                                                pb::ExecClientStreamClose { id: exec_id },
-                                            ),
-                                        ),
-                                    },
-                                ),
-                            ),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
-            }
-            _ => {}
-        }
-    }
+    // 256 KiB ≈ 64k tokens, well past the model's 25k context window, so both
+    // automatic compaction rounds still trigger without a 4 MiB payload
+    // churning through protobuf, SQLite, and JSON serialization.
+    let oversized = format!("HEAD{}TAIL", "x".repeat(256 * 1024));
+    let _out = drive(&handle, &mut output, &mut seqno, |exec| {
+        vec![
+            read_success(exec.id, "/tmp/large.txt", &oversized),
+            stream_close(exec.id),
+        ]
+    })
+    .await;
 
     let requests = provider.requests();
     let shapes = requests
@@ -1002,8 +893,8 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
 
 #[tokio::test]
 async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
-    let (directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     provider.push(vec![
         ModelEvent::Start {
             model_call_id: "ignored".into(),
@@ -1029,17 +920,7 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
         ModelEvent::TextEnd,
         ModelEvent::Done(FinishReason::Stop),
     ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let registry = registry(store.clone(), provider.clone());
     let handle = registry.get_or_create("tool-request").await.unwrap();
     let mut output = handle.subscribe();
     handle
@@ -1050,113 +931,32 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
         .await
         .unwrap();
     let mut seqno = 1;
-    let mut saw_exec = false;
+    let out = drive(&handle, &mut output, &mut seqno, |exec| {
+        vec![read_success(exec.id, "/tmp/a", "x"), stream_close(exec.id)]
+    })
+    .await;
+    assert_eq!(out.terminal, json!({}));
+    assert_eq!(out.execs.len(), 1);
     let mut saw_typed_completion = false;
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
-                json!({})
-            );
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        match server.message {
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => {
-                saw_exec = true;
-                let exec_id = exec.id;
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(pb::agent_client_message::Message::ExecClientMessage(
-                                pb::ExecClientMessage {
-                                    id: exec_id,
-                                    exec_id: String::new(),
-                                    message: Some(pb::exec_client_message::Message::ReadResult(
-                                        pb::ReadResult {
-                                            result: Some(pb::read_result::Result::Success(
-                                                pb::ReadSuccess {
-                                                    path: "/tmp/a".into(),
-                                                    total_lines: 1,
-                                                    file_size: 1,
-                                                    output: Some(
-                                                        pb::read_success::Output::Content(
-                                                            "x".into(),
-                                                        ),
-                                                    ),
-                                                    ..Default::default()
-                                                },
-                                            )),
-                                        },
-                                    )),
-                                    ..Default::default()
-                                },
-                            )),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(
-                                pb::agent_client_message::Message::ExecClientControlMessage(
-                                    pb::ExecClientControlMessage {
-                                        message: Some(
-                                            pb::exec_client_control_message::Message::StreamClose(
-                                                pb::ExecClientStreamClose { id: exec_id },
-                                            ),
-                                        ),
-                                    },
-                                ),
-                            ),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::InteractionUpdate(update)) => {
-                if let Some(pb::interaction_update::Message::ToolCallCompleted(completed)) =
-                    update.message
-                {
-                    let tool_call = completed.tool_call.expect("completed ToolCall");
-                    assert!(tool_call.started_at_ms.unwrap_or_default() > 1);
-                    assert!(tool_call.completed_at_ms.unwrap_or_default() > 1);
-                    assert!(tool_call.completed_at_ms >= tool_call.started_at_ms);
-                    let Some(pb::tool_call::Tool::ReadToolCall(read)) = tool_call.tool else {
-                        panic!("expected completed ReadToolCall")
-                    };
-                    let result = read.result.expect("typed ReadToolResult");
-                    assert!(matches!(
-                        result.result,
-                        Some(pb::read_tool_result::Result::Success(_))
-                    ));
-                    saw_typed_completion = true;
-                }
-            }
-            _ => {}
+    for update in &out.interactions {
+        if let Some(pb::interaction_update::Message::ToolCallCompleted(completed)) =
+            update.message.as_ref()
+        {
+            let tool_call = completed.tool_call.as_ref().expect("completed ToolCall");
+            assert!(tool_call.started_at_ms.unwrap_or_default() > 1);
+            assert!(tool_call.completed_at_ms.unwrap_or_default() > 1);
+            assert!(tool_call.completed_at_ms >= tool_call.started_at_ms);
+            let Some(pb::tool_call::Tool::ReadToolCall(read)) = tool_call.tool.as_ref() else {
+                panic!("expected completed ReadToolCall")
+            };
+            let result = read.result.as_ref().expect("typed ReadToolResult");
+            assert!(matches!(
+                result.result.as_ref(),
+                Some(pb::read_tool_result::Result::Success(_))
+            ));
+            saw_typed_completion = true;
         }
     }
-    assert!(saw_exec);
     assert!(saw_typed_completion);
     assert_eq!(provider.requests().len(), 2);
     let database = sqlx::SqlitePool::connect(&format!(
@@ -1191,34 +991,12 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
 }
 
 fn tool_call_response(call_id: &str) -> Vec<ModelEvent> {
-    vec![
-        ModelEvent::Start {
-            model_call_id: format!("model-{call_id}"),
-        },
-        ModelEvent::ToolCallStart {
-            index: 0,
-            call_id: call_id.into(),
-            name: "Read".into(),
-        },
-        ModelEvent::ToolCallArgumentsDelta {
-            index: 0,
-            delta: "{\"path\":\"/tmp/large.txt\"}".into(),
-        },
-        ModelEvent::ToolCallEnd { index: 0 },
-        ModelEvent::Done(FinishReason::ToolUse),
-    ]
-}
-
-fn text_events(text: &str) -> Vec<ModelEvent> {
-    vec![
-        ModelEvent::Start {
-            model_call_id: format!("model-{text}"),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta(text.into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Done(FinishReason::Stop),
-    ]
+    tool_response(
+        &format!("model-{call_id}"),
+        call_id,
+        "Read",
+        "{\"path\":\"/tmp/large.txt\"}",
+    )
 }
 
 fn client_run_for_model(
@@ -1226,35 +1004,13 @@ fn client_run_for_model(
     run_id: &str,
     model_id: &str,
 ) -> pb::AgentClientMessage {
-    let user = pb::UserMessage {
-        text: "read it".into(),
-        message_id: "user".into(),
-        mode: pb::AgentMode::Agent as i32,
-        ..Default::default()
-    };
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                action: Some(pb::ConversationAction {
-                    action: Some(pb::conversation_action::Action::UserMessageAction(
-                        pb::UserMessageAction {
-                            user_message: Some(user),
-                            request_context: Some(pb::RequestContext::default()),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                }),
-                conversation_id: Some(conversation_id.into()),
-                run_id: Some(run_id.into()),
-                requested_model: Some(pb::RequestedModel {
-                    model_id: model_id.into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )),
-    }
+    run_request(
+        conversation_id,
+        run_id,
+        model_id,
+        None,
+        user_message_action("read it", "user", Some(pb::RequestContext::default())),
+    )
 }
 
 /// A provider that reuses a tool call id across two rounds of the same run
@@ -1264,8 +1020,8 @@ fn client_run_for_model(
 /// `tool_round::execute` waited forever for a result that could never arrive.
 #[tokio::test]
 async fn duplicate_tool_call_id_across_rounds_does_not_wedge_the_run() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     for _ in 0..2 {
         provider.push(vec![
             ModelEvent::Start {
@@ -1293,17 +1049,7 @@ async fn duplicate_tool_call_id_across_rounds_does_not_wedge_the_run() {
         ModelEvent::TextEnd,
         ModelEvent::Done(FinishReason::Stop),
     ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store.clone(),
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let registry = registry(store.clone(), provider.clone());
     let handle = registry.get_or_create("tool-request").await.unwrap();
     let mut output = handle.subscribe();
     handle
@@ -1314,134 +1060,22 @@ async fn duplicate_tool_call_id_across_rounds_does_not_wedge_the_run() {
         .await
         .unwrap();
     let mut seqno = 1;
-    let mut execs = 0;
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), output.recv())
-            .await
-            .expect("run must not hang on a reused tool call id")
-            .unwrap();
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        match server.message {
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => {
-                execs += 1;
-                let exec_id = exec.id;
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(pb::agent_client_message::Message::ExecClientMessage(
-                                pb::ExecClientMessage {
-                                    id: exec_id,
-                                    exec_id: String::new(),
-                                    message: Some(pb::exec_client_message::Message::ReadResult(
-                                        pb::ReadResult {
-                                            result: Some(pb::read_result::Result::Success(
-                                                pb::ReadSuccess {
-                                                    path: "/tmp/a".into(),
-                                                    total_lines: 1,
-                                                    file_size: 1,
-                                                    output: Some(
-                                                        pb::read_success::Output::Content(
-                                                            "x".into(),
-                                                        ),
-                                                    ),
-                                                    ..Default::default()
-                                                },
-                                            )),
-                                        },
-                                    )),
-                                    ..Default::default()
-                                },
-                            )),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(
-                                pb::agent_client_message::Message::ExecClientControlMessage(
-                                    pb::ExecClientControlMessage {
-                                        message: Some(
-                                            pb::exec_client_control_message::Message::StreamClose(
-                                                pb::ExecClientStreamClose { id: exec_id },
-                                            ),
-                                        ),
-                                    },
-                                ),
-                            ),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
-            }
-            _ => {}
-        }
-    }
+    let out = drive(&handle, &mut output, &mut seqno, |exec| {
+        vec![read_success(exec.id, "/tmp/a", "x"), stream_close(exec.id)]
+    })
+    .await;
     // Both rounds have to reach the client, and the run has to get far enough
     // to ask the provider a third time and finish.
-    assert_eq!(execs, 2);
+    assert_eq!(out.execs.len(), 2);
     assert_eq!(provider.requests().len(), 3);
 }
 
 fn client_run() -> pb::AgentClientMessage {
-    let user = pb::UserMessage {
-        text: "read it".into(),
-        message_id: "user".into(),
-        mode: pb::AgentMode::Agent as i32,
-        ..Default::default()
-    };
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                action: Some(pb::ConversationAction {
-                    action: Some(pb::conversation_action::Action::UserMessageAction(
-                        pb::UserMessageAction {
-                            user_message: Some(user),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                }),
-                conversation_id: Some("tool-conversation".into()),
-                run_id: Some("tool-request".into()),
-                requested_model: Some(pb::RequestedModel {
-                    model_id: "test-model".into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )),
-    }
-}
-
-fn kv_ack(id: u32) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::KvClientMessage(
-            pb::KvClientMessage {
-                id,
-                message: Some(pb::kv_client_message::Message::SetBlobResult(
-                    pb::SetBlobResult { error: None },
-                )),
-            },
-        )),
-    }
+    run_request(
+        "tool-conversation",
+        "tool-request",
+        "test-model",
+        None,
+        user_message_action("read it", "user", None),
+    )
 }

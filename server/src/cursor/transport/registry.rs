@@ -122,6 +122,7 @@ impl TransportRegistry {
                     provider,
                     compiler,
                     web_cache.clone(),
+                    plugins.clone(),
                     local_rules_dir,
                 ),
                 store,

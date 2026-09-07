@@ -68,6 +68,34 @@ Cursor 重启后新建一个对话，再从模型列表中选择你配置的模�
 
 </Steps>
 
+## Remote SSH 窗口
+
+启用 Cursor Byok 集成后，Cursor 打开 Remote SSH 窗口时，桌面应用会自动在远端主机提供同号代理端点：
+
+```text
+远端 127.0.0.1:<代理端口>
+    └── SSH RemoteForward ──> 本地 127.0.0.1:<代理端口> ──> Cursor Byok
+```
+
+应用会在自身数据目录生成隔离的 SSH 配置，并让 Cursor Remote SSH 使用它。原有 SSH 配置会被原样包含，Cursor Byok 停止时会恢复原设置。远端只监听回环地址；如果端口无法占用，连接会直接失败，避免 Cursor 悄悄连到无关服务。
+
+在 Cursor 远端服务启动前，同一条 SSH 会话会把本地 CA 证书写入远端用户的 Cursor Byok 私有目录，设置代理与证书环境，按需安装 `uv`，并执行 Semble 官方提供的 Cursor MCP（Model Context Protocol）无交互安装命令。之后由 Cursor 在远端启动 Semble MCP 服务，因此代码搜索读取远端文件系统，不会再拿远端路径到本地查找。
+
+初始化过程也会同步本地 `~/.cursor/skills/` 与 `~/.agents/skills/` 中的用户级 Agent Skills。Cursor 当前将 skill 定义为包含 `SKILL.md` 的目录，该目录还可包含脚本、参考资料和资源文件。项目级 `.cursor/skills/` 或 `.agents/skills/` 已随 Remote SSH 工作区天然存在，因此 Cursor Byok 不会重复复制。
+
+每次新建 Remote SSH 连接时，应用都会重新读取本地用户 skills，并通过加密的 SSH 反向隧道传输。远端注入目录固定为 `~/.cursor/skills/cursor-byok-synced/`；若两个本地用户目录含有同名 skill，以 `~/.cursor/skills/` 为准。若远端用户在任一用户级目录已有同名 skill，会保留远端版本并跳过本地版本。应用会在完整下载后重建专属目录，因此本地删除的 skill 会在下次连接时从注入目录移除，但不会删除无关的远端内容。符号链接不会被跟随或复制。Unix 远端上的目录仅当前用户可访问，普通文件权限为 `0600`，可执行脚本为 `0700`；Windows 远端继承远端用户配置目录的访问控制列表（ACL）。
+
+skill 下载、扫描或写入失败时会在 Remote SSH 输出中告警，但不会阻断 SSH 连接；若暂存阶段失败，远端上一次完整同步的版本会保留。
+
+远端环境需要满足：
+
+- SSH 服务端启用 `AllowTcpForwarding yes`；
+- Linux/macOS 远端提供 Bash 和 `curl`，Windows 远端提供 PowerShell；
+- 首次配置时可访问 Astral、PyPI 和 Hugging Face，以下载 `uv`、Semble 与模型；
+- Windows 主机在 `remote.SSH.remotePlatform` 中配置了正确平台，以便选择 PowerShell 启动路径。
+
+启用 Cursor Byok 或修改代理端口后，请关闭并重新打开已有 Remote SSH 窗口。首次连接安装 Semble 时可能稍慢；如果安装无法完成，Cursor 连接仍会继续，并在 Remote SSH 输出中报告 Semble 错误。
+
 ## 验证安装
 
 完成配置后，请确认：

@@ -1,6 +1,5 @@
 //! Verifies append-only provider history and stable prompt prefixes.
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
 use std::collections::BTreeMap;
 
@@ -13,12 +12,13 @@ use cursor_server::{
     },
 };
 use sha2::{Digest, Sha256};
+use support::{prompt_assets, user};
 
 #[test]
 fn projecting_an_append_only_context_preserves_the_complete_prefix() {
-    let first = vec![fixtures::user("u1", "one")];
+    let first = vec![user("u1", "one")];
     let mut second = first.clone();
-    second.push(fixtures::user("u2", "two"));
+    second.push(user("u2", "two"));
     let projected_first = project_messages(&first).unwrap();
     let projected_second = project_messages(&second).unwrap();
     assert_eq!(projected_first, projected_second[..projected_first.len()]);
@@ -51,7 +51,7 @@ fn every_tool_result_is_projected_as_string_content() {
 fn projected_tool_result_prefixes_remain_stable() {
     let first = vec![named_tool_result("Grep", &"x".repeat(64 * 1024))];
     let mut second = first.clone();
-    second.push(fixtures::user("u2", "continue"));
+    second.push(user("u2", "continue"));
 
     let projected_first = project_messages(&first).unwrap();
     let projected_second = project_messages(&second).unwrap();
@@ -135,12 +135,7 @@ fn split_tool_pairs_reconstruct_the_original_provider_assistant_message() {
 
 #[test]
 fn every_prompt_mode_loads_the_captured_tool_set() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let assets = prompt_assets();
     assert_eq!(assets.mode(Mode::Agent).tools.len(), 24);
     assert_eq!(
         assets
@@ -198,7 +193,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "9908d81fca823c2726b59cf6a3b16d6e81a56646b0bc45470057ef66f212ef79",
+        "1acbf2d8ba315819ec9456eaa496dff1cb0bdc58260b2c9c1bf0663b155fe9ae",
     );
     assert_mode(
         &assets,
@@ -220,7 +215,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "67310e29ea29729c155975ec760bc95839442b46a32d95a44ed86f765116b797",
+        "909adfac547ec0b3b29251dce5cae0837a55282e5d4453baa5eb0e94e966bf09",
     );
     assert_mode(
         &assets,
@@ -244,7 +239,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "9908d81fca823c2726b59cf6a3b16d6e81a56646b0bc45470057ef66f212ef79",
+        "1acbf2d8ba315819ec9456eaa496dff1cb0bdc58260b2c9c1bf0663b155fe9ae",
     );
     assert_mode(
         &assets,
@@ -273,7 +268,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "3fe2a87befe80e980fdcd8c3257d689ba52421dbbd922f15679b13ebb219d7c7",
+        "69bb0d0f7a70d9f19e97f8a882790101377823f3e5b37b811263df68d11128d6",
     );
     assert_mode(
         &assets,
@@ -310,7 +305,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
     );
     assert_eq!(
         schema_digest(&assets.mode(Mode::Agent).tools),
-        "3eb4fc1dd2a125bd7cf31e2498ba029288453e144ab905b070bd67cf36a6db16"
+        "5d0ddfb7988dd8b75821e8706c83158cc27bd1ad3fd202c9a964cb1167d7098a"
     );
     let task = assets
         .mode(Mode::Agent)
@@ -358,14 +353,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
 
 #[test]
 fn every_captured_mode_owns_and_renders_its_runtime_template() {
-    let compiler = PromptCompiler::new(
-        PromptAssets::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("prompt/cursor")
-                .as_path(),
-        )
-        .unwrap(),
-    );
+    let compiler = PromptCompiler::new(prompt_assets());
     let values = BTreeMap::from([
         ("OPEN_FILES", String::new()),
         ("SELECTED_CONTEXT", String::new()),
@@ -409,12 +397,7 @@ fn schema_digest(tools: &[ToolDefinition]) -> String {
 
 #[test]
 fn dynamic_mcp_tools_are_appended_after_the_stable_mode_tool_prefix() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let base = compiler
         .prompt_spec(Mode::Agent, &ModelSpec::new("model"), &[], false)
@@ -437,12 +420,7 @@ fn dynamic_mcp_tools_are_appended_after_the_stable_mode_tool_prefix() {
 
 #[test]
 fn dynamic_mcp_tool_cannot_replace_a_mode_tool() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let error = compiler
         .prompt_spec(
@@ -463,12 +441,7 @@ fn dynamic_mcp_tool_cannot_replace_a_mode_tool() {
 
 #[test]
 fn image_generation_capability_controls_only_the_generate_image_definition() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let without = compiler
         .prompt_spec(Mode::Agent, &ModelSpec::new("model"), &[], false)
@@ -489,12 +462,7 @@ fn image_generation_capability_controls_only_the_generate_image_definition() {
 
 #[test]
 fn agent_system_prompt_is_static_and_substitutes_the_model_name() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let mut model = ModelSpec::new("test-model-hash");
     model.display_name = Some("Test Model".into());
@@ -510,12 +478,7 @@ fn agent_system_prompt_is_static_and_substitutes_the_model_name() {
 
 #[test]
 fn subagent_uses_the_agent_prompt_and_only_the_captured_tool_delta() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let agent_prompt = compiler
         .prompt_spec(Mode::Agent, &ModelSpec::new("model"), &[], false)
@@ -525,38 +488,7 @@ fn subagent_uses_the_agent_prompt_and_only_the_captured_tool_delta() {
         .unwrap();
     assert_eq!(agent_prompt.instructions, subagent_prompt.instructions);
 
-    let request = compiler
-        .prompt_spec(Mode::Subagent, &ModelSpec::new("model"), &[], false)
-        .unwrap();
-    assert_eq!(
-        request
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "Shell",
-            "Grep",
-            "Delete",
-            "WebSearch",
-            "WebFetch",
-            "ReadLints",
-            "EditNotebook",
-            "TodoWrite",
-            "StrReplace",
-            "Write",
-            "Read",
-            "Glob",
-            "GetMcpTools",
-            "FetchMcpResource",
-            "SwitchMode",
-            "UpdateCurrentStep",
-            "CallMcpTool",
-            "SembleSearch",
-            "SembleFindRelated",
-        ]
-    );
-    assert!(!request.tools.iter().any(|tool| tool.name == "Task"));
+    assert!(!subagent_prompt.tools.iter().any(|tool| tool.name == "Task"));
 
     let suppressed = compiler
         .prompt_spec(Mode::Subagent, &ModelSpec::new("model"), &[], true)

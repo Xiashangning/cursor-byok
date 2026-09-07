@@ -1,34 +1,15 @@
 //! Verifies registry ownership follows the transport actor rather than output subscriptions.
 
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
-use cursor_server::cursor::{
-    conversation::TransportCommand,
-    prompting::{PromptAssets, PromptCompiler},
-    transport::TransportRegistry,
-};
+use cursor_server::cursor::{conversation::TransportCommand, transport::TransportRegistry};
+use support::{registry as test_registry, temp_store, FakeProvider};
 
 async fn registry() -> (tempfile::TempDir, TransportRegistry) {
-    let (directory, store) = fixtures::temp_store().await;
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    (
-        directory,
-        TransportRegistry::new(
-            store,
-            Arc::new(fake_provider::FakeProvider::default()),
-            PromptCompiler::new(assets),
-        ),
-    )
+    let (directory, store) = temp_store().await;
+    (directory, test_registry(store, FakeProvider::default()))
 }
 
 #[tokio::test]

@@ -1,43 +1,27 @@
 //! Verifies local markdown rules are merged into the request-context message.
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
 use std::sync::Arc;
 
+use support::{
+    kv_ack, prompt_assets, run_request, temp_store, text_response, user_message_action,
+    FakeProvider,
+};
+
 use cursor_server::{
     cursor::{
-        prompting::{PromptAssets, PromptCompiler},
-        protocol::connect,
-        protocol::proto::agent::v1 as pb,
+        prompting::PromptCompiler, protocol::connect, protocol::proto::agent::v1 as pb,
         TransportCommand, TransportRegistry,
     },
     model::{ContentPart, ProjectedContent},
-    provider::{FinishReason, ModelEvent},
 };
 use prost::Message;
 
 #[tokio::test]
 async fn local_markdown_rules_land_in_the_request_context_message() {
-    let (_store_dir, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(vec![
-        ModelEvent::Start {
-            model_call_id: "call-1".into(),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta("ok".into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Done(FinishReason::Stop),
-    ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-
+    let (_store_dir, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(text_response("call-1", "ok"));
     let rules_dir = tempfile::tempdir().unwrap();
     let rules_root = rules_dir.path().join("rules");
     std::fs::create_dir_all(&rules_root).unwrap();
@@ -46,7 +30,7 @@ async fn local_markdown_rules_land_in_the_request_context_message() {
     let registry = TransportRegistry::with_local_rules(
         store,
         Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
+        PromptCompiler::new(prompt_assets()),
         rules_root,
     );
     let handle = registry.get_or_create("rules-request").await.unwrap();
@@ -54,7 +38,13 @@ async fn local_markdown_rules_land_in_the_request_context_message() {
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(user_run()),
+            message: Box::new(run_request(
+                "rules-conversation",
+                "rules-request",
+                "test-model",
+                None,
+                user_message_action("hello", "rules-user", None),
+            )),
         })
         .await
         .unwrap();
@@ -77,7 +67,7 @@ async fn local_markdown_rules_land_in_the_request_context_message() {
             handle
                 .command(TransportCommand::Append {
                     seqno: append_seqno,
-                    message: Box::new(set_blob_result(kv.id)),
+                    message: Box::new(kv_ack(kv.id)),
                 })
                 .await
                 .unwrap();
@@ -113,47 +103,4 @@ async fn local_markdown_rules_land_in_the_request_context_message() {
     );
 
     registry.shutdown().await;
-}
-
-fn set_blob_result(id: u32) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::KvClientMessage(
-            pb::KvClientMessage {
-                id,
-                message: Some(pb::kv_client_message::Message::SetBlobResult(
-                    pb::SetBlobResult { error: None },
-                )),
-            },
-        )),
-    }
-}
-
-fn user_run() -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                action: Some(pb::ConversationAction {
-                    action: Some(pb::conversation_action::Action::UserMessageAction(
-                        pb::UserMessageAction {
-                            user_message: Some(pb::UserMessage {
-                                text: "hello".into(),
-                                message_id: "rules-user".into(),
-                                mode: pb::AgentMode::Agent as i32,
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                }),
-                conversation_id: Some("rules-conversation".into()),
-                run_id: Some("rules-request".into()),
-                requested_model: Some(pb::RequestedModel {
-                    model_id: "test-model".into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )),
-    }
 }

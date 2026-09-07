@@ -708,7 +708,7 @@
               "type": "boolean"
             },
             "model": {
-              "description": "Optional model name or model slug for this agent. If provided, it must match EXACTLY the model name of a listed model. If omitted, the subagent uses the same model as the parent agent. Do not pass if resume field is set (prior model will be used). Use \"inherit\" unless the user explicitly requested another listed model.",
+              "description": "Optional model name or model slug for this agent. If provided, it must name one of the listed models; matching is case-insensitive and accepts the display name or the slug. If omitted, the subagent uses the same model and model parameters as the parent agent. Use \"inherit\" unless the user explicitly requested another listed model.",
               "type": "string"
             },
             "prompt": {
@@ -739,13 +739,13 @@
               "type": "string"
             },
             "model_parameters": {
-              "description": "Optional model parameter overrides forwarded to the subagent. Use only the effort and context values listed for the selected model above. When the user specifies model configuration, always include both `effort` and `context` entries in `model_parameters`, even when one matches the default. Never omit a user-specified value.",
+              "description": "Optional model parameter overrides forwarded to the subagent. Use only the reasoning and context values listed for the selected model above. When the user specifies model configuration, always include both `reasoning` and `context` entries in `model_parameters`, even when one matches the default. Never omit a user-specified value.",
               "items": {
                 "type": "object",
                 "properties": {
                   "id": {
                     "enum": [
-                      "effort",
+                      "reasoning",
                       "context"
                     ],
                     "type": "string"

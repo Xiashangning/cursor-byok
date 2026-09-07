@@ -1,5 +1,5 @@
 //! Compiles an AgentRunRequest into a PreparedRun.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
@@ -11,12 +11,13 @@ use crate::{
         protocol::proto::agent::v1 as pb,
         services::blob_sync::BlobSynchronizer,
         services::context_sync::RequestContextSynchronizer,
-        tools::runtime::{is_orchestration_tool, ExecContext, SubagentModel},
+        tools::runtime::{is_orchestration_tool, ExecContext, ModelDirectory, SubagentModel},
     },
     model::{
-        CanonicalMessage, ContentPart, ConversationId, MessageContent, Origin, PreparedRun,
-        PromptSpec, Role, RunAction, RunId, RunKind,
+        CanonicalMessage, ContentPart, ConversationId, MessageContent, ModelSpec, ModelVariantAxis,
+        ModelVariantParts, Origin, PreparedRun, PromptSpec, Role, RunAction, RunId, RunKind,
     },
+    plugin::{PluginModelDescriptor, PluginRegistry},
     store::{BlobId, Store},
     Error, Result,
 };
@@ -48,6 +49,7 @@ pub struct CursorRunContext {
 pub(crate) struct PrepareDependencies<'a> {
     pub compiler: &'a PromptCompiler,
     pub store: &'a Store,
+    pub plugins: Option<&'a PluginRegistry>,
     pub checkpoint: &'a CheckpointBuilder,
     pub blob_sync: &'a BlobSynchronizer,
     pub context_sync: &'a RequestContextSynchronizer,
@@ -62,6 +64,7 @@ pub(crate) async fn prepare(
     let PrepareDependencies {
         compiler,
         store,
+        plugins,
         checkpoint,
         blob_sync,
         context_sync,
@@ -161,31 +164,45 @@ pub(crate) async fn prepare(
     } else {
         mode_from_proto(mode_number)?
     };
+    let plugin_models = match plugins {
+        Some(plugins) => plugins.configured_models().await,
+        None => Vec::new(),
+    };
     let mut model = model::requested_model(request)?;
     let requested_model_id = model.model_id.clone();
     let mut inherited_subagent_model_variant = None;
     if let Some(configured_model) = store.resolve_model(&model.model_id).await? {
         model.model_id = configured_model.model_hash.clone();
         configured_model.configure(&mut model);
-        if let Some((context, effort)) =
-            model_variant_parameters(&requested_model_id, &configured_model)
+        if let Some(parts) = configured_model
+            .variant_axis()
+            .parse_slug(&configured_model.model_hash, &requested_model_id)
         {
-            model.context_window_tokens = Some(context);
-            model.reasoning.effort = Some(effort);
-            model.reasoning.enabled = true;
+            apply_variant_parts(&mut model, parts);
         }
-        inherited_subagent_model_variant = model_variant_id(&configured_model, &model);
+        inherited_subagent_model_variant = model_variant_id(
+            &configured_model.variant_axis(),
+            &configured_model.model_hash,
+            &model,
+        );
+    } else if let Some((descriptor, axis, parts)) =
+        resolve_plugin_model(&plugin_models, &requested_model_id)
+    {
+        model.model_id = descriptor.id.clone();
+        if let Some(parts) = parts {
+            apply_variant_parts(&mut model, parts);
+        }
+        inherited_subagent_model_variant = model_variant_id(&axis, &descriptor.id, &model);
     }
     let dynamic = context::dynamic_mcp(request, &request_context)?;
     let subagent_model_overrides = model::overrides(request)?;
-    let model_aliases = load_model_aliases(store).await?;
-    let model_variant_defaults = load_model_variant_defaults(store).await?;
+    let model_directory = load_model_directory(store, &plugin_models).await?;
     let subagents_disabled = !subagent_model_overrides.is_empty()
         && subagent_model_overrides.iter().all(|(_, selection)| {
             matches!(selection, crate::model::SubagentModelOverride::Disabled)
         });
     let available_subagent_models = if compiler.needs_available_subagent_models(checkpoint_mode) {
-        load_available_subagent_models(store).await?
+        load_available_subagent_models(store, &plugin_models).await?
     } else {
         String::new()
     };
@@ -199,6 +216,9 @@ pub(crate) async fn prepare(
         request.suppress_subagent_progress_update_tool == Some(true),
         &available_subagent_models,
     )?;
+    if context::is_remote_ssh(request, &request_context) {
+        remove_local_semble_tools(&mut checkpoint_prompt);
+    }
     if subagents_disabled {
         checkpoint_prompt
             .tools
@@ -381,8 +401,7 @@ pub(crate) async fn prepare(
         &conversation_id,
         &model.model_id,
         inherited_subagent_model_variant.clone(),
-        &model_aliases,
-        &model_variant_defaults,
+        &model_directory,
         &subagent_model_overrides,
     );
     Ok((
@@ -413,115 +432,188 @@ pub(crate) async fn prepare(
     ))
 }
 
-fn model_variant_parameters(key: &str, model: &crate::model::ModelConfig) -> Option<(u64, String)> {
-    let suffix = key.strip_prefix(&format!("{}-", model.model_hash))?;
-    let mut contexts = model.context_options.clone();
-    if let Some(tokens) = model.context_window_tokens {
-        let bare = tokens.to_string();
-        if !contexts.iter().any(|value| value == &bare) {
-            contexts.push(bare);
+/// 把变体 slug 解析出的档位应用到 ModelSpec;两个模型来源(内置/插件)共用。
+fn apply_variant_parts(model: &mut ModelSpec, parts: ModelVariantParts) {
+    if let Some(tokens) = crate::model::parse_token_count(&parts.context) {
+        model.context_window_tokens = Some(tokens);
+    }
+    if let Some(effort) = parts.effort {
+        model.reasoning.effort = Some(effort);
+        model.reasoning.enabled = true;
+    }
+    if parts.fast {
+        model.latency = crate::model::ModelLatency::Fast;
+    }
+}
+
+/// 插件模型的变体轴:没有配置窗口,轴即描述符的生效档位(已并入用户覆盖)。
+fn plugin_variant_axis(descriptor: &PluginModelDescriptor) -> ModelVariantAxis {
+    ModelVariantAxis {
+        context_options: descriptor.context_options.clone(),
+        effort_options: descriptor.effort_options.clone(),
+    }
+}
+
+/// 按精确 id 或变体 slug 解析插件模型;slug 大小写不敏感。
+fn resolve_plugin_model<'m>(
+    models: &'m [PluginModelDescriptor],
+    key: &str,
+) -> Option<(
+    &'m PluginModelDescriptor,
+    ModelVariantAxis,
+    Option<ModelVariantParts>,
+)> {
+    for descriptor in models {
+        let axis = plugin_variant_axis(descriptor);
+        if descriptor.id == key {
+            return Some((descriptor, axis, None));
+        }
+        if let Some(parts) = axis
+            .parse_slug(&descriptor.id, key)
+            .or_else(|| axis.parse_slug(&descriptor.id, &key.to_ascii_lowercase()))
+        {
+            return Some((descriptor, axis, Some(parts)));
         }
     }
-    contexts.iter().find_map(|context| {
-        model.effort_options.iter().find_map(|effort| {
-            let matches = suffix == format!("{context}-{effort}")
-                || suffix == format!("{context}-{effort}-fast");
-            matches
-                .then(|| Some((crate::model::parse_token_count(context)?, effort.clone())))
-                .flatten()
-        })
-    })
+    None
 }
 
-fn model_variant_id(
-    model: &crate::model::ModelConfig,
-    selected: &crate::model::ModelSpec,
-) -> Option<String> {
-    let context = selected.context_window_tokens?;
-    let effort = selected.reasoning.effort.as_deref()?;
-    let context = model
-        .context_options
-        .iter()
-        .find(|value| crate::model::parse_token_count(value) == Some(context))
-        .cloned()
-        .unwrap_or_else(|| context.to_string());
-    Some(format!("{}-{context}-{effort}", model.model_hash))
+fn model_variant_id(axis: &ModelVariantAxis, base: &str, selected: &ModelSpec) -> Option<String> {
+    let context = axis.context_option_for_tokens(selected.context_window_tokens?)?;
+    let effort = if axis.effort_options.is_empty() {
+        None
+    } else {
+        Some(selected.reasoning.effort.clone()?)
+    };
+    Some(axis.bake_slug(
+        base,
+        &ModelVariantParts {
+            context,
+            effort,
+            fast: selected.latency == crate::model::ModelLatency::Fast,
+        },
+    ))
 }
 
-async fn load_model_aliases(store: &Store) -> Result<HashMap<String, String>> {
-    let models = store.models().await?;
-    let mut aliases = HashMap::new();
-    for model in models {
-        let hash = model.model_hash.clone();
-        for alias in [&model.model_hash, &model.model_id, &model.display_name] {
-            aliases.insert((*alias).clone(), hash.clone());
-            aliases.insert(alias.to_ascii_lowercase(), hash.clone());
-        }
-        let mut contexts = model.context_options.clone();
-        if let Some(tokens) = model.context_window_tokens {
-            let bare = tokens.to_string();
-            if !contexts.iter().any(|value| value == &bare) {
-                contexts.push(bare);
-            }
-        }
-        for context in contexts {
-            for effort in &model.effort_options {
-                for suffix in [
-                    format!("{context}-{effort}"),
-                    format!("{context}-{effort}-fast"),
-                ] {
-                    let alias = format!("{}-{suffix}", model.model_hash);
-                    aliases.insert(alias.clone(), hash.clone());
-                    aliases.insert(alias.to_ascii_lowercase(), hash.clone());
-                }
-            }
-        }
+/// 把一个模型(内置或插件)登记进目录:别名(含小写与全部变体 slug)、
+/// 变体轴与展示名都以 base key(hash 或插件 id)归组。
+fn insert_directory_model(
+    directory: &mut ModelDirectory,
+    key: &str,
+    display_name: &str,
+    aliases: &[&str],
+    axis: ModelVariantAxis,
+) {
+    directory
+        .display_names
+        .insert(key.to_string(), display_name.to_string());
+    for alias in aliases {
+        directory
+            .aliases
+            .insert((*alias).to_string(), key.to_string());
+        directory
+            .aliases
+            .insert(alias.to_ascii_lowercase(), key.to_string());
     }
-    Ok(aliases)
-}
-
-async fn load_model_variant_defaults(store: &Store) -> Result<HashMap<String, (String, String)>> {
-    let models = store.models().await?;
-    Ok(models
-        .into_iter()
-        .map(|model| {
-            let context = model
-                .context_window_tokens
-                .and_then(|tokens| {
-                    model
-                        .context_options
-                        .iter()
-                        .find(|value| crate::model::parse_token_count(value) == Some(tokens))
-                        .cloned()
-                        .or_else(|| Some(tokens.to_string()))
-                })
-                .or_else(|| model.context_options.first().cloned())
-                .unwrap_or_else(|| "200k".into());
-            let effort = model
-                .effort_options
+    // 变体 slug 也是别名:继承与显式 slug 选择都能归一到 base key。
+    for context in &axis.context_options {
+        let efforts: Vec<Option<String>> = if axis.effort_options.is_empty() {
+            vec![None]
+        } else {
+            axis.effort_options
                 .iter()
-                .find(|value| value.as_str() == "high")
-                .cloned()
-                .or_else(|| model.effort_options.first().cloned())
-                .unwrap_or_else(|| "high".into());
-            (model.model_hash, (context, effort))
-        })
-        .collect())
+                .map(|effort| Some(effort.clone()))
+                .collect()
+        };
+        for effort in efforts {
+            for fast in [false, true] {
+                let slug = axis.bake_slug(
+                    key,
+                    &ModelVariantParts {
+                        context: context.clone(),
+                        effort: effort.clone(),
+                        fast,
+                    },
+                );
+                directory.aliases.insert(slug.clone(), key.to_string());
+                directory
+                    .aliases
+                    .insert(slug.to_ascii_lowercase(), key.to_string());
+            }
+        }
+    }
+    directory.variants.insert(key.to_string(), axis);
+}
+
+async fn load_model_directory(
+    store: &Store,
+    plugin_models: &[PluginModelDescriptor],
+) -> Result<ModelDirectory> {
+    let models = store.models().await?;
+    let mut directory = ModelDirectory::default();
+    for model in &models {
+        insert_directory_model(
+            &mut directory,
+            &model.model_hash,
+            &model.display_name,
+            &[&model.model_hash, &model.model_id, &model.display_name],
+            model.variant_axis(),
+        );
+    }
+    for descriptor in plugin_models {
+        insert_directory_model(
+            &mut directory,
+            &descriptor.id,
+            &descriptor.display_name,
+            &[&descriptor.id, &descriptor.display_name],
+            plugin_variant_axis(descriptor),
+        );
+    }
+    Ok(directory)
+}
+
+/// Task 清单行:展示名 + 生效轴;轴为空时省略该段。内置与插件模型共用。
+fn format_subagent_model_line(
+    display_name: &str,
+    effort_options: &[String],
+    context_options: &[String],
+) -> String {
+    let mut segments = Vec::new();
+    if !effort_options.is_empty() {
+        segments.push(format!("reasoning: {}", effort_options.join(", ")));
+    }
+    if !context_options.is_empty() {
+        segments.push(format!("context: {}", context_options.join(", ")));
+    }
+    if segments.is_empty() {
+        format!("- {display_name}")
+    } else {
+        format!("- {display_name} — {}", segments.join("; "))
+    }
 }
 
 fn format_available_subagent_model(model: &crate::model::ModelConfig) -> String {
-    format!(
-        "- {} — effort: {}; context: {}",
-        model.display_name,
-        model.effort_options.join(", "),
-        model.context_options.join(", "),
+    format_subagent_model_line(
+        &model.display_name,
+        &model.effort_options,
+        &model.context_options,
     )
 }
 
-async fn load_available_subagent_models(store: &Store) -> Result<String> {
+async fn load_available_subagent_models(
+    store: &Store,
+    plugin_models: &[PluginModelDescriptor],
+) -> Result<String> {
     let models = store.models().await?;
     let mut lines = vec!["- inherit".to_string()];
     lines.extend(models.iter().map(format_available_subagent_model));
+    lines.extend(plugin_models.iter().map(|descriptor| {
+        format_subagent_model_line(
+            &descriptor.display_name,
+            &descriptor.effort_options,
+            &descriptor.context_options,
+        )
+    }));
     Ok(lines.join("\n"))
 }
 
@@ -779,8 +871,7 @@ fn exec_context(
     conversation_id: &ConversationId,
     model_id: &str,
     inherited_model_variant: Option<String>,
-    model_aliases: &HashMap<String, String>,
-    model_variant_defaults: &HashMap<String, (String, String)>,
+    model_directory: &ModelDirectory,
     overrides: &[(
         crate::model::SubagentKind,
         crate::model::SubagentModelOverride,
@@ -791,7 +882,7 @@ fn exec_context(
         .map(|(kind, value)| {
             let model = match value {
                 crate::model::SubagentModelOverride::Explicit(model) => {
-                    SubagentModel::Model(model.model_id.clone())
+                    SubagentModel::Model(override_model_slug(model, model_directory))
                 }
                 crate::model::SubagentModelOverride::Inherit => SubagentModel::Inherit,
                 crate::model::SubagentModelOverride::Disabled => SubagentModel::Disabled,
@@ -807,8 +898,7 @@ fn exec_context(
             .unwrap_or_else(|| conversation_id.to_string()),
         default_subagent_model: model_id.into(),
         default_subagent_model_variant: inherited_model_variant.clone(),
-        model_aliases: model_aliases.clone(),
-        model_variant_defaults: model_variant_defaults.clone(),
+        model_directory: model_directory.clone(),
         subagent_models,
         allow_subagents: request.subagent_type_name.is_none(),
         terminals_folder: request_context
@@ -821,13 +911,71 @@ fn exec_context(
     }
 }
 
+/// 用户在设置里为子代理选的模型:保留完整 ModelSpec 的 effort/context/latency,
+/// 烘焙成带变体的 slug,使所选档位对子代理生效。未知模型原样透传。
+fn override_model_slug(spec: &crate::model::ModelSpec, directory: &ModelDirectory) -> String {
+    let (base, parts) = directory.resolve(&spec.model_id);
+    let Some(axis) = directory.variants.get(&base) else {
+        return spec.model_id.clone();
+    };
+    let Some(mut effective) = parts.or_else(|| axis.default_parts()) else {
+        return base;
+    };
+    if let Some(tokens) = spec.context_window_tokens {
+        if let Some(option) = axis.context_option_for_tokens(tokens) {
+            effective.context = option;
+        }
+    }
+    if !axis.effort_options.is_empty() {
+        if let Some(effort) = &spec.reasoning.effort {
+            let effort = effort.to_ascii_lowercase();
+            if axis.effort_options.iter().any(|option| option == &effort) {
+                effective.effort = Some(effort);
+            }
+        }
+    }
+    effective.fast = effective.fast || spec.latency == crate::model::ModelLatency::Fast;
+    axis.bake_slug(&base, &effective)
+}
+
+fn remove_local_semble_tools(prompt: &mut PromptSpec) {
+    prompt
+        .tools
+        .retain(|tool| !matches!(tool.name.as_str(), "SembleSearch" | "SembleFindRelated"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn available_subagent_model_line_omits_the_hash() {
-        let model = crate::model::ModelConfig {
+    fn remote_prompt_uses_cursor_mcp_instead_of_local_semble() {
+        let mut prompt = PromptSpec {
+            instructions: String::new(),
+            tools: ["SembleSearch", "SembleFindRelated", "CallMcpTool"]
+                .into_iter()
+                .map(|name| crate::model::ToolDefinition {
+                    name: name.into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                })
+                .collect(),
+        };
+
+        remove_local_semble_tools(&mut prompt);
+
+        assert_eq!(
+            prompt
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["CallMcpTool"]
+        );
+    }
+
+    fn configured_model() -> crate::model::ModelConfig {
+        crate::model::ModelConfig {
             model_hash: "abcd1234".into(),
             sort_order: 0,
             display_name: "Configured Model".into(),
@@ -855,12 +1003,177 @@ mod tests {
             thinking_budget_tokens: None,
             created_at_ms: 0,
             updated_at_ms: 0,
-        };
+        }
+    }
+
+    fn plugin_model() -> PluginModelDescriptor {
+        PluginModelDescriptor {
+            id: "plugin/codex/gpt-5".into(),
+            plugin_id: "codex-plugin".into(),
+            plugin_name: "Codex".into(),
+            provider_id: "codex".into(),
+            model_id: "gpt-5".into(),
+            display_name: "GPT-5".into(),
+            description: None,
+            icon: String::new(),
+            provider_type: "openai".into(),
+            max_output_tokens: None,
+            images: false,
+            effort_options: vec!["low".into(), "high".into()],
+            context_options: vec!["200k".into(), "1m".into()],
+        }
+    }
+
+    #[test]
+    fn plugin_model_line_lists_the_effective_axes() {
+        assert_eq!(
+            format_subagent_model_line(
+                &plugin_model().display_name,
+                &plugin_model().effort_options,
+                &plugin_model().context_options,
+            ),
+            "- GPT-5 — reasoning: low, high; context: 200k, 1m"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_model_accepts_exact_ids_and_variant_slugs() {
+        let models = vec![plugin_model()];
+        let (descriptor, _, parts) = resolve_plugin_model(&models, "plugin/codex/gpt-5").unwrap();
+        assert_eq!(descriptor.id, "plugin/codex/gpt-5");
+        assert!(parts.is_none());
+
+        let (_, _, parts) = resolve_plugin_model(&models, "plugin/codex/gpt-5-1m-low").unwrap();
+        let parts = parts.unwrap();
+        assert_eq!(parts.context, "1m");
+        assert_eq!(parts.effort.as_deref(), Some("low"));
+        assert!(!parts.fast);
+
+        let (_, _, parts) =
+            resolve_plugin_model(&models, "PLUGIN/CODEX/GPT-5-1M-LOW-FAST").unwrap();
+        assert!(parts.unwrap().fast);
+
+        assert!(resolve_plugin_model(&models, "plugin/codex/gpt-5-2m-low").is_none());
+        assert!(resolve_plugin_model(&models, "unknown").is_none());
+    }
+
+    #[test]
+    fn model_directory_resolves_plugin_aliases_and_variant_slugs() {
+        let mut directory = ModelDirectory::default();
+        let descriptor = plugin_model();
+        insert_directory_model(
+            &mut directory,
+            &descriptor.id,
+            &descriptor.display_name,
+            &[&descriptor.id, &descriptor.display_name],
+            plugin_variant_axis(&descriptor),
+        );
+        for key in [
+            "plugin/codex/gpt-5",
+            "gpt-5",
+            "GPT-5",
+            "plugin/codex/gpt-5-1m-low-fast",
+        ] {
+            let (base, _) = directory.resolve(key);
+            assert_eq!(base, "plugin/codex/gpt-5", "key {key} must resolve");
+        }
+        let (base, parts) = directory.resolve("plugin/codex/gpt-5-1m-low-fast");
+        let parts = parts.unwrap();
+        assert_eq!(directory.display_names[&base], "GPT-5");
+        assert!(parts.fast);
+    }
+
+    #[test]
+    fn plugin_inherited_variant_carries_the_selected_axes() {
+        let descriptor = plugin_model();
+        let mut selected = crate::model::ModelSpec::new("ignored");
+        selected.context_window_tokens = Some(1_000_000);
+        selected.reasoning.effort = Some("low".into());
+        selected.latency = crate::model::ModelLatency::Fast;
+        assert_eq!(
+            model_variant_id(&plugin_variant_axis(&descriptor), &descriptor.id, &selected),
+            Some("plugin/codex/gpt-5-1m-low-fast".into())
+        );
+    }
+
+    #[test]
+    fn available_subagent_model_line_omits_the_hash() {
+        let model = configured_model();
         assert_eq!(
             format_available_subagent_model(&model),
-            "- Configured Model — effort: low, high; context: 272k, 1m"
+            "- Configured Model — reasoning: low, high; context: 272k, 1m"
         );
         assert!(!format_available_subagent_model(&model).contains("abcd1234"));
+    }
+
+    #[test]
+    fn available_subagent_model_line_omits_empty_option_axes() {
+        let mut model = configured_model();
+        model.effort_options = Vec::new();
+        assert_eq!(
+            format_available_subagent_model(&model),
+            "- Configured Model — context: 272k, 1m"
+        );
+        model.context_options = Vec::new();
+        assert_eq!(
+            format_available_subagent_model(&model),
+            "- Configured Model"
+        );
+    }
+
+    #[test]
+    fn inherited_variant_restores_fast_and_skips_the_effort_segment_without_a_reasoning_axis() {
+        let mut selected = crate::model::ModelSpec::new("ignored");
+        selected.context_window_tokens = Some(1_000_000);
+        selected.reasoning.effort = Some("high".into());
+        selected.latency = crate::model::ModelLatency::Fast;
+
+        let model = configured_model();
+        // 父代理 Fast 时,继承变体携带 -fast,子代理不再静默退回 Standard。
+        assert_eq!(
+            model_variant_id(&model.variant_axis(), &model.model_hash, &selected),
+            Some("abcd1234-1m-high-fast".into())
+        );
+
+        let mut without_effort = configured_model();
+        without_effort.effort_options = Vec::new();
+        assert_eq!(
+            model_variant_id(
+                &without_effort.variant_axis(),
+                &without_effort.model_hash,
+                &selected
+            ),
+            Some("abcd1234-1m-fast".into())
+        );
+    }
+
+    #[test]
+    fn override_model_slug_bakes_the_configured_variant() {
+        let directory = {
+            let model = configured_model();
+            let axis = model.variant_axis();
+            let mut directory = ModelDirectory::default();
+            directory
+                .aliases
+                .insert(model.model_hash.clone(), model.model_hash.clone());
+            directory
+                .display_names
+                .insert(model.model_hash.clone(), model.display_name.clone());
+            directory.variants.insert(model.model_hash.clone(), axis);
+            directory
+        };
+        let mut spec = crate::model::ModelSpec::new("abcd1234");
+        spec.context_window_tokens = Some(272_000);
+        spec.reasoning.effort = Some("LOW".into());
+        spec.latency = crate::model::ModelLatency::Fast;
+
+        // 用户在设置里为子代理选的 effort/context/fast 档烘焙进 slug。
+        assert_eq!(
+            override_model_slug(&spec, &directory),
+            "abcd1234-272k-low-fast"
+        );
+        let unknown = crate::model::ModelSpec::new("other-model");
+        assert_eq!(override_model_slug(&unknown, &directory), "other-model");
     }
 
     #[test]

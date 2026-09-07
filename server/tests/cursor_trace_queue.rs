@@ -1,13 +1,13 @@
 //! Verifies that Cursor trace persistence is ordered and detached from producers.
 
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use cursor_server::{cursor::services::observability::CursorTraceService, store::Store};
 use sqlx::{Connection, SqliteConnection};
+use support::temp_store;
 
 #[tokio::test]
 async fn trace_producers_do_not_wait_for_sqlite_and_artifacts_stay_ordered() {
@@ -109,7 +109,7 @@ async fn trace_producers_do_not_wait_for_sqlite_and_artifacts_stay_ordered() {
 
 #[tokio::test]
 async fn events_for_disabled_detailed_logging_are_discarded_off_path() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let traces = CursorTraceService::new(store.clone());
     let recorder = traces.recorder("trace-disabled");
 

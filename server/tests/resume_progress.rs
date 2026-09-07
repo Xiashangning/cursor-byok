@@ -1,49 +1,47 @@
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
-
-use std::sync::Arc;
+mod support;
 
 use cursor_server::{
-    cursor::{
-        prompting::{PromptAssets, PromptCompiler},
-        protocol::{connect, proto::agent::v1 as pb},
-        TransportCommand, TransportHandle, TransportRegistry,
-    },
+    cursor::{protocol::proto::agent::v1 as pb, TransportCommand},
     model::{ContentPart, ProjectedContent, Role},
-    provider::{FinishReason, ModelEvent},
 };
-use prost::Message;
+use support::{
+    drive, registry, resume_action, run_request, temp_store, text_response, user_message_action,
+    FakeProvider,
+};
 
 #[tokio::test]
 async fn resume_action_context_and_continuation_reach_the_next_model_call() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     provider.push(text_response("model-initial", "initial response"));
     provider.push(text_response("model-resumed", "continued response"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let registry = registry(store, provider.clone());
 
     let first = registry.get_or_create("initial-request").await.unwrap();
     let mut first_output = first.subscribe();
     first
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(start_request()),
+            message: Box::new(run_request(
+                "resume-progress-conversation",
+                "initial-wire-run",
+                "test-model",
+                None,
+                user_message_action("perform the task", "user-1", Some(request_context("bash"))),
+            )),
         })
         .await
         .unwrap();
-    let state = drive_to_end(&first, &mut first_output, 1).await;
+    let mut first_seqno = 1;
+    let mut out = drive(&first, &mut first_output, &mut first_seqno, |_| vec![]).await;
+    assert!(out.kvs.iter().all(|kv| matches!(
+        kv.message,
+        Some(pb::kv_server_message::Message::SetBlobArgs(_))
+    )));
+    let state = out
+        .checkpoints
+        .pop()
+        .expect("run must publish a checkpoint");
     assert!(state.pending_tool_calls.is_empty());
 
     let resumed = registry.get_or_create("resume-request").await.unwrap();
@@ -51,11 +49,32 @@ async fn resume_action_context_and_continuation_reach_the_next_model_call() {
     resumed
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(resume_request(state)),
+            message: Box::new(run_request(
+                "resume-progress-conversation",
+                "resume-wire-run",
+                "test-model",
+                Some(state),
+                resume_action(Some(request_context("pwsh"))),
+            )),
         })
         .await
         .unwrap();
-    let _ = drive_to_end(&resumed, &mut resumed_output, 1).await;
+    let mut resumed_seqno = 1;
+    let mut out = drive(
+        &resumed,
+        &mut resumed_output,
+        &mut resumed_seqno,
+        |_| vec![],
+    )
+    .await;
+    assert!(out.kvs.iter().all(|kv| matches!(
+        kv.message,
+        Some(pb::kv_server_message::Message::SetBlobArgs(_))
+    )));
+    let _ = out
+        .checkpoints
+        .pop()
+        .expect("run must publish a checkpoint");
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
@@ -79,74 +98,6 @@ async fn resume_action_context_and_continuation_reach_the_next_model_call() {
     assert!(projected_text(last).as_deref().is_some_and(|text| {
         text.contains("<resume>") && text.contains("make concrete progress")
     }));
-}
-
-fn text_response(model_call_id: &str, text: &str) -> Vec<ModelEvent> {
-    vec![
-        ModelEvent::Start {
-            model_call_id: model_call_id.into(),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta(text.into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Done(FinishReason::Stop),
-    ]
-}
-
-fn start_request() -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                action: Some(pb::ConversationAction {
-                    action: Some(pb::conversation_action::Action::UserMessageAction(
-                        pb::UserMessageAction {
-                            user_message: Some(pb::UserMessage {
-                                text: "perform the task".into(),
-                                message_id: "user-1".into(),
-                                mode: pb::AgentMode::Agent as i32,
-                                ..Default::default()
-                            }),
-                            request_context: Some(request_context("bash")),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                }),
-                conversation_id: Some("resume-progress-conversation".into()),
-                run_id: Some("initial-wire-run".into()),
-                requested_model: Some(pb::RequestedModel {
-                    model_id: "test-model".into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )),
-    }
-}
-
-fn resume_request(state: pb::ConversationStateStructure) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                action: Some(pb::ConversationAction {
-                    action: Some(pb::conversation_action::Action::ResumeAction(
-                        pb::ResumeAction {
-                            request_context: Some(request_context("pwsh")),
-                        },
-                    )),
-                    ..Default::default()
-                }),
-                conversation_state: Some(state),
-                conversation_id: Some("resume-progress-conversation".into()),
-                run_id: Some("resume-wire-run".into()),
-                requested_model: Some(pb::RequestedModel {
-                    model_id: "test-model".into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )),
-    }
 }
 
 fn request_context(shell: &str) -> pb::RequestContext {
@@ -177,53 +128,4 @@ fn projected_text(message: &cursor_server::model::ProjectedMessage) -> Option<St
             .collect::<Vec<_>>()
             .join("\n"),
     )
-}
-
-async fn drive_to_end(
-    handle: &TransportHandle,
-    output: &mut tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>,
-    mut seqno: i64,
-) -> pb::ConversationStateStructure {
-    let mut latest = None;
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), output.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        match server.message {
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                assert!(matches!(
-                    kv.message,
-                    Some(pb::kv_server_message::Message::SetBlobArgs(_))
-                ));
-                handle
-                    .command(TransportCommand::Append {
-                        seqno,
-                        message: Box::new(pb::AgentClientMessage {
-                            message: Some(pb::agent_client_message::Message::KvClientMessage(
-                                pb::KvClientMessage {
-                                    id: kv.id,
-                                    message: Some(pb::kv_client_message::Message::SetBlobResult(
-                                        pb::SetBlobResult { error: None },
-                                    )),
-                                },
-                            )),
-                        }),
-                    })
-                    .await
-                    .unwrap();
-                seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(state)) => {
-                latest = Some(state)
-            }
-            _ => {}
-        }
-    }
-    latest.expect("run must publish a checkpoint")
 }

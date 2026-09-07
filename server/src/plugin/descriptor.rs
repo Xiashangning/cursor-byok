@@ -197,7 +197,7 @@ pub fn parse_model_id(value: &str) -> Option<(&str, &str, &str)> {
 /// 插件模型的默认 Effort 与 Context 档位轴;插件描述符不声明这两项,
 /// 由宿主统一提供,用户覆盖可整体替换。
 const DEFAULT_EFFORT_OPTIONS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-const DEFAULT_CONTEXT_OPTIONS: [&str; 5] = ["200k", "356k", "500k", "800k", "1m"];
+const DEFAULT_CONTEXT_OPTIONS: [&str; 4] = ["200k", "356k", "800k", "1m"];
 
 impl PluginModelDescriptor {
     pub fn new(

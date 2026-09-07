@@ -1,10 +1,9 @@
 //! Verifies the local WriteGitCommitMessage engine end to end on the wire.
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
 use std::sync::Arc;
+
+use support::{prompt_assets, temp_store, FakeProvider};
 
 use axum::{
     body::{to_bytes, Body},
@@ -13,7 +12,7 @@ use axum::{
 use cursor_server::{
     api::cursor,
     cursor::{
-        prompting::{PromptAssets, PromptCompiler},
+        prompting::PromptCompiler,
         protocol::{connect, proto::aiserver::v1 as ai},
         transport::TransportRegistry,
     },
@@ -24,16 +23,8 @@ use cursor_server::{
 };
 use tower::ServiceExt;
 
-async fn commit_router(
-    store: cursor_server::store::Store,
-    provider: fake_provider::FakeProvider,
-) -> axum::Router {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+async fn commit_router(store: cursor_server::store::Store, provider: FakeProvider) -> axum::Router {
+    let assets = prompt_assets();
     let clients = NetworkClients::new(store.clone());
     let registry = TransportRegistry::new(store, Arc::new(provider), PromptCompiler::new(assets));
     cursor::router(registry, clients).unwrap()
@@ -94,7 +85,7 @@ fn diff_request(diff: &str) -> ai::WriteGitCommitMessageRequest {
 
 #[tokio::test]
 async fn commit_message_is_generated_through_configured_model() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let created = store
         .create_model(&model_input("qwen/qwen3-flash"))
         .await
@@ -106,7 +97,7 @@ async fn commit_message_is_generated_through_configured_model() {
         })
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
+    let provider = FakeProvider::default();
     provider.push(vec![
         ModelEvent::TextStart,
         ModelEvent::TextDelta("```\nCommit message: feat: 新增提交引擎\n```".into()),
@@ -140,7 +131,7 @@ async fn commit_message_is_generated_through_configured_model() {
 
 #[tokio::test]
 async fn custom_prompt_and_model_from_commit_settings_are_used() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let created = store
         .create_model(&model_input("qwen/qwen3-coder"))
         .await
@@ -152,7 +143,7 @@ async fn custom_prompt_and_model_from_commit_settings_are_used() {
         })
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
+    let provider = FakeProvider::default();
     provider.push(vec![
         ModelEvent::TextDelta("chore: 清理旧代码".into()),
         ModelEvent::Done(FinishReason::Stop),
@@ -173,7 +164,7 @@ async fn custom_prompt_and_model_from_commit_settings_are_used() {
 
 #[tokio::test]
 async fn empty_diffs_are_rejected_when_generating() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let created = store
         .create_model(&model_input("qwen/qwen3-flash"))
         .await
@@ -185,7 +176,7 @@ async fn empty_diffs_are_rejected_when_generating() {
         })
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
+    let provider = FakeProvider::default();
     let router = commit_router(store, provider).await;
 
     let response = post_commit_message(router, ai::WriteGitCommitMessageRequest::default()).await;
@@ -198,7 +189,7 @@ async fn empty_diffs_are_rejected_when_generating() {
 
 #[tokio::test]
 async fn tool_call_events_are_rejected() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let created = store
         .create_model(&model_input("qwen/qwen3-flash"))
         .await
@@ -210,7 +201,7 @@ async fn tool_call_events_are_rejected() {
         })
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
+    let provider = FakeProvider::default();
     provider.push(vec![ModelEvent::ToolCallStart {
         index: 0,
         call_id: "call-1".into(),
@@ -228,7 +219,7 @@ async fn tool_call_events_are_rejected() {
 
 #[tokio::test]
 async fn unconfigured_model_is_rejected() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     store
         .set_commit_settings(CommitSettings {
             model_id: "missing-hash".into(),
@@ -236,7 +227,7 @@ async fn unconfigured_model_is_rejected() {
         })
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
+    let provider = FakeProvider::default();
     let router = commit_router(store, provider).await;
 
     let response = post_commit_message(router, diff_request("diff --git a/x.rs")).await;

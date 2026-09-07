@@ -139,7 +139,7 @@ mod tests {
                 &ModelSpec::new("model"),
                 &[],
                 false,
-                "- inherit\n- Configured [provider-model] — effort: low, high; context: 272k, 1m",
+                "- inherit\n- Configured [provider-model] — reasoning: low, high; context: 272k, 1m",
             )
             .unwrap();
         let task = prompt
@@ -150,7 +150,7 @@ mod tests {
         assert!(task.description.contains("Configured [provider-model]"));
         assert!(task
             .description
-            .contains("effort: low, high; context: 272k, 1m"));
+            .contains("reasoning: low, high; context: 272k, 1m"));
         assert!(!task.description.contains("{{AVAILABLE_SUBAGENT_MODELS}}"));
     }
 }

@@ -26,6 +26,8 @@ pub(crate) struct ConversationDependencies {
     pub provider: Arc<dyn Provider>,
     pub compiler: PromptCompiler,
     pub web_cache: WebCache,
+    /// 插件注册表;Task 工具的可用模型清单与模型目录需要插件模型的生效轴。
+    pub plugins: Option<crate::plugin::PluginRegistry>,
     /// 本地 rules 服务的 md 存储目录;编译请求上下文时合并其中的规则。
     pub local_rules_dir: Option<std::path::PathBuf>,
 }
@@ -49,6 +51,7 @@ impl ConversationRegistry {
         provider: Arc<dyn Provider>,
         compiler: PromptCompiler,
         web_cache: WebCache,
+        plugins: Option<crate::plugin::PluginRegistry>,
         local_rules_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
@@ -61,6 +64,7 @@ impl ConversationRegistry {
                     provider,
                     compiler,
                     web_cache,
+                    plugins,
                     local_rules_dir,
                 },
             }),

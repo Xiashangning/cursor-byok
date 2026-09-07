@@ -10,7 +10,7 @@ use prost::Message;
 use crate::{
     api::cursor::proxy::{self, CursorProxy},
     cursor::{protocol::proto::agent::v1 as agent, transport::TransportRegistry},
-    model::{format_token_count, parse_token_count, ModelConfig},
+    model::{format_token_count, parse_token_count, ModelConfig, ModelVariantAxis},
     plugin::PluginModelDescriptor,
     Error, Result,
 };
@@ -216,31 +216,17 @@ struct DefaultModelNudgeDataResponse {
 }
 
 const CLI_LOCAL_MODEL_API_KEY: &str = "cursor-byok-local";
-const DEFAULT_CONTEXT: &str = "200k";
 
 fn context_options(model: &ModelConfig) -> Vec<(String, String)> {
-    let configured = model.context_window_tokens;
-    let mut contexts =
-        Vec::with_capacity(model.context_options.len() + usize::from(configured.is_some()));
-    if let Some(tokens) = configured {
-        match model
-            .context_options
-            .iter()
-            .find(|value| parse_token_count(value) == Some(tokens))
-        {
-            // A named option matching the configured window leads the list as-is.
-            Some(value) => contexts.push((value.clone(), display_token_count(value))),
-            // Without a matching named option the window is exposed as a bare token count.
-            None => contexts.push((tokens.to_string(), format_token_count(tokens))),
-        }
-    }
-    for value in &model.context_options {
-        if configured.is_some_and(|tokens| parse_token_count(value) == Some(tokens)) {
-            continue;
-        }
-        contexts.push((value.clone(), display_token_count(value)));
-    }
-    contexts
+    model
+        .variant_axis()
+        .context_options
+        .into_iter()
+        .map(|value| {
+            let display_name = display_token_count(&value);
+            (value, display_name)
+        })
+        .collect()
 }
 
 fn display_token_count(value: &str) -> String {
@@ -614,16 +600,13 @@ fn model_variants(
     contexts: &[(String, String)],
     efforts: &[(String, String)],
 ) -> Vec<ModelVariant> {
-    let default_context = contexts
-        .iter()
-        .find(|(value, _)| value == DEFAULT_CONTEXT)
-        .or_else(|| contexts.first())
-        .map(|(value, _)| value.as_str());
-    let default_effort = efforts
-        .iter()
-        .find(|(value, _)| value == "high")
-        .or_else(|| efforts.first())
-        .map(|(value, _)| value.as_str());
+    let defaults = ModelVariantAxis {
+        context_options: contexts.iter().map(|(value, _)| value.clone()).collect(),
+        effort_options: efforts.iter().map(|(value, _)| value.clone()).collect(),
+    }
+    .default_parts();
+    let default_context = defaults.as_ref().map(|parts| parts.context.as_str());
+    let default_effort = defaults.as_ref().and_then(|parts| parts.effort.as_deref());
     // 没有 Effort 轴的模型(非思考插件模型)变体网格只剩 Context × Fast。
     let effort_axis = if efforts.is_empty() {
         vec![None]

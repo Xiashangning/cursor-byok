@@ -2,6 +2,7 @@
 mod account;
 mod ca;
 mod proxy;
+mod remote_ssh;
 mod settings;
 
 use std::{net::SocketAddr, sync::Arc};
@@ -103,7 +104,8 @@ impl CursorHarness {
     }
 
     pub async fn cleanup_stale_settings(&self) -> Result<()> {
-        settings::clear_stale_managed_settings()
+        remote_ssh::disable()?;
+        settings::clear_stale_proxy_settings()
     }
 
     /// Observes the integration without starting or stopping it.
@@ -116,7 +118,7 @@ impl CursorHarness {
         let proxy_url = proxy.url();
         let settings_applied = proxy_url
             .as_deref()
-            .map(settings::settings_match)
+            .map(remote_ssh::settings_match)
             .transpose()?
             .unwrap_or(false);
         let integration = integration_state(proxy.running(), settings_applied);
@@ -184,12 +186,22 @@ impl CursorHarness {
             .ok_or_else(|| Error::Config("desktop management server is not ready".into()))?;
         let mut proxy = self.inner.proxy.lock().await;
         if proxy.running() {
-            if let Some(url) = proxy.url() {
-                apply_cursor_configuration(&url).await?;
+            if let (Some(url), Some(port), Some(skill_sync)) =
+                (proxy.url(), proxy.port(), proxy.skill_sync())
+            {
+                apply_cursor_configuration(
+                    &url,
+                    port,
+                    &self.inner.ca.certificate_pem()?,
+                    &skill_sync,
+                )
+                .await?;
             }
             return Ok(());
         }
+        let certificate_pem = self.inner.ca.certificate_pem()?;
         let ca = self.inner.ca.load()?;
+        let skill_sync = remote_ssh::SkillSyncServer::new()?;
         let requested_port = self.inner.store.port_settings().await?.proxy_port;
         *self.inner.tab_mode.write() = self.inner.store.tab_settings().await?.mode;
         let (url, actual_port) = proxy
@@ -198,13 +210,16 @@ impl CursorHarness {
                 ca,
                 requested_port,
                 self.inner.tab_mode.clone(),
+                skill_sync.clone(),
             )
             .await?;
         if let Err(error) = self.inner.store.set_proxy_port(actual_port).await {
             proxy.stop().await;
             return Err(error);
         }
-        if let Err(error) = apply_cursor_configuration(&url).await {
+        if let Err(error) =
+            apply_cursor_configuration(&url, actual_port, &certificate_pem, &skill_sync).await
+        {
             proxy.stop().await;
             return Err(error);
         }
@@ -212,15 +227,20 @@ impl CursorHarness {
     }
 
     pub async fn disable(&self) -> Result<()> {
-        settings::clear_proxy_settings()?;
+        remote_ssh::disable()?;
         self.inner.proxy.lock().await.stop().await;
         Ok(())
     }
 }
 
-async fn apply_cursor_configuration(proxy_url: &str) -> Result<()> {
+async fn apply_cursor_configuration(
+    proxy_url: &str,
+    proxy_port: u16,
+    certificate_pem: &str,
+    skill_sync: &remote_ssh::SkillSyncServer,
+) -> Result<()> {
     account::ensure_local_account().await?;
-    settings::write_proxy_settings(proxy_url)
+    remote_ssh::enable(proxy_url, proxy_port, certificate_pem, skill_sync)
 }
 
 #[cfg(test)]

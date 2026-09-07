@@ -6,7 +6,7 @@ use crate::{
         protocol::proto::agent::v1 as pb,
         tools::{
             edit::{self, EditWrite},
-            runtime::{ExecContext, McpRoute},
+            runtime::{parse_task_model_parameters, ExecContext, McpRoute},
         },
     },
     model::ToolCall,
@@ -173,7 +173,9 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                         "send-message-to-agent is disabled by the subagent model override".into(),
                     ))
                 }
-                None => requested_model.unwrap_or_else(|| context.default_subagent_model.clone()),
+                None => requested_model
+                    .map(|model| context.canonical_model(&model))
+                    .unwrap_or_else(|| context.default_subagent_model.clone()),
             };
             let readonly = call
                 .arguments
@@ -530,40 +532,14 @@ fn shell_notification(call: &ToolCall) -> Result<Option<pb::ShellOutputNotificat
 }
 
 fn task_model_parameters(call: &ToolCall) -> Result<Vec<pb::requested_model::ModelParameterValue>> {
-    let Some(value) = call.arguments.get("model_parameters") else {
-        return Ok(Vec::new());
-    };
-    let parameters: Vec<&Value> = match value {
-        Value::Array(parameters) => parameters.iter().collect(),
-        Value::Object(_) => vec![value],
-        _ => {
-            return Err(Error::Protocol(
-                "Task model_parameters must be an object or array".into(),
-            ))
-        }
-    };
-    parameters
-        .iter()
-        .map(|parameter| {
-            let object = parameter.as_object().ok_or_else(|| {
-                Error::Protocol("Task model_parameters entries must be objects".into())
-            })?;
-            let id = object
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| matches!(*id, "effort" | "context"))
-                .ok_or_else(|| {
-                    Error::Protocol("Task model_parameters id must be effort or context".into())
-                })?;
-            let value = object.get("value").and_then(Value::as_str).ok_or_else(|| {
-                Error::Protocol(format!("Task model parameter {id} is missing value"))
-            })?;
-            Ok(pb::requested_model::ModelParameterValue {
-                id: id.into(),
-                value: value.into(),
-            })
-        })
-        .collect()
+    let arguments = call
+        .arguments
+        .as_object()
+        .ok_or_else(|| Error::Protocol("Task arguments must be a JSON object".into()))?;
+    Ok(parse_task_model_parameters(arguments)?
+        .into_iter()
+        .map(|(id, value)| pb::requested_model::ModelParameterValue { id, value })
+        .collect())
 }
 
 fn task_attachments(call: &ToolCall) -> Option<pb::SelectedContext> {
@@ -671,13 +647,69 @@ mod tests {
         let parameters = task_model_parameters(&call(
             "Task",
             json!({
-                "model_parameters": {"id": "effort", "value": "low"}
+                "model_parameters": {"id": "reasoning", "value": "low"}
             }),
         ))
         .unwrap();
         assert_eq!(parameters.len(), 1);
-        assert_eq!(parameters[0].id, "effort");
+        assert_eq!(parameters[0].id, "reasoning");
         assert_eq!(parameters[0].value, "low");
+    }
+
+    #[test]
+    fn task_model_parameters_reject_duplicate_and_unknown_ids() {
+        let duplicate = call(
+            "Task",
+            json!({
+                "model_parameters": [
+                    {"id": "context", "value": "200k"},
+                    {"id": "context", "value": "1m"}
+                ]
+            }),
+        );
+        assert!(matches!(
+            task_model_parameters(&duplicate),
+            Err(Error::Protocol(message)) if message.contains("repeats context")
+        ));
+        let unknown = call(
+            "Task",
+            json!({"model_parameters": [{"id": "effort", "value": "low"}]}),
+        );
+        assert!(matches!(
+            task_model_parameters(&unknown),
+            Err(Error::Protocol(message)) if message.contains("reasoning or context")
+        ));
+    }
+
+    #[test]
+    fn send_message_to_agent_normalizes_the_model_through_aliases() {
+        let mut context = crate::cursor::tools::runtime::ExecContext {
+            conversation_id: "conversation-1".into(),
+            root_conversation_id: "root-1".into(),
+            default_subagent_model: "model-1".into(),
+            ..Default::default()
+        };
+        context
+            .model_directory
+            .aliases
+            .insert("deepseek flash".into(), "hash-deepseek".into());
+        let server = request(
+            7,
+            &call(
+                "send-message-to-agent",
+                json!({"agent_id":"agent-1","prompt":"continue","model":"DeepSeek Flash"}),
+            ),
+            &context,
+        )
+        .unwrap();
+        let Some(pb::agent_server_message::Message::ExecServerMessage(server)) = server.message
+        else {
+            panic!("expected ExecServerMessage")
+        };
+        let Some(pb::exec_server_message::Message::SubagentArgs(args)) = server.message else {
+            panic!("expected SubagentArgs")
+        };
+        assert_eq!(args.model_id, "hash-deepseek");
     }
 
     #[test]
