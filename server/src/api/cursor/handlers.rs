@@ -1,4 +1,6 @@
 //! Implements Cursor HTTP endpoints outside the Agent Run stream.
+use std::time::Duration;
+
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{DefaultBodyLimit, Extension, State},
@@ -23,10 +25,12 @@ use crate::{
             account, analytics, commit_message, compatibility, entitlement::FreeEntitlementCache,
             knowledge, model_catalog, server_config, tab,
         },
-        transport::{TransportParent, TransportRegistry},
+        transport::{TransportParent, TransportRegistry, TransportRoute},
     },
     Result,
 };
+
+const INITIAL_APPEND_WAIT: Duration = Duration::from_secs(30);
 
 pub fn router(
     registry: TransportRegistry,
@@ -258,6 +262,21 @@ async fn bidi_handler(
         true
     } else if registry.upstream(&decoded.request_id).await {
         false
+    } else if decoded.seqno > 0 {
+        // BidiAppend uploads are concurrent. A small heartbeat can arrive before
+        // the much larger seqno=0 RunRequest has finished uploading/decoding.
+        // Wait for its model-selected route; never guess local vs upstream.
+        let route = tokio::time::timeout(
+            INITIAL_APPEND_WAIT,
+            registry.wait_route(&decoded.request_id),
+        )
+        .await
+        .map_err(|_| {
+            crate::Error::Protocol(
+                "timed out waiting for the initial BidiAppend model selection".into(),
+            )
+        })?;
+        matches!(route, TransportRoute::Local)
     } else {
         trace.resume();
         trace.request(
