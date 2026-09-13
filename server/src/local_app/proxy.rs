@@ -119,13 +119,14 @@ struct CursorRelay {
     skill_sync: SkillSyncServer,
 }
 
-impl HttpHandler for CursorRelay {
-    async fn handle_request(
-        &mut self,
-        _ctx: &HttpContext,
-        mut request: Request<Body>,
-    ) -> RequestOrResponse {
+impl CursorRelay {
+    fn route_request(&self, mut request: Request<Body>) -> RequestOrResponse {
         let original = request.uri().clone();
+        // Preserve CONNECT authority for TLS interception. The backend's HTTP
+        // forwarder cannot bridge upgraded connections, so keep those upstream.
+        if request.method() == Method::CONNECT || request.headers().contains_key("upgrade") {
+            return request.into();
+        }
         if request.method() == Method::GET {
             if let Some(script) = self.skill_sync.script_for_path(original.path()) {
                 let (status, body) = match script {
@@ -147,8 +148,16 @@ impl HttpHandler for CursorRelay {
                     .into();
             }
         }
-        let locally_routed = should_route_locally(original.path(), *self.tab_mode.read());
-        if is_cursor_host(original.host().unwrap_or_default()) && locally_routed {
+        // Route every Cursor-host request through the local backend instead of
+        // letting hudsucker dial the official upstream directly: direct dials
+        // hang (~75s) on networks that only allow proxied egress. Paths outside
+        // the explicit route table fall through to the router fallback
+        // (proxy::forward), which uses the configured outbound proxy. Tab paths
+        // in explicit Direct mode keep their original upstream pass-through.
+        let route_locally = is_cursor_host(original.host().unwrap_or_default())
+            && (should_route_locally(original.path(), *self.tab_mode.read())
+                || !is_tab_path(original.path()));
+        if route_locally {
             if let Ok(value) = original.to_string().parse() {
                 request.headers_mut().insert(UPSTREAM_URL_HEADER, value);
             }
@@ -161,6 +170,16 @@ impl HttpHandler for CursorRelay {
             }
         }
         request.into()
+    }
+}
+
+impl HttpHandler for CursorRelay {
+    async fn handle_request(
+        &mut self,
+        _ctx: &HttpContext,
+        request: Request<Body>,
+    ) -> RequestOrResponse {
+        self.route_request(request)
     }
 
     async fn should_intercept_connect(
@@ -239,6 +258,103 @@ mod tests {
         let requested_port = occupied.local_addr().unwrap().port();
         let listener = bind_proxy_listener(requested_port).await.unwrap();
         assert_ne!(listener.local_addr().unwrap().port(), requested_port);
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_tunnels_hosts_tab_modes_and_skill_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let skills = SkillSyncServer::at(directory.path().to_path_buf(), "test-token");
+        let skill_url = skills.unix_url(12345);
+        let relay = CursorRelay {
+            backend: "127.0.0.1:12346".parse().unwrap(),
+            tab_mode: Arc::new(RwLock::new(TabMode::Public)),
+            skill_sync: skills,
+        };
+        for mode in [TabMode::Public, TabMode::Custom, TabMode::Direct] {
+            *relay.tab_mode.write() = mode;
+            for (method, url, routed) in [
+                (Method::CONNECT, "api2.cursor.sh:443", false),
+                (Method::CONNECT, "example.com:443", false),
+                (Method::GET, "https://API2.CURSOR.SH./unknown?x=1", true),
+                (Method::POST, "https://api2.cursor.sh/unknown?x=1", true),
+                (
+                    Method::GET,
+                    "https://example.com/agent.v1.AgentService/RunSSE",
+                    false,
+                ),
+                (
+                    Method::POST,
+                    "https://api2.cursor.sh/aiserver.v1.AiService/StreamCpp",
+                    mode != TabMode::Direct,
+                ),
+            ] {
+                let request = Request::builder()
+                    .method(method.clone())
+                    .uri(url)
+                    .header("x-test", "preserved")
+                    .body(Body::from("payload"))
+                    .unwrap();
+                let RequestOrResponse::Request(request) = relay.route_request(request) else {
+                    panic!("ordinary requests must remain requests");
+                };
+                assert_eq!(request.method(), method);
+                assert_eq!(request.headers()["x-test"], "preserved");
+                if routed {
+                    assert_eq!(
+                        request.uri().authority().unwrap().as_str(),
+                        "127.0.0.1:12346"
+                    );
+                    assert_eq!(request.headers()[UPSTREAM_URL_HEADER], url);
+                    assert_eq!(
+                        request.uri().path_and_query(),
+                        url.parse::<Uri>().unwrap().path_and_query()
+                    );
+                } else {
+                    assert_eq!(request.uri(), &url.parse::<Uri>().unwrap());
+                    assert!(!request.headers().contains_key(UPSTREAM_URL_HEADER));
+                }
+                if method == Method::CONNECT {
+                    assert_eq!(
+                        is_cursor_host(request.uri().authority().unwrap().host()),
+                        url.starts_with("api2")
+                    );
+                }
+            }
+            for url in [
+                skill_url.clone(),
+                skill_url.replace("127.0.0.1:12345", "api2.cursor.sh"),
+            ] {
+                let request = Request::builder().uri(url).body(Body::empty()).unwrap();
+                let RequestOrResponse::Response(response) = relay.route_request(request) else {
+                    panic!("skill paths must retain their local owner");
+                };
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["cache-control"], "no-store");
+            }
+        }
+    }
+
+    #[test]
+    fn relay_preserves_websocket_upgrade_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let relay = CursorRelay {
+            backend: "127.0.0.1:12346".parse().unwrap(),
+            tab_mode: Arc::new(RwLock::new(TabMode::Public)),
+            skill_sync: SkillSyncServer::at(directory.path().to_path_buf(), "test-token"),
+        };
+        let url = "https://api2.cursor.sh/ws-reachability-probe";
+        let request = Request::builder()
+            .uri(url)
+            .header("connection", "keep-alive, Upgrade")
+            .header("upgrade", "websocket")
+            .body(Body::empty())
+            .unwrap();
+        let RequestOrResponse::Request(request) = relay.route_request(request) else {
+            panic!("upgrades must remain upstream requests");
+        };
+        assert_eq!(request.uri(), &url.parse::<Uri>().unwrap());
+        assert_eq!(request.headers()["upgrade"], "websocket");
+        assert!(!request.headers().contains_key(UPSTREAM_URL_HEADER));
     }
 
     #[test]
