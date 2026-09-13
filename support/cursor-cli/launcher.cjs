@@ -18,7 +18,7 @@ function endpointFromStore(data) {
   }
 }
 
-function initializeConfig(data) {
+function initializeConfig(data, platform = process.platform) {
   const directory = path.join(data, 'cli');
   fs.mkdirSync(directory, { recursive: true });
   const config = {
@@ -27,9 +27,11 @@ function initializeConfig(data) {
     permissions: { allow: [], deny: [] },
     approvalMode: 'allowlist',
     network: { useHttp1ForAgent: true },
-    // Native Windows CLI does not implement its sandbox. Tool approval remains enabled.
-    sandbox: { mode: 'disabled', networkAccess: 'user_config_with_defaults' },
   };
+  // Only native Windows lacks the CLI sandbox; retain the platform default on Mac.
+  if (platform === 'win32') {
+    config.sandbox = { mode: 'disabled', networkAccess: 'user_config_with_defaults' };
+  }
   try {
     fs.writeFileSync(path.join(directory, 'cli-config.json'), JSON.stringify(config, null, 2) + '\n', { flag: 'wx' });
   } catch (error) {
@@ -66,7 +68,7 @@ function cliEnvironment(data, endpoint, status, inherited = process.env) {
 }
 
 async function main() {
-  if (process.platform !== 'win32') throw new Error('This launcher currently supports native Windows only.');
+  if (!['win32', 'darwin'].includes(process.platform)) throw new Error('This launcher supports Windows and macOS.');
   const data = path.join(os.homedir(), '.cursor-byok-v3');
   const endpoint = endpointFromStore(data);
   let status;
@@ -79,7 +81,7 @@ async function main() {
   }
   const env = cliEnvironment(data, endpoint, status);
   const entry = path.join(path.dirname(process.execPath), 'index.js');
-  if (!fs.existsSync(entry)) throw new Error('Run cursor-byok.ps1 with the official CLI installed.');
+  if (!fs.existsSync(entry)) throw new Error('Use the cursor-byok launcher with the official CLI installed.');
   if (!fs.existsSync(env.NODE_EXTRA_CA_CERTS)) throw new Error('Cursor BYOK CA certificate is missing.');
   initializeConfig(data);
   const child = spawn(process.execPath, [entry, ...process.argv.slice(2)], { env, stdio: 'inherit', windowsHide: true });

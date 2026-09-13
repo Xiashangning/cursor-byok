@@ -16,8 +16,11 @@ concurrency:
 
 jobs:
   cursor-cli:
-    name: Cursor CLI launcher (Windows)
-    runs-on: windows-latest
+    name: Cursor CLI launcher (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

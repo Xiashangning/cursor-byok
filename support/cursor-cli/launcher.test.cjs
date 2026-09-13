@@ -59,6 +59,17 @@ test('isolates credentials and proxies to the CLI child environment', () => {
   assert.equal(inherited.CURSOR_AUTH_TOKEN, 'test-account');
 });
 
+test('disables sandbox only on native Windows and retains Mac defaults', t => {
+  const data = temporaryData(t);
+  for (const platform of ['win32', 'darwin']) {
+    const directory = path.join(data, platform);
+    initializeConfig(directory, platform);
+    const config = JSON.parse(fs.readFileSync(path.join(directory, 'cli', 'cli-config.json'), 'utf8'));
+    assert.equal(config.approvalMode, 'allowlist');
+    assert.equal(config.sandbox?.mode, platform === 'win32' ? 'disabled' : undefined);
+  }
+});
+
 test('rejects disabled integration and a remote proxy', () => {
   assert.throws(() => cliEnvironment('data', 'http://127.0.0.1:1', { integration: 'disabled' }), /Enable Cursor/);
   assert.throws(() => cliEnvironment('data', 'http://127.0.0.1:1', { integration: 'enabled', proxy_url: 'http://example.invalid:1234' }), /local HTTP proxy/);
