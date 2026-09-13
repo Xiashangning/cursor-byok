@@ -10,7 +10,6 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "i18n:scan": "cross-env STATIC_I18N_SCAN=true vite build",
     "build": "vite build",
-    "build:demo": "npm run typecheck && npm run typecheck:node && vite build --config vite.demo.config.ts",
     "check": "npm run typecheck && npm run typecheck:node && npm run build",
     "dev:web": "concurrently --kill-others --success first --names server,web \"cross-env CURSOR_CONSOLE_PROXY=http://127.0.0.1:1420 cargo run --manifest-path ../../server/Cargo.toml --bin cursor-server\" \"wait-on http-get://127.0.0.1:3000/__byok-api__/healthz && vite\"",
     "serve": "vite preview",

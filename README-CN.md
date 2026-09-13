@@ -4,7 +4,7 @@
 
 cursor-byok 是一个运行在本机的 Cursor 模型网关，帮助你在 Cursor 中使用自己配置的模型服务。
 
-[English README](./README.md) · [使用指南](https://docs.leokun.cn) · [下载](https://github.com/leookun/cursor-byok/releases/latest) · [提交问题](https://github.com/leookun/cursor-byok/issues)
+[English README](./README.md) · [下载](https://github.com/leookun/cursor-byok/releases/latest) · [提交问题](https://github.com/leookun/cursor-byok/issues)
 
 [![Release](https://img.shields.io/github/v/release/leookun/cursor-byok?style=flat-square)](https://github.com/leookun/cursor-byok/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/leookun/cursor-byok/total?style=flat-square)](https://github.com/leookun/cursor-byok/releases)
@@ -44,8 +44,6 @@ cursor-byok 是一个开源的本地模型网关。它在你的设备上运行�
 3. 在模型设置中添加模型，填写服务地址、API Key 和模型名称，然后保存并运行 **测试**。
 4. 确认测试通过后，保持 cursor-byok 运行。
 5. **首次升级 Cursor 或首次配置模型后，完全退出并重新启动 Cursor，然后新开一个对话**。在模型列表中选择已配置的模型，开始使用 Agent。
-
-完整的安装步骤、配置说明和常见问题，请参阅[中文使用指南](https://docs.leokun.cn/zh/docs)。
 
 > [!TIP]
 > 首次升级 Cursor 或首次完成配置后，必须完全退出并重新启动 Cursor，再新开一个对话。配置前已经打开的对话不会加载新连接；使用自定义模型时，请在模型列表中手动选择该模型，不要选择 **Auto**。
@@ -128,7 +126,6 @@ cursor-byok/
 │   │   │   ├── i18n/     # 本地化运行时与语言目录
 │   │   │   └── styles/   # 全局主题与排版令牌
 │   │   └── src-tauri/    # Tauri 桌面生命周期
-│   └── docs/          # Next.js 与 Fumadocs 中文/英文文档站
 ├── server/
 │   ├── src/
 │   │   ├── cursor/    # Cursor 协议适配
@@ -167,7 +164,6 @@ cursor-byok/
 
 ```bash
 npm --prefix apps/desktop install
-npm --prefix apps/docs install
 ```
 
 ### 启动开发环境
@@ -184,14 +180,6 @@ make dev-web
 make dev-desktop
 ```
 
-启动文档站：
-
-```bash
-make dev-docs
-```
-
-文档站默认地址为 <http://localhost:3000>。
-
 ### 检查与构建
 
 运行完整检查：
@@ -205,12 +193,9 @@ make check
 ```bash
 make build-web       # 构建桌面前端
 make build-server    # 构建 Rust 本地服务
-make build-docs      # 构建文档站
 make build-desktop   # 构建 Tauri 桌面安装包
 make build-docker    # 构建 Docker 镜像
 ```
-
-文档内容位于 `apps/docs/content/docs` 和 `apps/docs/content/blog`。修改文档侧边栏时同步更新 `apps/docs/content/docs/meta.json`。
 
 ## 路线图
 
@@ -220,7 +205,6 @@ make build-docker    # 构建 Docker 镜像
 
 ## 社区与反馈
 
-- [中文使用指南](https://docs.leokun.cn/zh/docs)
 - [GitHub Issues](https://github.com/leookun/cursor-byok/issues)
 - [Telegram 社区](https://t.me/cursor_byok)
 - QQ 群：`1095916242`、`1094411438`、`1095918002`、`1094419321`

@@ -7,7 +7,6 @@
 server/*.db
 server/*.db-shm
 server/*.db-wal
-docs
 logs
 *.tar
 *.zip

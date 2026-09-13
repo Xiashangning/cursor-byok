@@ -6,7 +6,7 @@ cursor-byok is a local implementation of Cursor's backend.
 <br>
 <a href="https://trendshift.io/repositories/39260?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-39260" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/39260" alt="leookun/cursor-byok | Trendshift" width="250" height="55" /></a>
 
-[User Guide](https://docs.leokun.cn) · [Download](https://github.com/leookun/cursor-byok/releases/latest) · [Report an Issue](https://github.com/leookun/cursor-byok/issues) · [中文版本说明](./README-CN.md)
+[Download](https://github.com/leookun/cursor-byok/releases/latest) · [Report an Issue](https://github.com/leookun/cursor-byok/issues) · [中文版本说明](./README-CN.md)
 
 [![Release](https://img.shields.io/github/v/release/leookun/cursor-byok?style=flat-square)](https://github.com/leookun/cursor-byok/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/leookun/cursor-byok/total?style=flat-square)](https://github.com/leookun/cursor-byok/releases)
@@ -48,8 +48,6 @@ You can connect OpenAI- and Anthropic-compatible services, customize endpoints, 
 4. Test the model configuration. Once it passes, return to the dashboard and start the service.
 5. After upgrading Cursor or configuring a model for the first time, quit Cursor completely and restart it, then start a new conversation and select the configured model.
 
-For complete installation steps, system configuration, and Frequently Asked Questions, see the [User Guide](https://docs.leokun.cn).
-
 ## Model Management
 
 Model configurations support both OpenAI and Anthropic API protocols. Each model channel can independently define its context window, maximum output tokens, reasoning effort, custom headers, and additional request parameters.
@@ -86,7 +84,6 @@ See the [release roadmap](https://github.com/leookun/cursor-byok/discussions/32)
 
 ## Community and Support
 
-- [User Guide](https://docs.leokun.cn)
 - [GitHub Issues](https://github.com/leookun/cursor-byok/issues)
 - [Telegram community](https://t.me/cursor_byok)
 - QQ groups: `1095916242`, `1094411438`, `1095918002`, `1094419321`

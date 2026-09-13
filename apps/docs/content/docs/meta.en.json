@@ -1,5 +1,0 @@
-{
-  "title": "User Guide",
-  "root": true,
-  "pages": ["index", "installation", "model-configuration", "plugin-development", "tab-service", "faq"]
-}
