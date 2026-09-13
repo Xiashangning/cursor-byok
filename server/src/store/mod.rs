@@ -3,6 +3,7 @@ mod background_completions;
 mod cas;
 mod checkpoints;
 mod conversations;
+mod cursor_model_aliases;
 mod cursor_traces;
 mod input_anchors;
 mod legacy_config;

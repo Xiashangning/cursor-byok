@@ -236,8 +236,9 @@ async fn bidi_handler(
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
     let request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
-    let decoded = bidi::decode(&request)?;
+    let mut decoded = bidi::decode(&request)?;
     let first_model = decoded.model_id().map(str::to_owned);
+    decoded.resolve_model_aliases(registry.store()).await?;
     let conversation_id = decoded.conversation_id().map(str::to_owned);
     let trace_metadata = decoded.trace_metadata();
     let trace = registry.trace(&decoded.request_id);

@@ -90,6 +90,15 @@ See the [release roadmap](https://github.com/leookun/cursor-byok/discussions/32)
 
 
 
+## Explicit Cursor model routing
+
+Cursor-hosted model IDs normally use the Cursor upstream. To route a specific ID through an existing BYOK model, use the local control API:
+
+- `GET /__byok-api__/api/settings/cursor-model-aliases` reads the alias map.
+- `PUT /__byok-api__/api/settings/cursor-model-aliases` replaces it with a JSON object such as `{"cursor-grok-4.6-high-fast":"<configured-model-hash>"}`. Obtain the target hash from the configured model, not its provider model ID or display name.
+
+Mappings are exact and opt-in; no hosted models are redirected by default. The target supplies the provider URL, API key, and provider model ID. Explicit Cursor request parameters still take precedence over saved defaults, as with a direct BYOK selection. Initial selections, model-details selections, and explicit subagent model overrides use the same mapping. Existing runs keep their selected route. An unknown/deleted target is rejected locally rather than falling back to the hosted model. To remove all mappings, PUT `{}`. If changing provider configuration changes a target hash, update its mappings too.
+
 ## Development and Contributing
 
 Issues and pull requests are welcome. See the [Contributing Guide](./CONTRIBUTING_EN.md) for prerequisites, build commands, project structure, and contribution guidelines.
