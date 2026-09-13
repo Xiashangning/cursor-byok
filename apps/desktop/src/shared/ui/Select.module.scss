@@ -62,55 +62,6 @@
     border-color: var(--vscode-focusBorder);
   }
 }
-
-.multiCombo {
-  min-width: 0;
-  min-height: 34px;
-  flex: 1;
-  display: flex;
-  align-items: stretch;
-  overflow: hidden;
-  background: var(--vscode-input-background);
-  border: 1px solid var(--vscode-input-border, transparent);
-  border-radius: 6px;
-
-  &:focus-within,
-  &[data-open] {
-    border-color: var(--vscode-focusBorder);
-  }
-}
-
-.multiValues {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 6px;
-
-  > input {
-    min-width: 120px;
-    min-height: 24px;
-    flex: 1;
-    padding: 0 3px;
-    color: var(--vscode-input-foreground);
-    background: transparent;
-    border: 0;
-    outline: 0;
-    font-size: type.$font-size-xs;
-  }
-}
-
-.multiCount {
-  height: 24px;
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  padding: 0 3px;
-  color: var(--vscode-descriptionForeground);
-  font-size: type.$font-size-xs;
-  white-space: nowrap;
-}
 .combo input {
   min-width: 0;
   flex: 1;
@@ -171,24 +122,4 @@
       color: var(--vscode-list-activeSelectionForeground);
     }
   }
-}
-
-.menu .multiOption {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-
-  > span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-}
-
-.empty {
-  padding: 8px;
-  color: var(--vscode-descriptionForeground);
-  font-size: type.$font-size-xs;
 }

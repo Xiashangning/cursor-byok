@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - develop
 
 permissions:
   contents: read
@@ -15,7 +16,7 @@ concurrency:
 
 jobs:
   rust:
-    name: Rust
+    name: Rust (Linux)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -35,11 +36,54 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - name: cargo fmt --all -- --check
+      - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: cargo test --workspace --all-targets
+      - name: Run tests
         run: cargo test --workspace --all-targets
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Check types and production build
+        working-directory: apps/desktop
+        run: npm run check
+
+  desktop-rust:
+    name: Desktop Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Run platform Clippy
+        run: cargo clippy --package cursor-byok-desktop --all-targets -- -D warnings

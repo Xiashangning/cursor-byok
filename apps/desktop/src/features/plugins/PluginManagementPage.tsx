@@ -3,7 +3,7 @@ import { api, getDisabledPluginModelIds, pluginText, type PluginDescriptor, type
 import { useI18n } from "../../i18n/store";
 import { PageContent } from "../../shell/layout/PageContent";
 import { appStore, useAppStore } from "../../shared/store/appStore";
-import { ActionMenu } from "../../shared/ui/ActionMenu";
+import { ActionMenu, type ActionMenuItem } from "../../shared/ui/ActionMenu";
 import { Button } from "../../shared/ui/Button";
 import { Card } from "../../shared/ui/Card";
 import { Modal } from "../../shared/ui/Modal";
@@ -78,6 +78,8 @@ export function PluginManagementPage() {
         ? t("{name} 账号管理", { name: selectedPlugin?.name ?? "" })
         : t("添加 {name} 账号", { name: selectedPlugin?.name ?? "" })}
       onClose={() => setSelected(null)}
+      onSubmit={() => setSelected(null)}
+      submitLabel={t("确定")}
     >
       {selected?.mode === "add" && selectedPlugin && <PluginAddPanel plugin={selectedPlugin} onConfigured={() => setSelected(null)} />}
       {selected?.mode === "settings" && selectedPlugin && <PluginSettingsPanel plugin={selectedPlugin} />}
@@ -178,6 +180,38 @@ function PluginCard({ plugin, onOpen }: {
     }
   };
 
+  const moreItems: ActionMenuItem[] = [
+    ...(importResource
+      ? [
+          {
+            id: "import",
+            label: importing ? t("正在导入…") : t("批量导入"),
+            disabled: importing,
+            onSelect: () => importInput.current?.click(),
+          },
+        ]
+      : []),
+    ...(exportResource
+      ? [
+          {
+            id: "export",
+            label: t("批量导出"),
+            onSelect: () =>
+              void api.openExternalUrl(
+                api.pluginResourceExportUrl(
+                  ports.service_port,
+                  plugin.id,
+                  exportResource.type,
+                ),
+              ),
+          },
+        ]
+      : []),
+    ...(plugin.version
+      ? [{ id: "version", type: "text" as const, label: `v${plugin.version}` }]
+      : []),
+  ];
+
   return (
     <Card className={styles.pluginCard}>
       <div className={styles.pluginCardTop}>
@@ -199,9 +233,9 @@ function PluginCard({ plugin, onOpen }: {
             models: modelCount,
           })}
         </span>
-        <span className={styles.pluginAuthor}>
-          {[`v${plugin.version}`, plugin.author].filter(Boolean).join(" · ")}
-        </span>
+        {plugin.author && (
+          <span className={styles.pluginAuthor}>{plugin.author}</span>
+        )}
       </div>
       <div className={styles.cardActions}>
         <TruncatedButton
@@ -217,39 +251,9 @@ function PluginCard({ plugin, onOpen }: {
             onClick={() => onOpen(plugin.id, "settings")}
           />
         )}
-        {(importResource || exportResource) && (
+        {moreItems.length > 0 && (
           <span className={styles.moreAction}>
-            <ActionMenu
-              label={t("更多")}
-              items={[
-                ...(importResource
-                  ? [
-                      {
-                        id: "import",
-                        label: importing ? t("正在导入…") : t("批量导入"),
-                        disabled: importing,
-                        onSelect: () => importInput.current?.click(),
-                      },
-                    ]
-                  : []),
-                ...(exportResource
-                  ? [
-                      {
-                        id: "export",
-                        label: t("批量导出"),
-                        onSelect: () =>
-                          void api.openExternalUrl(
-                            api.pluginResourceExportUrl(
-                              ports.service_port,
-                              plugin.id,
-                              exportResource.type,
-                            ),
-                          ),
-                      },
-                    ]
-                  : []),
-              ]}
-            />
+            <ActionMenu label={t("更多")} items={moreItems} />
           </span>
         )}
         {importResource && (

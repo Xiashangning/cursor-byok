@@ -22,6 +22,15 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
             .map(str::to_string)
             .ok_or_else(|| Error::Protocol(format!("{} is missing {name}", call.name)))
     };
+    // Claude 系模型常按 Claude Code 习惯输出别名参数(如 file_path),逐个回退兼容。
+    let string_aliased = |names: &[&str]| -> Result<String> {
+        names
+            .iter()
+            .find_map(|name| call.arguments.get(name))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| Error::Protocol(format!("{} is missing {}", call.name, names[0])))
+    };
     let optional_string = |name: &str| {
         call.arguments
             .get(name)
@@ -63,7 +72,7 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
             })
         }
         "read" => Message::ReadArgs(pb::ReadArgs {
-            path: string("path")?,
+            path: string_aliased(&["path", "file_path", "filePath"])?,
             tool_call_id: call.call_id.clone(),
             offset: int("offset"),
             limit: call
@@ -74,7 +83,7 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
             encoding_hint: optional_string("encoding_hint"),
         }),
         "delete" => Message::DeleteArgs(pb::DeleteArgs {
-            path: string("path")?,
+            path: string_aliased(&["path", "file_path", "filePath"])?,
             tool_call_id: call.call_id.clone(),
         }),
         "grep" => Message::GrepArgs(pb::GrepArgs {
@@ -640,6 +649,45 @@ mod tests {
             panic!("expected ExecServerMessage")
         };
         server.message.unwrap()
+    }
+
+    #[test]
+    fn read_delete_aliases_match_execution_and_display() {
+        for name in ["Read", "Delete"] {
+            for arguments in [
+                json!({"file_path": "/snake"}),
+                json!({"filePath": "/camel"}),
+                json!({"path": "/primary", "file_path": "/snake", "filePath": "/camel"}),
+                json!({"file_path": "/snake", "filePath": "/camel"}),
+            ] {
+                let call = call(name, arguments);
+                let expected = call
+                    .arguments
+                    .get("path")
+                    .or_else(|| call.arguments.get("file_path"))
+                    .or_else(|| call.arguments.get("filePath"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap();
+                let path = match message(&call) {
+                    pb::exec_server_message::Message::ReadArgs(args) => args.path,
+                    pb::exec_server_message::Message::DeleteArgs(args) => args.path,
+                    _ => panic!("unexpected execution"),
+                };
+                assert_eq!(path, expected);
+                let rendered = super::super::render_tool_call(&call, false).unwrap();
+                let displayed = match rendered.tool.unwrap() {
+                    pb::tool_call::Tool::ReadToolCall(tool) => tool.args.unwrap().path,
+                    pb::tool_call::Tool::DeleteToolCall(tool) => tool.args.unwrap().path,
+                    _ => panic!("unexpected display"),
+                };
+                assert_eq!(displayed, path);
+            }
+            for value in [Value::Null, json!(42), json!([])] {
+                let call = call(name, json!({"path": value, "file_path": "/alias"}));
+                assert!(request(7, &call, &ExecContext::default()).is_err());
+            }
+        }
     }
 
     #[test]

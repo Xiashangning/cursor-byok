@@ -4,7 +4,7 @@ import { createPortal } from "react-dom";
 import { parseTimeInput } from "../../../shared/utils/parseTimeInput";
 import controls from "../../../shared/ui/Controls.module.scss";
 import { Icon } from "../../../shared/ui/Icon";
-import { MultiSelect, type MultiSelectOption } from "../../../shared/ui/MultiSelect";
+import { ModelSelect, type ModelSelectOption } from "../../../shared/ui/ModelSelect";
 import { TooltipTrigger } from "../../../shared/ui/TooltipTrigger";
 import { refreshIcon } from "../../../shared/ui/icons";
 import styles from "./OverviewTimeRangeFilter.module.scss";
@@ -25,7 +25,7 @@ export function OverviewTimeRangeFilter({ value, granularity, customOpen, custom
   customOpen: boolean;
   customStart: string;
   customEnd: string;
-  modelOptions: MultiSelectOption[];
+  modelOptions: ModelSelectOption[];
   selectedModels: string[];
   busy: boolean;
   onSelect: (value: Exclude<OverviewRangePreset, "custom">) => void;
@@ -188,7 +188,7 @@ export function OverviewTimeRangeFilter({ value, granularity, customOpen, custom
     >
       <label><span>{t("开始时间")}</span><input type="text" placeholder={t("如：2026-08-23 09:00、1小时前")} value={customStart} onChange={(event) => onCustomStartChange(event.target.value)} /></label>
       <label><span>{t("结束时间")}</span><input type="text" placeholder={t("如：现在、2026-08-23 18:00")} value={customEnd} onChange={(event) => onCustomEndChange(event.target.value)} /></label>
-      <div className={styles.filterRow}><MultiSelect label={t("模型")} value={selectedModels} options={modelOptions} onChange={onSelectedModelsChange} /></div>
+      <div className={styles.filterRow}><ModelSelect mode="multiple" label={t("模型")} value={selectedModels} options={modelOptions} onChange={onSelectedModelsChange} /></div>
       <div className={styles.popoverActions}>
         <button type="button" className={controls.secondary} onClick={() => onCustomOpenChange(false)}>{t("取消")}</button>
         <button type="button" className={controls.primary} disabled={!customValid} onClick={onCustomApply}>{t("应用")}</button>

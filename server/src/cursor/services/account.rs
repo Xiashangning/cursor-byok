@@ -1,15 +1,17 @@
 //! Implements Cursor account information services.
 use axum::{
-    body::{Body, Bytes},
+    body::{to_bytes, Body},
     extract::Extension,
-    http::{header, Request, Response},
+    http::{header, HeaderValue, Request, Response},
 };
 use prost::Message;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-use crate::{api::cursor::proxy, Result};
+use crate::{api::cursor::proxy, local_app, Result};
 
-const LOCAL_AUTH_ID: &str = "local_ultra";
+use super::entitlement::FreeEntitlementCache;
+
+const LOCAL_AUTH_ID: &str = "cursor-local-user";
 const LOCAL_EMAIL: &str = "cursor@ai.com";
 const LOCAL_ULTRA_PLAN_INCLUDED_CENTS: i32 = 20_000;
 
@@ -19,6 +21,20 @@ struct GetEmailResponse {
     email: String,
     #[prost(int32, tag = "2")]
     sign_up_type: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct GetUserMetaResponse {
+    #[prost(string, tag = "1")]
+    email: String,
+    #[prost(int32, tag = "2")]
+    sign_up_type: i32,
+    #[prost(int64, tag = "3")]
+    user_id: i64,
+    #[prost(string, optional, tag = "4")]
+    workos_id: Option<String>,
+    #[prost(string, optional, tag = "5")]
+    profile_picture_url: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -41,6 +57,8 @@ struct GetMeResponse {
     email_domain_type: Option<String>,
     #[prost(string, optional, tag = "12")]
     country: Option<String>,
+    #[prost(string, optional, tag = "13")]
+    profile_picture_url: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -134,10 +152,26 @@ pub async fn get_email(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    forward_or(upstream, request, || {
+    local_or_forward(upstream, request, || {
         proto(GetEmailResponse {
             email: LOCAL_EMAIL.into(),
             sign_up_type: 3,
+        })
+    })
+    .await
+}
+
+pub async fn get_user_meta(
+    Extension(upstream): Extension<proxy::CursorProxy>,
+    request: Request<Body>,
+) -> Result<Response<Body>> {
+    local_or_forward(upstream, request, || {
+        proto(GetUserMetaResponse {
+            email: LOCAL_EMAIL.into(),
+            sign_up_type: 3,
+            user_id: 1,
+            workos_id: None,
+            profile_picture_url: None,
         })
     })
     .await
@@ -147,7 +181,7 @@ pub async fn get_me(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    forward_or(upstream, request, || {
+    local_or_forward(upstream, request, || {
         proto(GetMeResponse {
             auth_id: LOCAL_AUTH_ID.into(),
             user_id: 1,
@@ -158,6 +192,7 @@ pub async fn get_me(
             is_enterprise_user: Some(false),
             email_domain_type: Some("personal".into()),
             country: Some("US".into()),
+            profile_picture_url: None,
         })
     })
     .await
@@ -167,14 +202,14 @@ pub async fn get_teams(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    forward_or(upstream, request, || proto(Empty {})).await
+    local_or_forward(upstream, request, || proto(Empty {})).await
 }
 
 pub async fn get_user_profile(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    forward_or(upstream, request, || {
+    local_or_forward(upstream, request, || {
         proto(GetUserProfileResponse {
             public_visibility_allowed: Some(true),
             max_visibility: Some("PUBLIC".into()),
@@ -183,85 +218,170 @@ pub async fn get_user_profile(
     .await
 }
 
-pub async fn current_period_usage() -> Result<Response<Body>> {
-    let now = chrono::Utc::now();
-    proto(GetCurrentPeriodUsageResponse {
-        billing_cycle_start: (now - chrono::Duration::days(30)).timestamp_millis(),
-        billing_cycle_end: (now + chrono::Duration::days(10 * 365)).timestamp_millis(),
-        plan_usage: Some(PlanUsage {
-            total_spend: 0,
-            included_spend: LOCAL_ULTRA_PLAN_INCLUDED_CENTS,
-            remaining: LOCAL_ULTRA_PLAN_INCLUDED_CENTS,
-            limit: LOCAL_ULTRA_PLAN_INCLUDED_CENTS,
-            remaining_bonus: Some(false),
-            bonus_tooltip: Some("Ultra local account mock is active.".into()),
-            auto_spend: Some(0),
-            api_spend: Some(0),
-            auto_percent_used: Some(0.0),
-            api_percent_used: Some(0.0),
-            total_percent_used: Some(0.0),
-        }),
-        spend_limit_usage: Some(SpendLimitUsage {
-            limit_type: "user".into(),
-        }),
-        display_threshold: Some(99_999_999),
-        enabled: true,
-        display_message: "Ultra plan active".into(),
-        auto_model_selected_display_message: Some("Ultra plan active".into()),
-        named_model_selected_display_message: Some("Ultra plan active".into()),
+pub async fn current_period_usage(
+    Extension(upstream): Extension<proxy::CursorProxy>,
+    Extension(free_entitlements): Extension<FreeEntitlementCache>,
+    request: Request<Body>,
+) -> Result<Response<Body>> {
+    local_or_confirmed_free_or_forward(upstream, &free_entitlements, request, || {
+        let now = chrono::Utc::now();
+        proto(GetCurrentPeriodUsageResponse {
+            billing_cycle_start: (now - chrono::Duration::days(30)).timestamp_millis(),
+            billing_cycle_end: (now + chrono::Duration::days(10 * 365)).timestamp_millis(),
+            plan_usage: Some(PlanUsage {
+                total_spend: 0,
+                included_spend: LOCAL_ULTRA_PLAN_INCLUDED_CENTS,
+                remaining: LOCAL_ULTRA_PLAN_INCLUDED_CENTS,
+                limit: LOCAL_ULTRA_PLAN_INCLUDED_CENTS,
+                remaining_bonus: Some(false),
+                bonus_tooltip: Some("Ultra local account mock is active.".into()),
+                auto_spend: Some(0),
+                api_spend: Some(0),
+                auto_percent_used: Some(0.0),
+                api_percent_used: Some(0.0),
+                total_percent_used: Some(0.0),
+            }),
+            spend_limit_usage: Some(SpendLimitUsage {
+                limit_type: "user".into(),
+            }),
+            display_threshold: Some(99_999_999),
+            enabled: true,
+            display_message: "Ultra plan active".into(),
+            auto_model_selected_display_message: Some("Ultra plan active".into()),
+            named_model_selected_display_message: Some("Ultra plan active".into()),
+        })
     })
+    .await
 }
 
-pub async fn usage_limit_status() -> Result<Response<Body>> {
-    proto(GetUsageLimitStatusAndActiveGrantsResponse {
-        usage_limit_policy_status: Some(UsageLimitPolicyStatus {
-            is_in_slow_pool: false,
-            features: Default::default(),
-            can_configure_spend_limit: true,
-            has_pending_request: false,
-            allowed_model_ids: Vec::new(),
-            allowed_model_tags: Vec::new(),
-        }),
+pub async fn usage_limit_status(
+    Extension(upstream): Extension<proxy::CursorProxy>,
+    Extension(free_entitlements): Extension<FreeEntitlementCache>,
+    request: Request<Body>,
+) -> Result<Response<Body>> {
+    local_or_confirmed_free_or_forward(upstream, &free_entitlements, request, || {
+        proto(GetUsageLimitStatusAndActiveGrantsResponse {
+            usage_limit_policy_status: Some(UsageLimitPolicyStatus {
+                is_in_slow_pool: false,
+                features: Default::default(),
+                can_configure_spend_limit: true,
+                has_pending_request: false,
+                allowed_model_ids: Vec::new(),
+                allowed_model_tags: Vec::new(),
+            }),
+        })
     })
+    .await
 }
 
 pub async fn stripe_profile(
     Extension(upstream): Extension<proxy::CursorProxy>,
+    Extension(free_entitlements): Extension<FreeEntitlementCache>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    match proxy::forward_buffered(&upstream, request).await {
-        Ok(response) if response.status.is_success() => {
-            let mut profile = serde_json::from_slice::<Map<String, Value>>(&response.body)?;
-            ultra(&mut profile);
-            Ok(response.with_body(Bytes::from(serde_json::to_vec(&profile)?)))
-        }
-        Ok(response) => {
-            tracing::warn!(status = %response.status, "Cursor account upstream rejected profile; using local Ultra identity");
-            json(ultra_profile())
-        }
-        Err(error) => {
-            tracing::warn!(%error, "Cursor account upstream unavailable; using local Ultra identity");
-            json(ultra_profile())
-        }
+    if local_app::request_uses_local_cursor_token(request.headers()) {
+        return local_stripe_profile(request.headers().get(header::ORIGIN).cloned());
     }
+
+    let request_headers = request.headers().clone();
+    let origin = request.headers().get(header::ORIGIN).cloned();
+    let upstream_response = match proxy::forward_buffered(&upstream, request).await {
+        Ok(response) => response,
+        Err(error) if free_entitlements.is_confirmed_free(&request_headers) => {
+            tracing::warn!(%error, "using cached Free entitlement after Stripe upstream failure");
+            return local_stripe_profile(origin);
+        }
+        Err(error) => return Err(error),
+    };
+    if !upstream_response.status.is_success() {
+        if should_fallback_to_cached_free(
+            upstream_response.status,
+            &free_entitlements,
+            &request_headers,
+        ) {
+            tracing::warn!(
+                status = %upstream_response.status,
+                "using cached Free entitlement after Stripe upstream failure"
+            );
+            return local_stripe_profile(origin);
+        }
+        return Ok(upstream_response.into_response());
+    }
+
+    let Some(membership_type) = membership_type(&upstream_response.body) else {
+        return Ok(upstream_response.into_response());
+    };
+    let observed = free_entitlements.observe_membership(&request_headers, &membership_type);
+    if observed && membership_type.eq_ignore_ascii_case("free") {
+        return local_stripe_profile(origin);
+    }
+
+    Ok(upstream_response.into_response())
 }
 
-async fn forward_or(
+fn should_fallback_to_cached_free(
+    status: axum::http::StatusCode,
+    free_entitlements: &FreeEntitlementCache,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    status.is_server_error() && free_entitlements.is_confirmed_free(headers)
+}
+
+fn membership_type(body: &[u8]) -> Option<String> {
+    let profile: Value = serde_json::from_slice(body).ok()?;
+    let membership_type = profile.get("membershipType")?.as_str()?.trim();
+    (!membership_type.is_empty()).then(|| membership_type.to_owned())
+}
+
+fn local_stripe_profile(origin: Option<HeaderValue>) -> Result<Response<Body>> {
+    let mut response = json(ultra_profile())?;
+    if let Some(origin) = origin {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+        response
+            .headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Origin"));
+    }
+    Ok(response)
+}
+
+async fn local_or_confirmed_free_or_forward(
+    upstream: proxy::CursorProxy,
+    free_entitlements: &FreeEntitlementCache,
+    request: Request<Body>,
+    local: impl FnOnce() -> Result<Response<Body>>,
+) -> Result<Response<Body>> {
+    if local_app::request_uses_local_cursor_token(request.headers())
+        || free_entitlements.is_confirmed_free(request.headers())
+    {
+        consume_body(request).await?;
+        return local();
+    }
+    proxy::forward(Extension(upstream), request).await
+}
+
+async fn local_or_forward(
     upstream: proxy::CursorProxy,
     request: Request<Body>,
-    fallback: impl FnOnce() -> Result<Response<Body>>,
+    local: impl FnOnce() -> Result<Response<Body>>,
 ) -> Result<Response<Body>> {
-    match proxy::forward_buffered(&upstream, request).await {
-        Ok(response) if response.status.is_success() => Ok(response.into_response()),
-        Ok(response) => {
-            tracing::debug!(status = %response.status, "Cursor identity upstream rejected request; using local identity");
-            fallback()
-        }
-        Err(error) => {
-            tracing::warn!(%error, "Cursor identity upstream unavailable; using local identity");
-            fallback()
-        }
+    if local_app::request_uses_local_cursor_token(request.headers()) {
+        consume_body(request).await?;
+        return local();
     }
+    proxy::forward(Extension(upstream), request).await
+}
+
+async fn consume_body(request: Request<Body>) -> Result<()> {
+    to_bytes(request.into_body(), usize::MAX)
+        .await
+        .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
+    Ok(())
 }
 
 fn proto(message: impl Message) -> Result<Response<Body>> {
@@ -289,15 +409,6 @@ fn response(content_type: &'static str, body: Vec<u8>) -> Result<Response<Body>>
     Ok(response)
 }
 
-fn ultra(profile: &mut Map<String, Value>) {
-    profile.insert("membershipType".into(), Value::String("ultra".into()));
-    profile.insert(
-        "individualMembershipType".into(),
-        Value::String("ultra".into()),
-    );
-    profile.insert("subscriptionStatus".into(), Value::String("active".into()));
-}
-
 fn ultra_profile() -> Value {
     serde_json::json!({
         "membershipType": "ultra",
@@ -309,4 +420,137 @@ fn ultra_profile() -> Value {
         "paymentId": LOCAL_AUTH_ID,
         "isTeamMember": false
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use axum::body::Bytes;
+    use futures_util::stream;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn real_identity_is_forwarded_and_local_identity_stays_local() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = axum::Router::new().fallback(move |request: Request<Body>| {
+            let observed = observed.clone();
+            async move {
+                assert_eq!(
+                    request.headers()[header::AUTHORIZATION],
+                    "Bearer fixture-official-token"
+                );
+                observed.fetch_add(1, Ordering::SeqCst);
+                "official-identity"
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = crate::store::Store::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let proxy = proxy::CursorProxy::for_test(
+            crate::network::NetworkClients::new(store),
+            format!("http://{addr}"),
+        );
+        for (authorization, local) in [
+            (local_app::local_cursor_authorization(), true),
+            ("Bearer fixture-official-token".into(), false),
+        ] {
+            let request = Request::post("/aiserver.v1.AuthService/GetUserMeta")
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .unwrap();
+            let response = get_user_meta(Extension(proxy.clone()), request)
+                .await
+                .unwrap();
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            if local {
+                let response = GetUserMetaResponse::decode(body).unwrap();
+                assert_eq!(response.email, LOCAL_EMAIL);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(&body[..], b"official-identity");
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_account_response_consumes_request_body_before_replying() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let observed = polled.clone();
+        let body = Body::from_stream(stream::once(async move {
+            observed.store(true, Ordering::SeqCst);
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"request"))
+        }));
+
+        consume_body(Request::new(body)).await.unwrap();
+
+        assert!(polled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cached_free_fallback_accepts_server_failures_but_not_auth_failures() {
+        let cache = FreeEntitlementCache::default();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer official-free-token"),
+        );
+        assert!(cache.observe_membership(&headers, "free"));
+
+        assert!(should_fallback_to_cached_free(
+            axum::http::StatusCode::BAD_GATEWAY,
+            &cache,
+            &headers
+        ));
+        assert!(!should_fallback_to_cached_free(
+            axum::http::StatusCode::UNAUTHORIZED,
+            &cache,
+            &headers
+        ));
+    }
+
+    #[test]
+    fn reads_only_a_non_empty_membership_type() {
+        assert_eq!(
+            membership_type(br#"{"membershipType":"free"}"#).as_deref(),
+            Some("free")
+        );
+        assert_eq!(membership_type(br#"{"membershipType":""}"#), None);
+        assert_eq!(membership_type(br#"{"subscriptionStatus":"active"}"#), None);
+        assert_eq!(membership_type(b"not-json"), None);
+    }
+
+    #[test]
+    fn local_stripe_profile_allows_the_cursor_app_origin() {
+        let origin = HeaderValue::from_static("vscode-file://vscode-app");
+        let response = local_stripe_profile(Some(origin.clone())).unwrap();
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&origin)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+            Some(&HeaderValue::from_static("true"))
+        );
+        assert_eq!(
+            response.headers().get(header::VARY),
+            Some(&HeaderValue::from_static("Origin"))
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+    }
 }

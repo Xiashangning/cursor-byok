@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, type CommitSettingsView } from "../../shared/api";
+import { api, getDisabledPluginModelIds, pluginText, type CommitSettingsView } from "../../shared/api";
+import { useI18n } from "../../i18n/store";
 import { useAppStore } from "../../shared/store/appStore";
+import { Button } from "../../shared/ui/Button";
 import { Modal } from "../../shared/ui/Modal";
-import { Select } from "../../shared/ui/Select";
+import { ModelSelect, type ModelSelectOption } from "../../shared/ui/ModelSelect";
+import { claudeIcon, flatColorOrganizationIcon, openAiIcon } from "../../shared/ui/icons";
 import { TitledCard } from "../../shared/ui/TitledCard";
 import { useMessage } from "../../shared/ui/message";
 import controls from "../../shared/ui/Controls.module.scss";
+import { modelProviderName } from "../../shared/utils/modelProvider";
 import styles from "./CommitSettingsCard.module.scss";
 
 function errorText(cause: unknown) {
@@ -13,20 +17,50 @@ function errorText(cause: unknown) {
 }
 
 export function CommitSettingsCard() {
-  const { models } = useAppStore();
+  const { models, plugins } = useAppStore();
+  const { locale } = useI18n();
   const message = useMessage();
   const [view, setView] = useState<CommitSettingsView | null>(null);
+  const [disabledModels, setDisabledModels] = useState(getDisabledPluginModelIds);
+  useEffect(() => {
+    const update = () => setDisabledModels(getDisabledPluginModelIds());
+    window.addEventListener("cursor_plugin_models_changed", update);
+    return () => window.removeEventListener("cursor_plugin_models_changed", update);
+  }, []);
+  const [modelDraft, setModelDraft] = useState("");
+  const [editing, setEditing] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
   const [promptDraft, setPromptDraft] = useState("");
   const [savingPrompt, setSavingPrompt] = useState(false);
 
   useEffect(() => {
-    void api.commitSettings().then(setView).catch((cause) => message(errorText(cause)));
-  }, [message]);
+    let active = true;
+    void (async () => {
+      try {
+        let loaded = await api.commitSettings(locale);
+        if (!loaded.prompt.trim() && loaded.prompt_locale !== locale) {
+          loaded = await api.setCommitSettings({
+            model_id: loaded.model_id,
+            prompt: "",
+            prompt_locale: locale,
+          });
+        }
+        if (active) {
+          setView(loaded);
+          setModelDraft(loaded.model_id);
+        }
+      } catch (cause) {
+        if (active) message(errorText(cause));
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [locale, message]);
 
   const modelOptions = useMemo(() => {
-    const options: Array<{ value: string; label: string }> = [{ value: "", label: t("直连") }];
+    const options: ModelSelectOption[] = [{ value: "", label: t("直连"), group: "Cursor" }];
     const seen = new Set<string>();
     for (const model of models) {
       seen.add(model.model_hash);
@@ -35,41 +69,73 @@ export function CommitSettingsCard() {
         label: model.display_name && model.display_name !== model.model_id
           ? `${model.display_name}（${model.model_id}）`
           : model.display_name || model.model_id,
+        group: modelProviderName(model),
+        icon: model.type === "anthropic" ? claudeIcon : openAiIcon,
       });
     }
+    for (const plugin of plugins) {
+      for (const provider of plugin.providers) {
+        if (!provider.configured) continue;
+        const group = pluginText(provider.displayName, locale) || plugin.name;
+        for (const model of provider.models.filter((model) => !disabledModels.has(model.id))) {
+          seen.add(model.id);
+          options.push({
+            value: model.id,
+            label: model.displayName,
+            group,
+            iconSrc: model.icon || undefined,
+            icon: model.icon ? undefined : flatColorOrganizationIcon,
+          });
+        }
+      }
+    }
     if (view?.model_id && !seen.has(view.model_id)) {
-      options.push({ value: view.model_id, label: view.model_id });
+      options.push({ value: view.model_id, label: view.model_id, group: "Cursor" });
     }
     return options;
-  }, [models, view]);
-
-  const selectedModelId = view?.model_id ?? "";
+  }, [disabledModels, locale, models, plugins, view]);
 
   const persist = useCallback(
     async (modelId: string, prompt: string) => {
       if (!view) return null;
       const normalizedPrompt =
         prompt.trim() === view.default_prompt.trim() ? "" : prompt.trim();
-      return api.setCommitSettings({ model_id: modelId, prompt: normalizedPrompt });
+      return api.setCommitSettings({
+        model_id: modelId,
+        prompt: normalizedPrompt,
+        prompt_locale: locale,
+      });
     },
-    [view],
+    [view, locale],
   );
 
-  const changeModel = useCallback(
-    async (modelId: string) => {
-      if (!view) return;
-      setSavingModel(true);
-      try {
-        const saved = await persist(modelId, view.prompt);
-        if (saved) setView(saved);
-      } catch (cause) {
-        message(errorText(cause));
-      } finally {
-        setSavingModel(false);
+  const editModel = useCallback(() => {
+    if (!view) return;
+    setModelDraft(view.model_id);
+    setEditing(true);
+  }, [view]);
+
+  const cancelModelEdit = useCallback(() => {
+    setModelDraft(view?.model_id ?? "");
+    setEditing(false);
+  }, [view]);
+
+  const saveModel = useCallback(async () => {
+    if (!view) return;
+    setSavingModel(true);
+    try {
+      const saved = await persist(modelDraft, view.prompt);
+      if (saved) {
+        setView(saved);
+        setModelDraft(saved.model_id);
+        setEditing(false);
       }
-    },
-    [view, persist, message],
-  );
+    } catch (cause) {
+      message(errorText(cause));
+    } finally {
+      setSavingModel(false);
+    }
+  }, [modelDraft, view, persist, message]);
 
   const openPrompt = useCallback(() => {
     if (!view) return;
@@ -97,29 +163,45 @@ export function CommitSettingsCard() {
     setPromptDraft(view.default_prompt);
   }, [view]);
 
+  const selectedModelLabel = modelOptions.find((option) => option.value === view?.model_id)?.label
+    ?? view?.model_id
+    ?? t("加载中…");
+  const action = editing ? (
+    <div className={styles.actionGroup}>
+      <Button size="small" disabled={savingModel} onClick={cancelModelEdit}>{t("取消")}</Button>
+      <Button variant="primary" size="small" disabled={savingModel} onClick={() => void saveModel()}>
+        {savingModel ? t("保存中…") : t("保存")}
+      </Button>
+    </div>
+  ) : (
+    <div className={styles.actionGroup}>
+      <button type="button" className={styles.textButton} disabled={!view} onClick={openPrompt}>
+        {t("提示词设置")}
+      </button>
+      <button type="button" className={styles.textButton} disabled={!view} onClick={editModel}>
+        {t("编辑")}
+      </button>
+    </div>
+  );
+
   return (
     <>
-      <TitledCard
-        title={t("Commit 设置")}
-        action={
-          <button type="button" className={styles.textButton} disabled={!view} onClick={openPrompt}>
-            {t("提示词设置")}
-          </button>
-        }
-      >
-        <div className={styles.row}>
-          <div>
-            <strong>{t("生成模型")}</strong>
-            <small>{t("直连走 Cursor 原有通道；选择 Cursor 页已配置的模型后由本地生成。")}</small>
-          </div>
-          <div className={styles.select}>
-            <Select
-              value={selectedModelId}
-              options={modelOptions}
-              disabled={!view || savingModel}
-              ariaLabel={t("生成模型")}
-              onChange={(value) => void changeModel(value)}
-            />
+      <TitledCard title={t("Commit 提交代码模型设置")} action={action}>
+        <div className={styles.content}>
+          <div className={styles.row}>
+            <div className={styles.details}>
+              <strong>{t("生成模型")}</strong>
+            </div>
+            {editing ? <div className={styles.select}>
+              <ModelSelect
+                mode="single"
+                value={modelDraft}
+                options={modelOptions}
+                disabled={savingModel}
+                label={t("生成模型")}
+                onChange={setModelDraft}
+              />
+            </div> : <span className={styles.value}>{selectedModelLabel}</span>}
           </div>
         </div>
       </TitledCard>

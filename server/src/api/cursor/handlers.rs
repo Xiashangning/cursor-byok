@@ -20,7 +20,8 @@ use crate::{
             proto::{agent::v1 as agent, aiserver::v1 as ai},
         },
         services::{
-            account, analytics, commit_message, knowledge, model_catalog, server_config, tab,
+            account, analytics, commit_message, compatibility, entitlement::FreeEntitlementCache,
+            knowledge, model_catalog, server_config, tab,
         },
         transport::{TransportParent, TransportRegistry},
     },
@@ -42,10 +43,27 @@ fn router_with_proxy(
     knowledge_service: knowledge::KnowledgeService,
 ) -> Router {
     let web_cache = registry.web_cache().router();
+    let free_entitlements = FreeEntitlementCache::default();
     Router::new()
         .route("/__byok-api__/healthz", get(health))
         .route("/agent.v1.AgentService/RunSSE", post(run_sse_handler))
         .route("/aiserver.v1.BidiService/BidiAppend", post(bidi_handler))
+        .route(
+            "/aiserver.v1.AiService/AvailableDocs",
+            post(compatibility::available_docs),
+        )
+        .route(
+            "/aiserver.v1.DashboardService/GetEffectiveUserPlugins",
+            post(compatibility::effective_user_plugins),
+        )
+        .route(
+            "/aiserver.v1.DashboardService/GetUserPrivacyMode",
+            post(compatibility::user_privacy_mode),
+        )
+        .route(
+            "/agent.v1.AgentService/UpdateConversationMetadata",
+            post(compatibility::update_conversation_metadata),
+        )
         .route(
             "/aiserver.v1.AiService/GetServerConfig",
             post(server_config::get),
@@ -94,6 +112,10 @@ fn router_with_proxy(
             "/aiserver.v1.AuthService/GetEmail",
             post(account::get_email),
         )
+        .route(
+            "/aiserver.v1.AuthService/GetUserMeta",
+            post(account::get_user_meta),
+        )
         .route("/aiserver.v1.DashboardService/GetMe", post(account::get_me))
         .route(
             "/aiserver.v1.DashboardService/GetTeams",
@@ -132,6 +154,7 @@ fn router_with_proxy(
             post(analytics::bootstrap_statsig),
         )
         .route("/auth/full_stripe_profile", get(account::stripe_profile))
+        .route("/auth/stripe_profile", get(account::stripe_profile))
         .merge(tab::router())
         .route_layer(DefaultBodyLimit::disable())
         .route_layer(RequestDecompressionLayer::new())
@@ -139,6 +162,7 @@ fn router_with_proxy(
         .method_not_allowed_fallback(proxy::forward)
         .layer(Extension(proxy))
         .layer(Extension(knowledge_service))
+        .layer(Extension(free_entitlements))
         .with_state(registry)
         .merge(web_cache)
 }

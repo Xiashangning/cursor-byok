@@ -39,8 +39,23 @@ pub struct ResourceDefinition {
     pub add: Vec<AddMethodDefinition>,
     #[serde(default)]
     pub import: Option<ImportDefinition>,
+    #[serde(default)]
+    pub actions: Vec<ResourceActionDefinition>,
     pub can_refresh: bool,
     pub can_remove: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceActionDefinition {
+    pub id: String,
+    pub display_name: LocalizedText,
+    #[serde(default)]
+    pub description: LocalizedText,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub destructive: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,6 +67,17 @@ pub struct AddMethodDefinition {
     pub display_name: LocalizedText,
     #[serde(default)]
     pub description: LocalizedText,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback: Option<OAuthCallbackDefinition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OAuthCallbackDefinition {
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -65,6 +91,7 @@ pub struct ImportDefinition {
 }
 
 pub const OAUTH2_ADD_METHOD: &str = "oauth2.0";
+pub const OAUTH2_AUTHORIZATION_CODE_ADD_METHOD: &str = "oauth2.authorization-code";
 
 /// 桌面端看到的插件全貌。
 #[derive(Clone, Debug, Serialize)]
@@ -110,6 +137,7 @@ pub struct PluginModelDescriptor {
     pub provider_type: String,
     pub max_output_tokens: Option<u64>,
     pub images: bool,
+    pub enabled: bool,
     /// 生效的 Effort 轴:宿主默认值,可被用户覆盖整体替换。
     pub effort_options: Vec<String>,
     /// 生效的 Context 档位轴:宿主默认值,可被用户覆盖整体替换。
@@ -124,6 +152,7 @@ pub struct PluginResourceDescriptor {
     pub display_name: LocalizedText,
     pub add: Vec<AddMethodDefinition>,
     pub import: Option<ImportDefinition>,
+    pub actions: Vec<ResourceActionDefinition>,
     pub can_refresh: bool,
     pub can_remove: bool,
     pub resources: Vec<PluginResourceView>,
@@ -161,6 +190,61 @@ pub struct ResourcePresentation {
     pub description: LocalizedText,
     #[serde(default)]
     pub metrics: Vec<ResourceMetric>,
+}
+
+/// 插件资源操作返回的安全详情;patch 只在核心内部应用,不会回传给桌面端。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceActionResult {
+    pub title: LocalizedText,
+    #[serde(default)]
+    pub description: Option<LocalizedText>,
+    #[serde(default)]
+    pub cards: Vec<ResourceActionCard>,
+    #[serde(default, skip_serializing)]
+    pub patch: Option<super::state::ResourcePatch>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceActionCard {
+    pub id: String,
+    pub title: LocalizedText,
+    #[serde(default)]
+    pub status: Option<LocalizedText>,
+    #[serde(default)]
+    pub granted_at_ms: Option<i64>,
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub fields: Vec<ResourceActionField>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceActionField {
+    pub id: String,
+    pub label: LocalizedText,
+    pub value: String,
+}
+
+/// 返回给桌面端的资源操作结果,明确排除插件私有 patch。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceActionResponse {
+    pub title: LocalizedText,
+    pub description: Option<LocalizedText>,
+    pub cards: Vec<ResourceActionCard>,
+}
+
+impl From<ResourceActionResult> for ResourceActionResponse {
+    fn from(result: ResourceActionResult) -> Self {
+        Self {
+            title: result.title,
+            description: result.description,
+            cards: result.cards,
+        }
+    }
 }
 
 impl PluginResourceView {
@@ -219,6 +303,7 @@ impl PluginModelDescriptor {
             provider_type: provider.provider_type.clone(),
             max_output_tokens: model.max_output_tokens,
             images: model.images,
+            enabled: true,
             effort_options: DEFAULT_EFFORT_OPTIONS
                 .iter()
                 .map(|value| (*value).to_owned())

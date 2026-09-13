@@ -12,7 +12,9 @@ import { buildResponsesBody } from "cursor-byok:protocol/openai-responses";
 import { codexProvider, isQuotaError } from "./provider.ts";
 import {
   accountIdentity,
+  consumeResetCardAction,
   credentialDraft,
+  listResetCardsAction,
   parseCodexUsage,
   parseCredentialFiles,
   presentAccount,
@@ -134,12 +136,117 @@ Deno.test("usage maps secondary to weekly and primary to five-hour quota", () =>
       primary_window: { used_percent: 80, reset_at: 1_800_000_000 },
       secondary_window: { used_percent: 25, reset_at: 1_900_000_000 },
     },
+    rate_limit_reset_credits: { available_count: 2 },
   }, 1_700_000_000_000);
   assertEquals(quota.planLabel, "ChatGPT Plus");
   assertEquals(quota.weekly?.remainingPercent, 75);
   assertEquals(quota.fiveHour?.remainingPercent, 20);
   assertEquals(quota.weekly?.resetAtMs, 1_900_000_000_000);
+  assertEquals(quota.resetCreditsAvailable, 2);
   assertEquals(quotaState(quota, 1_700_000_000_000), { status: "ready" });
+});
+
+Deno.test("reset card action lists safe card metadata and optional expiry", async () => {
+  const result = await listResetCardsAction.run(
+    snapshot({
+      accessToken: "access-secret",
+      accountId: "acct-1",
+      refreshToken: null,
+      displayName: "person@example.com",
+      quota: null,
+    }),
+    null,
+    context({
+      fetch: (url, init) => {
+        assertEquals(url, "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits");
+        assertEquals(init?.headers?.["ChatGPT-Account-Id"], "acct-1");
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({
+            available_count: 1,
+            credits: [{
+              id: "credit-1",
+              reset_type: "codex_rate_limits",
+              status: "available",
+              granted_at: "2026-06-12T01:33:14Z",
+              expires_at: "2026-07-12T01:33:14Z",
+              title: "One free rate limit reset",
+            }],
+          }),
+        };
+      },
+    }),
+  );
+  assertEquals(result.cards, [{
+    id: "credit-1",
+    title: "One free rate limit reset",
+    status: "available",
+    grantedAtMs: Date.parse("2026-06-12T01:33:14Z"),
+    expiresAtMs: Date.parse("2026-07-12T01:33:14Z"),
+    fields: [{
+      id: "reset-type",
+      label: { "en-US": "Reset type", "zh-CN": "重置类型" },
+      value: "codex_rate_limits",
+    }],
+  }]);
+});
+
+Deno.test("reset card action consumes a selected card and refreshes quota state", async () => {
+  let requestNumber = 0;
+  const result = await consumeResetCardAction.run(
+    snapshot({
+      accessToken: "access-secret",
+      accountId: "acct-1",
+      refreshToken: null,
+      displayName: "person@example.com",
+      quota: null,
+    }),
+    { cardId: "credit-1" },
+    context({
+      fetch: (url, init) => {
+        requestNumber += 1;
+        if (requestNumber === 1 || requestNumber === 4) {
+          assertEquals(url, "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits");
+          return {
+            status: 200,
+            headers: {},
+            body: JSON.stringify(
+              requestNumber === 1
+                ? { available_count: 1, credits: [{ id: "credit-1", status: "available" }] }
+                : { available_count: 0, credits: [] },
+            ),
+          };
+        }
+        if (requestNumber === 2) {
+          assertEquals(
+            url,
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+          );
+          assertEquals(JSON.parse(init?.body ?? "{}"), {
+            credit_id: "credit-1",
+            redeem_request_id: JSON.parse(init?.body ?? "{}").redeem_request_id,
+          });
+          return { status: 200, headers: {}, body: JSON.stringify({ code: "reset" }) };
+        }
+        assertEquals(url, "https://chatgpt.com/backend-api/wham/usage");
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({ rate_limit_reset_credits: { available_count: 0 } }),
+        };
+      },
+    }),
+  );
+  assertEquals(requestNumber, 4);
+  assertEquals(result.cards, []);
+  const quota = (result.patch?.privateData as Record<string, unknown>).quota as Record<
+    string,
+    unknown
+  >;
+  assertEquals(quota.resetCreditsAvailable, 0);
+  assertEquals(quota.weekly, null);
+  assertEquals(quota.fiveHour, null);
 });
 
 Deno.test("exhausted quota projects a cooling state until the latest reset", () => {

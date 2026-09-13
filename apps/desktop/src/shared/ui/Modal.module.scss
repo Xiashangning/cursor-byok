@@ -54,6 +54,10 @@
   width: min(1080px, calc(100vw - 48px));
 }
 
+.compact {
+  width: min(560px, calc(100vw - 48px));
+}
+
 .fullHeight {
   height: calc(100vh - var(--window-header-height) - 24px);
 }

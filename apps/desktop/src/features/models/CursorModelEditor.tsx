@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import type { ModelInput, ModelType } from "../../shared/api";
 import { defaultContextOptions, defaultCustomHeadersText, defaultEffortOptions, formatTokenCount, parseTokenCount } from "../../shared/utils/modelDefaults";
 import { modelPresets, presetEndpoint, trimTrailingSlash, type ModelPreset } from "../../shared/utils/modelPresets";
@@ -5,7 +6,7 @@ import { Button } from "../../shared/ui/Button";
 import { Checkbox } from "../../shared/ui/Checkbox";
 import { FormField, SecretTextInput, TextInput } from "../../shared/ui/FormControls";
 import { JsonEditor } from "../../shared/ui/JsonEditor";
-import { Combobox, Select } from "../../shared/ui/Select";
+import { Combobox, Select, type ComboboxHandle } from "../../shared/ui/Select";
 import { Switch } from "../../shared/ui/Switch";
 import { claudeIcon, openAiIcon } from "../../shared/ui/icons";
 import { CursorPresetChips } from "./CursorPresetChips";
@@ -61,8 +62,9 @@ export function CursorModelEditor({ draft, modelOptions, discovering, onChange, 
   modelOptions: string[];
   discovering: boolean;
   onChange: (draft: CursorModelDraft) => void;
-  onDiscover: () => void;
+  onDiscover: () => Promise<boolean>;
 }) {
+  const modelCombobox = useRef<ComboboxHandle>(null);
   const setModel = (patch: Partial<ModelInput>) => onChange({ ...draft, model: { ...draft.model, ...patch } });
   const setType = (type: ModelType) => {
     // 切换协议类型时，若当前地址命中某预设的另一协议端点，自动换到该预设对应协议的端点，
@@ -95,6 +97,9 @@ export function CursorModelEditor({ draft, modelOptions, discovering, onChange, 
     .filter((preset) => trimTrailingSlash(presetEndpoint(preset, draft.model.type).baseUrl) === trimTrailingSlash(draft.model.base_url.trim()))
     .flatMap((preset) => preset.models.map((item) => item.model_id));
   const combinedOptions = [...new Set([...modelOptions, ...presetModelOptions])];
+  const discoverModels = async () => {
+    if (await onDiscover()) modelCombobox.current?.openAll();
+  };
   const applyPreset = (preset: ModelPreset) => {
     const endpoint = presetEndpoint(preset, draft.model.type);
     const first = preset.models[0];
@@ -161,7 +166,7 @@ export function CursorModelEditor({ draft, modelOptions, discovering, onChange, 
       </div>
       <FormField label="API Key" hint={t("访问模型服务所需的密钥。")}> <SecretTextInput placeholder="sk-xxxxxx" autoComplete="off" value={draft.model.api_key} onChange={(event) => setModel({ api_key: event.target.value })} /></FormField>
 
-      <FormField label={t("模型名称")} hint={t("可以直接输入模型标识，也可以读取接口返回的模型列表。")}> <Combobox value={draft.model.model_id} options={combinedOptions} placeholder="gpt-5" append={<Button className={styles.discoverButton} disabled={discovering || !canDiscover} onClick={onDiscover}>{discovering ? t("获取中…") : t("获取模型")}</Button>} onChange={(model_id) => setModel({ model_id, display_name: draft.model.display_name || model_id })} /></FormField>
+      <FormField label={t("模型名称")} hint={t("可以直接输入模型标识，也可以读取接口返回的模型列表。")}><Combobox ref={modelCombobox} value={draft.model.model_id} options={combinedOptions} placeholder="gpt-5" append={<Button className={styles.discoverButton} disabled={discovering || !canDiscover} onClick={() => void discoverModels()}>{discovering ? t("获取中…") : t("获取模型")}</Button>} onChange={(model_id) => setModel({ model_id, display_name: draft.model.display_name || model_id })} /></FormField>
       <FormField label={t("显示名称")} hint={t("仅用于界面展示，不会改变发送给模型服务的模型名称。")}> <TextInput placeholder={t("例如：主力模型")} value={draft.model.display_name} onChange={(event) => setModel({ display_name: event.target.value })} /></FormField>
       <FormField className={styles.fullWidth} label={t("备注")} hint={t("显示在 Cursor 模型说明中。")}> <TextInput placeholder={t("请输入模型备注")} value={draft.model.tooltip_data} onChange={(event) => setModel({ tooltip_data: event.target.value })} /></FormField>
 

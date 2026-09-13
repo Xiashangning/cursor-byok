@@ -1,16 +1,16 @@
 @use "../../styles/typography" as type;
 
+.content {
+  padding: 16px;
+}
+
 .row {
+  min-width: 0;
+  min-height: 34px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-  padding: 16px;
-
-  > div:first-child {
-    display: grid;
-    gap: 5px;
-  }
 
   small {
     color: var(--vscode-descriptionForeground);
@@ -18,8 +18,27 @@
   }
 }
 
+.details {
+  display: grid;
+  gap: 5px;
+}
+
 .select {
-  min-width: 280px;
+  width: min(320px, 50%);
+}
+
+.value {
+  min-width: 0;
+  max-width: 70%;
+  color: var(--vscode-descriptionForeground);
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.actionGroup {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .textButton {
@@ -50,4 +69,8 @@
   &:focus {
     outline: 1px solid var(--vscode-focusBorder);
   }
+}
+
+@media (max-width: 680px) {
+  .select { width: 68%; }
 }

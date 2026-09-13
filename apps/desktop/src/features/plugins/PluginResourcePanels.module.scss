@@ -698,6 +698,43 @@
   }
 }
 
+.actionBody {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.actionDescription {
+  color: var(--vscode-descriptionForeground);
+  font-size: type.$font-size-xs;
+}
+
+.actionCardList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.actionCard {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+}
+
+.actionCardMain {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  span {
+    color: var(--vscode-descriptionForeground);
+    font-size: type.$font-size-xs;
+  }
+}
+
 .ready {
   color: var(--vscode-testing-iconPassed, #73c991) !important;
 }

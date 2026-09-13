@@ -4,7 +4,7 @@ import Sortable from "sortablejs";
 import type { Model, PluginModelDescriptor } from "../../shared/api";
 import { Card } from "../../shared/ui/Card";
 import { Icon } from "../../shared/ui/Icon";
-import { chevronDownIcon, chevronRightIcon, claudeIcon, dragIcon, flatColorOrganizationIcon, openAiIcon } from "../../shared/ui/icons";
+import { chevronDownIcon, chevronRightIcon, claudeIcon, dragIcon, editIcon, flatColorOrganizationIcon, openAiIcon } from "../../shared/ui/icons";
 import { TruncatedButton } from "../../shared/ui/TruncatedButton";
 import { CursorModelTestResult, type CursorModelTestState } from "./CursorModelTestResult";
 import styles from "./CursorSettings.module.scss";
@@ -61,6 +61,7 @@ export function CursorModelCards(props: CursorModelCardsProps) {
         key={group.key}
         label={group.label}
         icon={group.icon}
+        defaultOpen={false}
         onSettings={props.grouping === "provider" ? () => props.onGroupSettings(group) : undefined}
       >
         {group.models.map((model) => <ModelListRow
@@ -79,9 +80,10 @@ export function CursorModelCards(props: CursorModelCardsProps) {
   return <div className={styles.modelGroups}>
     {builtins}
     {pluginGroups(props.pluginModels).map((group) => <CollapsibleGroup
-      key={group.pluginId}
+      key={`${props.grouping}:${group.pluginId}`}
       label={group.pluginName}
       iconSrc={group.icon}
+      defaultOpen={props.grouping === "flat"}
     >
       {group.models.map((model) => <PluginModelRow
         key={model.id}
@@ -109,14 +111,15 @@ function pluginGroups(models: PluginModelDescriptor[]) {
   return groups;
 }
 
-function CollapsibleGroup({ label, icon, iconSrc, onSettings, children }: {
+function CollapsibleGroup({ label, icon, iconSrc, defaultOpen = true, onSettings, children }: {
   label: string;
   icon?: IconifyIcon;
   iconSrc?: string;
+  defaultOpen?: boolean;
   onSettings?: () => void;
   children: ReactNode;
 }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(defaultOpen);
   return <Card className={styles.groupCard}>
     <div className={styles.groupHeader}>
       <button
@@ -129,7 +132,10 @@ function CollapsibleGroup({ label, icon, iconSrc, onSettings, children }: {
         {iconSrc && <Icon src={iconSrc} size="1.1em" />}
         <span className={styles.groupLabel}>{label}</span>
       </button>
-      {onSettings && <button type="button" className={styles.groupSettings} onClick={onSettings}>{t("分组设置")}</button>}
+      {onSettings && <button type="button" className={styles.groupSettings} onClick={onSettings}>
+        <Icon icon={editIcon} size="1em" />
+        {t("分组设置")}
+      </button>}
       <button
         type="button"
         className={styles.groupChevron}

@@ -82,7 +82,11 @@ impl Provider for ProviderRouter {
                     let provider_type = model.provider_type();
                     let request_url = model.request_url()?;
                     model.configure(&mut routed.request.model);
-                    routed.request.model.extra_params = model.extra_params().clone();
+                    routed.request.model.extra_params =
+                        super::request_template::render_json_strings(
+                            model.extra_params(),
+                            &invocation.conversation_id,
+                        );
                     routed.request.model.model_id = model.model_id.clone();
                     let recorder = start_recorder(&store, &invocation, &model.model_hash, &model.display_name, provider_type, &request_url, &model.model_id).await?;
                     let guard = recorder.cancel_on_drop();
@@ -90,7 +94,14 @@ impl Provider for ProviderRouter {
                         kind: provider_kind(provider_type),
                         request_url,
                         api_key: model.api_key.clone(),
-                        custom_headers: if model.custom_headers_enabled { custom_headers(&model.custom_headers)? } else { reqwest::header::HeaderMap::new() },
+                        custom_headers: if model.custom_headers_enabled {
+                            custom_headers(
+                                &model.custom_headers,
+                                &invocation.conversation_id,
+                            )?
+                        } else {
+                            reqwest::header::HeaderMap::new()
+                        },
                         max_output_tokens: model.max_output_tokens(),
                         request_timeout,
                         allowed_body_fields: None,
@@ -297,8 +308,12 @@ fn root_error_message(error: &(dyn std::error::Error + 'static)) -> String {
     current.to_string()
 }
 
-fn custom_headers(value: &serde_json::Value) -> Result<reqwest::header::HeaderMap> {
-    let object = value
+fn custom_headers(
+    value: &serde_json::Value,
+    conversation_id: &str,
+) -> Result<reqwest::header::HeaderMap> {
+    let rendered = super::request_template::render_json_strings(value, conversation_id);
+    let object = rendered
         .as_object()
         .ok_or_else(|| Error::Config("custom headers must be an object".into()))?;
     let mut headers = reqwest::header::HeaderMap::new();
@@ -355,6 +370,26 @@ fn build_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renders_cursor_conversation_id_in_custom_header_values() {
+        let template = serde_json::json!({
+            "x-opencode-session-id": "{{SessionId}}",
+            "x-label": "cursor/{{SessionId}}"
+        });
+
+        let headers = custom_headers(&template, "cursor-conversation-id").unwrap();
+
+        assert_eq!(
+            headers.get("x-opencode-session-id").unwrap(),
+            "cursor-conversation-id"
+        );
+        assert_eq!(
+            headers.get("x-label").unwrap(),
+            "cursor/cursor-conversation-id"
+        );
+        assert_eq!(template["x-opencode-session-id"], "{{SessionId}}");
+    }
 
     #[tokio::test]
     async fn pending_provider_event_hits_the_idle_timeout() {

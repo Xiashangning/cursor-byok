@@ -810,6 +810,87 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn resource_actions_keep_worker_cancellation_isolated() {
+        let executable = std::path::PathBuf::from("deno");
+        if std::process::Command::new(&executable)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let entry_path = directory.path().join("main.ts");
+        std::fs::write(&entry_path, include_str!("fixtures/resource_actions.ts")).unwrap();
+        let loader =
+            super::super::definition::PluginDefinitionLoader::for_test(directory.path()).unwrap();
+        let definition = loader
+            .load(&executable, directory.path(), &entry_path)
+            .await
+            .unwrap();
+        assert_eq!(definition.resources[0].actions.len(), 2);
+        let entry = PluginEntry {
+            directory: directory.path().to_owned(), entry: entry_path,
+            manifest: serde_json::from_value(serde_json::json!({
+                "apiVersion": 1, "id": "dev.actions", "name": "Actions", "version": "1.0.0", "icon": "unused.svg", "entry": "main.ts"
+            })).unwrap(), definition, icon: String::new(),
+        };
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let id = "plugin:dev.actions/provider/model";
+        let over = crate::store::PluginModelOverride {
+            display_name: Some("Custom model".into()),
+            ..Default::default()
+        };
+        store
+            .set_plugin_model_override(id, over.clone())
+            .await
+            .unwrap();
+        store.set_plugin_model_enabled(id, false).await.unwrap();
+        let worker = PluginWorker::new(&entry, executable, loader, store.clone());
+        let params = serde_json::json!({"resourceType": "account", "actionId": "wait", "resource": {"id": "fixture", "type": "account", "key": "fixture", "privateData": {}, "state": {"status": "ready"}}});
+        let cancellation = CancellationToken::new();
+        let mut waiting = worker
+            .invoke_streaming(
+                "resource.action",
+                params.clone(),
+                cancellation.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut details = params;
+        details["actionId"] = "details".into();
+        let value = worker
+            .invoke("resource.action", details.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let result: super::super::descriptor::ResourceActionResult =
+            serde_json::from_value(value).unwrap();
+        assert!(result.patch.is_some());
+        let response = super::super::descriptor::ResourceActionResponse::from(result);
+        assert!(!serde_json::to_string(&response).unwrap().contains("token"));
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), waiting.recv())
+                .await
+                .unwrap(),
+            Some(WorkerStreamItem::Result(Err(Error::Cancelled)))
+        ));
+        assert!(worker.inner.pending.lock().await.is_empty());
+        assert!(worker.inner.host.invocations.lock().await.is_empty());
+        assert!(worker
+            .invoke("resource.action", details, CancellationToken::new())
+            .await
+            .is_ok());
+        assert_eq!(
+            store.plugin_model_overrides().await.unwrap().get(id),
+            Some(&over)
+        );
+        assert!(store.disabled_plugin_models().await.unwrap().contains(id));
+        worker.stop().await;
+    }
+
     async fn recorder(detailed: bool, call_id: &str) -> (tempfile::TempDir, Store, CallRecorder) {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::connect(&format!(

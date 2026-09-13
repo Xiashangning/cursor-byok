@@ -13,6 +13,7 @@ import { FormField, SecretTextInput, TextInput } from "../../shared/ui/FormContr
 import controls from "../../shared/ui/Controls.module.scss";
 import { Icon } from "../../shared/ui/Icon";
 import { Modal } from "../../shared/ui/Modal";
+import { Switch } from "../../shared/ui/Switch";
 import { TooltipTrigger } from "../../shared/ui/TooltipTrigger";
 import { addIcon } from "../../shared/ui/icons";
 import { useMessage } from "../../shared/ui/message";
@@ -33,6 +34,7 @@ export function CursorSettingsPage() {
   const [caCommand, setCaCommand] = useState<string | null>(null);
   const [waitingForCaRefresh, setWaitingForCaRefresh] = useState(false);
   const [deleting, setDeleting] = useState<Model | null>(null);
+  const [confirmDisableTakeover, setConfirmDisableTakeover] = useState(false);
   const [testingModelHashes, setTestingModelHashes] = useState<Set<string>>(() => new Set());
   const [modelTestResults, setModelTestResults] = useState<Map<string, CursorModelTestState>>(() => new Map());
   const [savingAndTesting, setSavingAndTesting] = useState(false);
@@ -45,6 +47,8 @@ export function CursorSettingsPage() {
   const [groupSettingsBusy, setGroupSettingsBusy] = useState(false);
   const activeModelTests = useRef(new Map<string, { testId: string; controller: AbortController; cancelling: boolean }>());
   const caReady = cursorHarness?.ca === "ready";
+  const cursorTakenOver = cursorHarness?.settings_applied ?? false;
+  const takeoverLabel = cursorTakenOver ? t("关闭接管Cursor") : t("开启接管Cursor");
   const pluginModels = configuredPluginModels(plugins);
   const testTargets = [
     ...models.map((model) => ({ model_hash: model.model_hash, display_name: model.display_name })),
@@ -87,8 +91,8 @@ export function CursorSettingsPage() {
       anthropicExtraParamsText: JSON.stringify(model.anthropic_extra_params, null, 2),
     });
   };
-  const discover = async () => {
-    if (!draft) return;
+  const discover = async (): Promise<boolean> => {
+    if (!draft) return false;
     setDiscovering(true);
     try {
       const custom_headers = parseHeaders(draft.customHeadersText);
@@ -100,8 +104,10 @@ export function CursorSettingsPage() {
         custom_headers,
       });
       setModelOptions([...new Set(result.models)]);
+      return true;
     } catch (cause) {
       message(errorText(cause));
+      return false;
     } finally {
       setDiscovering(false);
     }
@@ -138,11 +144,10 @@ export function CursorSettingsPage() {
     const active = activeModelTests.current.get(modelHash);
     if (!active || active.cancelling) return;
     active.cancelling = true;
+    active.controller.abort();
     try {
       await api.cancelModelTest(modelHash, active.testId);
-      active.controller.abort();
     } catch (cause) {
-      active.cancelling = false;
       message(t("取消测试失败：{error}", { error: errorText(cause) }), { duration: 5000 });
     }
   };
@@ -311,19 +316,46 @@ export function CursorSettingsPage() {
     : Math.max(380, activeGroups.reduce((height, group) => height + 60 + group.models.length * 56, 0) + Math.max(0, activeGroups.length - 1) * 20 + pluginSectionHeight);
 
   return <>
-    {testTargets.length > 0 && <PageActions position="left">
-      <div className={styles.groupActions} role="group" aria-label={t("操作")}>
-        <button type="button" aria-pressed={grouping === "flat"} onClick={() => setGrouping("flat")}>{t("默认平铺")}</button>
-        {canGroupByProvider && <button type="button" aria-pressed={grouping === "provider"} onClick={() => setGrouping("provider")}>{t("按供应商")}</button>}
-        {canGroupByType && <button type="button" aria-pressed={grouping === "type"} onClick={() => setGrouping("type")}>{t("按类型")}</button>}
-        <button type="button" disabled={cursorBusy || (!batchTesting && testingModelHashes.size > 0)} onClick={() => void (batchTesting ? cancelAllModelTests() : testAllModels())}>{batchTesting ? t("取消全部测试") : t("一键测试")}</button>
+    <PageActions position="left">
+      <div className={styles.takeoverActions}>
+        <span className={styles.takeoverStatus}>{cursorTakenOver ? t("已接管") : t("未接管")}</span>
+        <TooltipTrigger label={takeoverLabel}>
+          <Switch
+            checked={cursorTakenOver}
+            disabled={cursorBusy || (!cursorTakenOver && !caReady)}
+            label={takeoverLabel}
+            onChange={(enabled) => {
+              if (enabled) void appStore.setCursorEnabled(true);
+              else setConfirmDisableTakeover(true);
+            }}
+          />
+        </TooltipTrigger>
+        {testTargets.length > 0 && <div className={styles.groupActions} role="group" aria-label={t("操作")}>
+          <button type="button" aria-pressed={grouping === "flat"} onClick={() => setGrouping("flat")}>{t("默认平铺")}</button>
+          {canGroupByProvider && <button type="button" aria-pressed={grouping === "provider"} onClick={() => setGrouping("provider")}>{t("按供应商")}</button>}
+          {canGroupByType && <button type="button" aria-pressed={grouping === "type"} onClick={() => setGrouping("type")}>{t("按类型")}</button>}
+          <button type="button" disabled={cursorBusy || (!batchTesting && testingModelHashes.size > 0)} onClick={() => void (batchTesting ? cancelAllModelTests() : testAllModels())}>{batchTesting ? t("取消全部测试") : t("一键测试")}</button>
+        </div>}
       </div>
-    </PageActions>}
+    </PageActions>
     <PageActions><TooltipTrigger label={caReady ? t("添加模型") : t("请先初始化 CA")}><button className={controls.iconButton} aria-label={t("添加模型")} disabled={!caReady || cursorBusy} onClick={openNew}><Icon icon={addIcon} size="1.1em" /></button></TooltipTrigger></PageActions>
     <PageContent title="Cursor" sections={[{ key: "cursor-settings", estimatedHeight: estimatedModelHeight, content }]} />
+    <ConfirmDialog
+      open={confirmDisableTakeover}
+      title={t("关闭接管Cursor？")}
+      cancelLabel={t("取消")}
+      confirmLabel={t("关闭接管")}
+      onCancel={() => setConfirmDisableTakeover(false)}
+      onConfirm={() => {
+        setConfirmDisableTakeover(false);
+        void appStore.setCursorEnabled(false);
+      }}
+    >
+      <p>{t("关闭后将移除 Cursor 本地代理配置。如果你需要登陆官方账号，通常不需要关闭操作，推荐直接登陆你的账号即可(byok模型与官方账号的模型已支持无缝衔接)，是否继续关闭并清理代理？")}</p>
+    </ConfirmDialog>
     <Modal fullHeight open={draft !== null || pluginEditing !== null} title={editing || pluginEditing ? t("编辑模型") : t("添加模型")} banner={draft && (editorTesting || editorTestState) ? <CursorModelTestResult state={editorTestState} testing={editorTesting} /> : undefined} busy={cursorBusy || savingAndTesting || pluginSaving} onClose={() => { if (editing && editorTesting) void cancelModelTest(editing.model_hash); setDraft(null); setEditing(null); setPluginEditing(null); }} onSubmit={() => { if (draft) void save(); else pluginEditorRef.current?.save(); }} submitLabel={t("保存")} secondaryAction={draft ? <button type="button" className={controls.secondary} disabled={cursorBusy || savingAndTesting} onClick={() => void (editorTesting && editing ? cancelModelTest(editing.model_hash) : saveAndTest())}>{savingAndTesting ? t("处理中…") : editorTesting ? t("取消测试") : t("保存并测试")}</button> : undefined}>
       {draft && <>
-        <CursorModelEditor draft={draft} modelOptions={modelOptions} discovering={discovering} onChange={setDraft} onDiscover={() => void discover()} />
+        <CursorModelEditor draft={draft} modelOptions={modelOptions} discovering={discovering} onChange={setDraft} onDiscover={discover} />
       </>}
       {pluginEditing && <PluginModelEditor ref={pluginEditorRef} model={pluginEditing} busy={pluginSaving} onSave={(input) => void savePluginOverride(input)} />}
     </Modal>

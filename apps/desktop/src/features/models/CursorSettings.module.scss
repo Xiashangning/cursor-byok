@@ -5,6 +5,20 @@
   gap: 16px;
 }
 
+.takeoverActions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.takeoverStatus {
+  min-width: 39px;
+  color: var(--vscode-descriptionForeground);
+  font-size: type.$font-size-xs;
+  text-align: right;
+  white-space: nowrap;
+}
+
 .groupActions {
   display: flex;
   align-items: center;
@@ -79,6 +93,9 @@
   gap: 8px;
 }
 .groupSettings {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   padding: 4px 2px;
   color: var(--vscode-descriptionForeground);
   background: none;

@@ -218,6 +218,19 @@ impl ControlService {
             .await
     }
 
+    pub async fn plugin_resource_action(
+        &self,
+        plugin_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        action_id: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.plugins
+            .resource_action(plugin_id, resource_type, resource_id, action_id, input)
+            .await
+    }
+
     pub async fn plugin_delete_resource(
         &self,
         plugin_id: &str,
@@ -231,6 +244,18 @@ impl ControlService {
 
     pub async fn plugin_sync_models(&self, plugin_id: &str, provider_id: &str) -> Result<usize> {
         self.plugins.sync_models(plugin_id, provider_id).await
+    }
+
+    pub async fn plugin_set_model_enabled(
+        &self,
+        plugin_id: &str,
+        provider_id: &str,
+        model_id: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        self.plugins
+            .set_model_enabled(plugin_id, provider_id, model_id, enabled)
+            .await
     }
 
     pub async fn remove_plugin_configuration(&self, plugin_id: &str) -> Result<()> {

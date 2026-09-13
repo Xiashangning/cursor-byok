@@ -13,12 +13,12 @@ pub(crate) struct EditWrite {
 }
 
 pub(crate) fn path(call: &ToolCall) -> Result<String> {
-    let field = if normalized(&call.name) == "editnotebook" {
-        "target_notebook"
+    if normalized(&call.name) == "editnotebook" {
+        string(call, "target_notebook")
     } else {
-        "path"
-    };
-    string(call, field)
+        // Claude 系模型常按 Claude Code 习惯输出 file_path/filePath,做别名兼容。
+        string_any(call, &["path", "file_path", "filePath"])
+    }
 }
 
 pub(crate) fn execution_path(call: &ToolCall) -> Result<Option<String>> {
@@ -63,7 +63,10 @@ pub(crate) fn after_read(
     };
     let after = match normalized(&call.name).as_str() {
         "write" => {
-            normalize_newlines(&string(call, "contents").map_err(|error| error.to_string())?)
+            // Claude Code 习惯的 content 作为 contents 的别名兼容。
+            normalize_newlines(
+                &string_any(call, &["contents", "content"]).map_err(|error| error.to_string())?,
+            )
         }
         "strreplace" => replace_string(call, &before)?,
         "editnotebook" => edit_notebook(call, &before)?,
@@ -230,11 +233,16 @@ fn source_lines(value: &str) -> Vec<Value> {
 }
 
 fn string(call: &ToolCall, field: &str) -> Result<String> {
-    call.arguments
-        .get(field)
+    string_any(call, &[field])
+}
+
+fn string_any(call: &ToolCall, fields: &[&str]) -> Result<String> {
+    fields
+        .iter()
+        .find_map(|field| call.arguments.get(field))
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| Error::Protocol(format!("{} is missing {field}", call.name)))
+        .ok_or_else(|| Error::Protocol(format!("{} is missing {}", call.name, fields[0])))
 }
 
 fn normalized(value: &str) -> String {
@@ -247,9 +255,9 @@ fn normalized(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
 
-    use super::edit_notebook;
+    use super::{after_read, edit_notebook, path, pb};
     use crate::model::ToolCall;
 
     fn notebook_call(old_string: &str) -> ToolCall {
@@ -274,6 +282,44 @@ mod tests {
             "cells": [{"cell_type": "code", "source": ["print('hi')\n"]}],
         })
         .to_string()
+    }
+
+    #[test]
+    fn edit_aliases_preserve_canonical_values_and_match_display() {
+        let read = pb::ReadResult {
+            result: Some(pb::read_result::Result::Success(pb::ReadSuccess {
+                output: Some(pb::read_success::Output::Content("before".into())),
+                ..Default::default()
+            })),
+        };
+        for name in ["Write", "StrReplace"] {
+            for field in ["path", "file_path", "filePath"] {
+                let mut call = notebook_call("before");
+                call.name = name.into();
+                call.arguments = json!({field: "/test", "content": "after", "old_string": "before", "new_string": "after"});
+                assert_eq!(path(&call).unwrap(), "/test");
+                assert_eq!(after_read(&call, &read).unwrap().after, "after");
+                let rendered = crate::cursor::tools::codec::render_tool_call(&call, false).unwrap();
+                let Some(pb::tool_call::Tool::EditToolCall(tool)) = rendered.tool else {
+                    panic!("expected edit")
+                };
+                let args = tool.args.unwrap();
+                assert_eq!(args.path, "/test");
+                assert_eq!(args.stream_content.as_deref(), Some("after"));
+            }
+        }
+        let mut call = notebook_call("before");
+        call.name = "Write".into();
+        call.arguments =
+            json!({"path": "/primary", "file_path": "/alias", "contents": "", "content": "alias"});
+        assert_eq!(path(&call).unwrap(), "/primary");
+        assert_eq!(after_read(&call, &read).unwrap().after, "");
+        for value in [Value::Null, json!(42), json!([])] {
+            call.arguments["path"] = value.clone();
+            assert!(path(&call).is_err());
+            call.arguments["contents"] = value;
+            assert!(after_read(&call, &read).is_err());
+        }
     }
 
     #[test]

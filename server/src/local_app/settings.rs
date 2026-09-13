@@ -63,6 +63,7 @@ pub(super) fn set_managed_integration(
     proxy_url: &str,
     remote_ssh_config: &std::path::Path,
 ) {
+    settings.remove("http.noProxy");
     settings.insert(PROXY_KEYS[0].into(), Value::String(proxy_url.into()));
     settings.insert(PROXY_KEYS[1].into(), Value::String(proxy_url.into()));
     settings.insert(PROXY_KEYS[2].into(), Value::String("on".into()));
@@ -82,7 +83,8 @@ pub(super) fn clear_proxy_values(settings: &mut BTreeMap<String, Value>) {
 }
 
 pub(super) fn proxy_values_match(settings: &BTreeMap<String, Value>, proxy_url: &str) -> bool {
-    settings.get(PROXY_KEYS[0]) == Some(&Value::String(proxy_url.into()))
+    !settings.contains_key("http.noProxy")
+        && settings.get(PROXY_KEYS[0]) == Some(&Value::String(proxy_url.into()))
         && settings.get(PROXY_KEYS[1]) == Some(&Value::String(proxy_url.into()))
         && settings.get(PROXY_KEYS[2]) == Some(&Value::String("on".into()))
         && settings.get(PROXY_KEYS[3]) == Some(&Value::Bool(true))
@@ -110,4 +112,27 @@ pub fn clear_stale_proxy_settings() -> Result<()> {
         write(&settings)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enabling_removes_proxy_bypass_without_losing_remote_ssh_settings() {
+        let mut values = BTreeMap::from([
+            ("http.noProxy".into(), serde_json::json!(["api2.cursor.sh"])),
+            ("editor.fontSize".into(), serde_json::json!(14)),
+        ]);
+        let proxy = "http://127.0.0.1:31245";
+        let ssh = std::path::Path::new("/fixture/ssh-config");
+        set_managed_integration(&mut values, proxy, ssh);
+        assert!(proxy_values_match(&values, proxy));
+        assert!(!values.contains_key("http.noProxy"));
+        assert_eq!(values["editor.fontSize"], 14);
+        assert_eq!(values["remote.SSH.configFile"], "/fixture/ssh-config");
+        assert_eq!(values["remote.SSH.enableRemoteCommand"], true);
+        values.insert("http.noProxy".into(), serde_json::json!(["*"]));
+        assert!(!proxy_values_match(&values, proxy));
+    }
 }

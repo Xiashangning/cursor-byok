@@ -1,3 +1,4 @@
+import type { Locale } from "../i18n/runtime";
 import { invoke } from "@tauri-apps/api/core";
 
 export type ModelType = "openai" | "anthropic";
@@ -106,6 +107,7 @@ export interface CursorHarnessStatus {
   configured_models: number;
   enabled_models: number;
   integration: IntegrationState;
+  settings_applied: boolean;
   proxy_url: string | null;
   ca_install_command: string | null;
 }
@@ -156,6 +158,7 @@ export interface DesktopSettings {
 export interface CommitSettings {
   model_id: string;
   prompt: string;
+  prompt_locale: Locale;
 }
 
 export interface CommitSettingsView extends CommitSettings {
@@ -214,10 +217,11 @@ export interface PluginResourceView {
 }
 
 export interface PluginAddMethod {
-  type: "oauth2.0";
+  type: "oauth2.0" | "oauth2.authorization-code";
   id: string;
   displayName: PluginLocalizedText;
   description: PluginLocalizedText | null;
+  callback?: { port: number | null; path: string | null };
 }
 
 export interface PluginImportDescriptor {
@@ -227,6 +231,35 @@ export interface PluginImportDescriptor {
   multiple: boolean;
 }
 
+export interface PluginResourceAction {
+  id: string;
+  displayName: PluginLocalizedText;
+  description: PluginLocalizedText | null;
+  target: "resource" | "card";
+  destructive: boolean;
+}
+
+export interface PluginResourceActionField {
+  id: string;
+  label: PluginLocalizedText;
+  value: string;
+}
+
+export interface PluginResourceActionCard {
+  id: string;
+  title: PluginLocalizedText;
+  status: PluginLocalizedText | null;
+  grantedAtMs: number | null;
+  expiresAtMs: number | null;
+  fields: PluginResourceActionField[];
+}
+
+export interface PluginResourceActionResult {
+  title: PluginLocalizedText;
+  description: PluginLocalizedText | null;
+  cards: PluginResourceActionCard[];
+}
+
 export interface PluginResourceDescriptor {
   type: string;
   displayName: PluginLocalizedText;
@@ -234,6 +267,7 @@ export interface PluginResourceDescriptor {
   import: PluginImportDescriptor | null;
   canRefresh: boolean;
   canRemove: boolean;
+  actions: PluginResourceAction[];
   resources: PluginResourceView[];
 }
 
@@ -251,6 +285,7 @@ export interface PluginModelDescriptor {
   effortOptions: string[];
   contextOptions: string[];
   images: boolean;
+  enabled: boolean;
 }
 
 export interface PluginModelOverrideInput {
@@ -286,7 +321,7 @@ export interface PluginDescriptor {
 
 export interface PluginOAuthBegin {
   sessionId: string;
-  userCode: string;
+  userCode: string | null;
   verificationUrl: string;
   verificationUrlComplete: string | null;
   expiresAtMs: number;
@@ -392,13 +427,6 @@ export function configuredPluginModels(plugins: PluginDescriptor[]): PluginModel
       provider.configured ? provider.models.filter((m) => !disabled.has(m.id)) : []
     )
   );
-}
-
-export function configuredModels(models: Model[], plugins: PluginDescriptor[]): ConfiguredModel[] {
-  return [
-    ...models.map((model): ConfiguredModel => ({ kind: "builtin", id: model.model_hash, name: model.display_name, builtin: model })),
-    ...configuredPluginModels(plugins).map((model): ConfiguredModel => ({ kind: "plugin", id: model.id, name: model.displayName, plugin: model })),
-  ];
 }
 
 export interface OverviewMetrics {
@@ -562,9 +590,11 @@ export const api = {
   pluginOAuthPoll: (sessionId: string, signal?: AbortSignal) => request<PluginOAuthPoll>(`/plugins/oauth/${encodeURIComponent(sessionId)}/poll`, { method: "POST", signal }),
   importPluginResources: (pluginId: string, resourceType: string, files: PluginImportFile[]) => request<PluginImportResult>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/import`, { method: "POST", body: JSON.stringify(files) }),
   refreshPluginResource: (pluginId: string, resourceType: string, resourceId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}/refresh`, { method: "POST" }),
+  pluginResourceAction: (pluginId: string, resourceType: string, resourceId: string, actionId: string, input: unknown = {}) => request<PluginResourceActionResult>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}/actions/${encodeURIComponent(actionId)}`, { method: "POST", body: JSON.stringify(input) }),
   deletePluginResource: (pluginId: string, resourceType: string, resourceId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}`, { method: "DELETE" }),
   syncPluginModels: (pluginId: string, providerId: string) => request<{ models: number }>(`/plugins/${encodeURIComponent(pluginId)}/providers/${encodeURIComponent(providerId)}/models/sync`, { method: "POST" }),
   setPluginModelOverride: (input: PluginModelOverrideInput) => request<void>("/plugins/model-overrides", { method: "PUT", body: JSON.stringify(input) }),
+  setPluginModelEnabled: (pluginId: string, providerId: string, modelId: string, enabled: boolean) => request<void>(`/plugins/${encodeURIComponent(pluginId)}/providers/${encodeURIComponent(providerId)}/models/enabled`, { method: "PUT", body: JSON.stringify({ modelId, enabled }) }),
   pluginResourceExportUrl: (servicePort: number, pluginId: string, resourceType: string) => `http://127.0.0.1:${servicePort}${API_ROOT}/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/export`,
   removePluginConfiguration: (pluginId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}`, { method: "DELETE" }),
   pluginRuntime: () => request<PluginRuntimeStatus>("/plugins/runtime"),
@@ -600,6 +630,6 @@ export const api = {
   setTabSettings: (settings: TabSettings) => request<TabSettings>("/settings/tab", { method: "PUT", body: JSON.stringify(settings) }),
   desktopSettings: () => request<DesktopSettings>("/settings/desktop"),
   setDesktopSettings: (settings: DesktopSettings) => request<DesktopSettings>("/settings/desktop", { method: "PUT", body: JSON.stringify(settings) }),
-  commitSettings: () => request<CommitSettingsView>("/settings/commit"),
+  commitSettings: (locale: Locale) => request<CommitSettingsView>("/settings/commit", { headers: { "accept-language": locale } }),
   setCommitSettings: (settings: CommitSettings) => request<CommitSettingsView>("/settings/commit", { method: "PUT", body: JSON.stringify(settings) }),
 };

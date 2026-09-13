@@ -75,6 +75,24 @@
   }
 }
 
+.menuStatusTag {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 1px 5px;
+  color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--vscode-descriptionForeground) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--vscode-descriptionForeground) 28%, transparent);
+  border-radius: 999px;
+  font-size: type.$font-size-2xs;
+  line-height: 1.4;
+
+  &[data-taken] {
+    color: var(--vscode-testing-iconPassed, #73c991);
+    background: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 10%, transparent);
+    border-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 28%, transparent);
+  }
+}
+
 .menuIndicatorDot {
   width: 7px;
   height: 7px;

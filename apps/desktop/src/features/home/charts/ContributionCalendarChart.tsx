@@ -2,7 +2,7 @@ import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { init, Rect, type ElementEvent } from "zrender";
 import type { Locale } from "../../../i18n/runtime";
 import { useI18n } from "../../../i18n/store";
-import { Tooltip, type TooltipAnchor } from "../../../shared/ui/Tooltip";
+import { useTooltip, type TooltipAnchor } from "../../../shared/ui/Tooltip";
 import styles from "./ContributionCalendarChart.module.scss";
 
 export type ContributionDay = {
@@ -26,12 +26,6 @@ type CellExtra = CalendarCell & {
   y: number;
   width: number;
   height: number;
-};
-
-type TooltipState = {
-  date: string;
-  tokens: number;
-  anchor: TooltipAnchor;
 };
 
 type AxisLabel = {
@@ -101,7 +95,7 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
   const canvasRef = useRef<HTMLDivElement>(null);
   const layoutRef = useRef<ReturnType<typeof buildCalendarLayout>>(null);
   const scheduleDrawRef = useRef<() => void>(() => undefined);
-  const [tooltip, setTooltip] = useState<TooltipState | null>(null);
+  const { show: showTooltip, hide: hideTooltip } = useTooltip();
   const [axisLabels, setAxisLabels] = useState<AxisLabel[]>([]);
   const layout = useMemo(() => buildCalendarLayout(data, locale), [data, locale]);
   const tokenFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale]);
@@ -129,10 +123,13 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
           return new DOMRect(bounds.left + extra.x, bounds.top + extra.y, extra.width, extra.height);
         },
       };
-      setTooltip({ date: extra.date, tokens: extra.tokens, anchor });
+      showTooltip(anchor, undefined, <div className={styles.tooltipContent}>
+        <strong>{extra.date}</strong>
+        <span>{t("Token 用量：{tokens}", { tokens: tokenFormatter.format(extra.tokens) })}</span>
+      </div>);
     };
     const handleMouseOut = (event: ElementEvent) => {
-      if (isCellExtra(event.target?.extra)) setTooltip(null);
+      if (isCellExtra(event.target?.extra)) hideTooltip();
     };
 
     chart.on("mouseover", handleMouseOver);
@@ -226,7 +223,7 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
         cellRects.set(cell.date, rect);
         chart.add(rect);
       }
-      setTooltip(null);
+      hideTooltip();
     };
     const scheduleDraw = () => {
       window.cancelAnimationFrame(drawFrame);
@@ -264,12 +261,6 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
           {axisLabels.map((label) => <span key={label.key} style={{ left: label.left }}>{label.text}</span>)}
         </div>
       </div>
-      <Tooltip anchor={tooltip?.anchor ?? null}>
-        <div className={styles.tooltipContent}>
-          <strong>{tooltip?.date}</strong>
-          <span>{t("Token 用量：{tokens}", { tokens: tokenFormatter.format(tooltip?.tokens ?? 0) })}</span>
-        </div>
-      </Tooltip>
     </section>
   );
 }

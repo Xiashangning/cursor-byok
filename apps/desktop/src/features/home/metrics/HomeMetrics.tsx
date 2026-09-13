@@ -1,7 +1,6 @@
-import { useState } from "react";
 import { formatCompactInteger, formatInteger } from "../../../shared/utils/numberFormat";
 import { Icon } from "../../../shared/ui/Icon";
-import { Tooltip, type TooltipAnchor } from "../../../shared/ui/Tooltip";
+import { useTooltip, type TooltipAnchor } from "../../../shared/ui/Tooltip";
 import { informationOutlineIcon } from "../../../shared/ui/icons";
 import { CacheHitRateChart } from "./CacheHitRateChart";
 import styles from "./HomeMetrics.module.scss";
@@ -53,22 +52,17 @@ function elementAnchor(element: HTMLElement): TooltipAnchor {
 }
 
 function InfoTooltip({ content }: { content: string }) {
-  const [anchor, setAnchor] = useState<TooltipAnchor | null>(null);
+  const { show, hide } = useTooltip();
 
-  return <>
-    <button
-      type="button"
-      className={styles.info}
-      aria-label={t("查看说明")}
-      onMouseEnter={(event) => setAnchor(elementAnchor(event.currentTarget))}
-      onMouseLeave={() => setAnchor(null)}
-      onFocus={(event) => setAnchor(elementAnchor(event.currentTarget))}
-      onBlur={() => setAnchor(null)}
-    ><Icon icon={informationOutlineIcon} size="1.1em" /></button>
-    <Tooltip anchor={anchor}>
-      <div className={styles.tooltipText}>{content}</div>
-    </Tooltip>
-  </>;
+  return <button
+    type="button"
+    className={styles.info}
+    aria-label={t("查看说明")}
+    onMouseEnter={(event) => show(elementAnchor(event.currentTarget), undefined, <div className={styles.tooltipText}>{content}</div>)}
+    onMouseLeave={hide}
+    onFocus={(event) => show(elementAnchor(event.currentTarget), undefined, <div className={styles.tooltipText}>{content}</div>)}
+    onBlur={hide}
+  ><Icon icon={informationOutlineIcon} size="1.1em" /></button>;
 }
 
 export function HomeMetrics({ data, refreshVersion = 0 }: { data: HomeMetricsData; refreshVersion?: number }) {

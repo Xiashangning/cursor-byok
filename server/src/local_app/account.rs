@@ -52,13 +52,14 @@ async fn ensure_local_account_at(path: &Path) -> Result<()> {
     .execute(&mut connection)
     .await?;
 
+    let token = local_token()?;
     let account = sqlx::query("SELECT CAST(value AS TEXT) AS value FROM ItemTable WHERE key = ?")
         .bind("cursorAuth/accessToken")
         .fetch_optional(&mut connection)
         .await?;
     let has_access_token = account.is_some_and(|row| {
         row.try_get::<String, _>("value")
-            .is_ok_and(|value| !value.trim().is_empty())
+            .is_ok_and(|value| !value.trim().is_empty() && value != token)
     });
 
     let mut transaction = connection.begin().await?;
@@ -69,6 +70,7 @@ async fn ensure_local_account_at(path: &Path) -> Result<()> {
             ("cursorAuth/refreshToken", token.as_str()),
             ("cursorAuth/cachedEmail", EMAIL),
             ("cursorAuth/cachedSignUpType", SIGN_UP_TYPE),
+            ("cursorAuth/stripeMembershipAuthId", SUBJECT),
         ];
         for (key, value) in values {
             sqlx::query("INSERT OR REPLACE INTO ItemTable(key, value) VALUES(?, ?)")
@@ -100,7 +102,13 @@ async fn ensure_local_account_at(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn local_token() -> Result<String> {
+pub(crate) fn is_local_cursor_authorization(authorization: &str) -> bool {
+    authorization
+        .strip_prefix("Bearer ")
+        .is_some_and(|token| local_token().is_ok_and(|local| local == token))
+}
+
+pub(super) fn local_token() -> Result<String> {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({
         "sub": SUBJECT,
@@ -115,6 +123,57 @@ fn local_token() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_injected_identity_is_a_local_authorization() {
+        let token = local_token().unwrap();
+        assert!(is_local_cursor_authorization(&format!("Bearer {token}")));
+        assert!(!is_local_cursor_authorization(&token));
+        assert!(!is_local_cursor_authorization("Bearer real-account-token"));
+        assert!(!is_local_cursor_authorization("Bearer "));
+    }
+
+    #[tokio::test]
+    async fn reinjection_repairs_local_identity_without_replacing_real_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.vscdb");
+        ensure_local_account_at(&path).await.unwrap();
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("DELETE FROM ItemTable WHERE key = 'cursorAuth/stripeMembershipAuthId'")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        ensure_local_account_at(&path).await.unwrap();
+        let id: String = sqlx::query_scalar("SELECT CAST(value AS TEXT) FROM ItemTable WHERE key = 'cursorAuth/stripeMembershipAuthId'").fetch_one(&mut connection).await.unwrap();
+        assert_eq!(id, SUBJECT);
+        for (key, value) in [
+            ("cursorAuth/accessToken", "real-token"),
+            ("cursorAuth/cachedEmail", "real@example.com"),
+            ("cursorAuth/stripeMembershipAuthId", "real-user"),
+        ] {
+            sqlx::query("UPDATE ItemTable SET value = ? WHERE key = ?")
+                .bind(value)
+                .bind(key)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        ensure_local_account_at(&path).await.unwrap();
+        for (key, expected) in [
+            ("cursorAuth/accessToken", "real-token"),
+            ("cursorAuth/cachedEmail", "real@example.com"),
+            ("cursorAuth/stripeMembershipAuthId", "real-user"),
+        ] {
+            let value: String =
+                sqlx::query_scalar("SELECT CAST(value AS TEXT) FROM ItemTable WHERE key = ?")
+                    .bind(key)
+                    .fetch_one(&mut connection)
+                    .await
+                    .unwrap();
+            assert_eq!(value, expected);
+        }
+    }
 
     #[tokio::test]
     async fn injects_the_local_account_only_when_missing() {

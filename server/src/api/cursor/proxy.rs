@@ -46,6 +46,11 @@ impl BufferedResponse {
 }
 
 impl CursorProxy {
+    #[cfg(test)]
+    pub(crate) fn for_test(clients: crate::network::NetworkClients, upstream: String) -> Self {
+        Self { clients, upstream }
+    }
+
     pub fn cursor(clients: crate::network::NetworkClients) -> Self {
         Self {
             clients,

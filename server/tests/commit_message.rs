@@ -19,7 +19,7 @@ use cursor_server::{
     model::{ContentPart, ModelConfigInput, ModelType, ProjectedContent, OPENAI_CHAT_ENDPOINT},
     network::NetworkClients,
     provider::{FinishReason, ModelEvent},
-    store::{CommitSettings, DEFAULT_COMMIT_PROMPT},
+    store::{CommitPromptLocale, CommitSettings, DEFAULT_COMMIT_PROMPT_ZH_CN},
 };
 use tower::ServiceExt;
 
@@ -94,6 +94,7 @@ async fn commit_message_is_generated_through_configured_model() {
         .set_commit_settings(CommitSettings {
             model_id: created.model_hash.clone(),
             prompt: String::new(),
+            prompt_locale: CommitPromptLocale::ZhCn,
         })
         .await
         .unwrap();
@@ -117,7 +118,7 @@ async fn commit_message_is_generated_through_configured_model() {
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].prompt.instructions,
-        DEFAULT_COMMIT_PROMPT.trim()
+        DEFAULT_COMMIT_PROMPT_ZH_CN.trim()
     );
     let ProjectedContent::Parts(parts) = &requests[0].history[0].content else {
         panic!("expected user text parts");
@@ -140,6 +141,7 @@ async fn custom_prompt_and_model_from_commit_settings_are_used() {
         .set_commit_settings(CommitSettings {
             model_id: created.model_hash,
             prompt: "自定义提交提示词".into(),
+            prompt_locale: CommitPromptLocale::ZhCn,
         })
         .await
         .unwrap();
@@ -173,6 +175,7 @@ async fn empty_diffs_are_rejected_when_generating() {
         .set_commit_settings(CommitSettings {
             model_id: created.model_hash,
             prompt: String::new(),
+            prompt_locale: CommitPromptLocale::ZhCn,
         })
         .await
         .unwrap();
@@ -198,6 +201,7 @@ async fn tool_call_events_are_rejected() {
         .set_commit_settings(CommitSettings {
             model_id: created.model_hash,
             prompt: String::new(),
+            prompt_locale: CommitPromptLocale::ZhCn,
         })
         .await
         .unwrap();
@@ -224,6 +228,7 @@ async fn unconfigured_model_is_rejected() {
         .set_commit_settings(CommitSettings {
             model_id: "missing-hash".into(),
             prompt: String::new(),
+            prompt_locale: CommitPromptLocale::ZhCn,
         })
         .await
         .unwrap();

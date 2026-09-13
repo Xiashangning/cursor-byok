@@ -1,5 +1,8 @@
 import type { JsonValue, PluginContext } from "cursor-byok:plugin";
 import type {
+  ResourceAction,
+  ResourceActionCard,
+  ResourceActionResult,
   ResourceDraft,
   ResourceImportFile,
   ResourceImportResult,
@@ -14,7 +17,12 @@ import type {
 export const RESOURCE_TYPE = "chatgpt-account";
 
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const RESET_CREDITS_CONSUME_URL = `${RESET_CREDITS_URL}/consume`;
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
+
+export const LIST_RESET_CARDS_ACTION_ID = "list-reset-cards";
+export const CONSUME_RESET_CARD_ACTION_ID = "consume-reset-card";
 
 export type QuotaWindow = {
   usedPercent: number | null;
@@ -26,6 +34,7 @@ export type AccountQuota = {
   planLabel: string | null;
   weekly: QuotaWindow | null;
   fiveHour: QuotaWindow | null;
+  resetCreditsAvailable: number | null;
   limitReached: boolean;
   updatedAtMs: number;
 };
@@ -34,6 +43,7 @@ export type AccountQuota = {
 export type AccountData = {
   accessToken: string;
   refreshToken: string | null;
+  accountId: string | null;
   displayName: string;
   quota: AccountQuota | null;
 };
@@ -41,6 +51,7 @@ export type AccountData = {
 export type CredentialCandidate = {
   accessToken: string;
   refreshToken: string | null;
+  accountId?: string | null;
   displayName: string | null;
 };
 
@@ -102,9 +113,10 @@ function profileEmail(payload: Record<string, unknown> | null): string | null {
 
 export async function accountIdentity(
   accessToken: string,
+  accountId?: string | null,
 ): Promise<{ key: string; displayName: string }> {
   const payload = decodeJwtPayload(accessToken);
-  const identity = chatGptAccountId(accessToken) ??
+  const identity = accountId ?? chatGptAccountId(accessToken) ??
     claim(payload, "sub") ??
     claim(payload, "email") ??
     await tokenFingerprint(accessToken);
@@ -117,10 +129,11 @@ export async function accountIdentity(
 }
 
 export async function credentialDraft(credential: CredentialCandidate): Promise<ResourceDraft> {
-  const identity = await accountIdentity(credential.accessToken);
+  const identity = await accountIdentity(credential.accessToken, credential.accountId);
   const data: AccountData = {
     accessToken: credential.accessToken,
     refreshToken: credential.refreshToken,
+    accountId: credential.accountId ?? chatGptAccountId(credential.accessToken),
     displayName: credential.displayName ?? identity.displayName,
     quota: null,
   };
@@ -134,6 +147,7 @@ export function accountData(resource: ResourceSnapshot): AccountData {
   return {
     accessToken,
     refreshToken: text(data?.refreshToken),
+    accountId: text(data?.accountId) ?? chatGptAccountId(accessToken),
     displayName: text(data?.displayName) ?? "ChatGPT account",
     quota: (data?.quota ?? null) as AccountQuota | null,
   };
@@ -145,7 +159,7 @@ export function accountHeaders(data: AccountData): Record<string, string> {
     originator: "codex_cli_rs",
     authorization: `Bearer ${data.accessToken}`,
   };
-  const accountId = chatGptAccountId(data.accessToken);
+  const accountId = data.accountId ?? chatGptAccountId(data.accessToken);
   if (accountId) headers["ChatGPT-Account-Id"] = accountId;
   return headers;
 }
@@ -207,10 +221,17 @@ export function parseCodexUsage(body: unknown, nowMs = Date.now()): AccountQuota
     ? null
     : quotaWindow(primary, nowMs);
   const explicitLimit = rateLimit.limit_reached ?? rateLimit.limitReached;
+  const resetCredits = object(root.rate_limit_reset_credits ?? root.rateLimitResetCredits);
+  const resetCreditsAvailable = number(
+    resetCredits?.available_count ?? resetCredits?.availableCount,
+  );
   return {
     planLabel: planLabel(root.plan_type ?? root.planType),
     weekly,
     fiveHour,
+    resetCreditsAvailable: resetCreditsAvailable === null
+      ? null
+      : Math.max(0, Math.floor(resetCreditsAvailable)),
     limitReached: typeof explicitLimit === "boolean" ? explicitLimit : [weekly, fiveHour].some(
       (window) => window?.remainingPercent !== null && window?.remainingPercent === 0,
     ),
@@ -271,6 +292,7 @@ export function quotaExhaustedPatch(
       remainingPercent: 0,
       resetAtMs: resetFromError(error, nowMs),
     },
+    resetCreditsAvailable: data.quota?.resetCreditsAvailable ?? null,
     limitReached: true,
     updatedAtMs: nowMs,
   };
@@ -279,6 +301,152 @@ export function quotaExhaustedPatch(
     state: quotaState(quota, nowMs),
   };
 }
+
+async function fetchResetCredits(
+  data: AccountData,
+  context: PluginContext,
+): Promise<{ cards: ResourceActionCard[]; availableCount: number }> {
+  const accountId = data.accountId ?? chatGptAccountId(data.accessToken);
+  if (!accountId) throw new Error("ChatGPT account is missing its account ID");
+  const response = await context.network.fetch(RESET_CREDITS_URL, {
+    method: "GET",
+    headers: accountHeaders(data),
+  });
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(
+      `Codex reset card lookup failed (HTTP ${response.status}): ${response.body}`,
+    );
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(response.body);
+  } catch {
+    throw new Error("Codex reset card lookup returned invalid JSON");
+  }
+  const root = object(body) ?? {};
+  const rawCredits = Array.isArray(root.credits) ? root.credits : [];
+  const cards = rawCredits.flatMap((value, index): ResourceActionCard[] => {
+    const credit = object(value);
+    const id = text(credit?.id);
+    if (!id) return [];
+    const resetType = text(credit?.reset_type ?? credit?.resetType);
+    const grantedAt = timestampMs(credit?.granted_at ?? credit?.grantedAt);
+    const expiresAt = timestampMs(credit?.expires_at ?? credit?.expiresAt);
+    return [{
+      id,
+      title: text(credit?.title) ?? resetType ?? `Codex reset card ${index + 1}`,
+      ...(text(credit?.status) ? { status: text(credit?.status)! } : {}),
+      ...(grantedAt !== null ? { grantedAtMs: grantedAt } : {}),
+      ...(expiresAt !== null ? { expiresAtMs: expiresAt } : {}),
+      fields: resetType
+        ? [{
+          id: "reset-type",
+          label: { "en-US": "Reset type", "zh-CN": "重置类型" },
+          value: resetType,
+        }]
+        : [],
+    }];
+  });
+  const availableCount = number(root.available_count ?? root.availableCount);
+  return {
+    cards,
+    availableCount: availableCount === null
+      ? cards.filter((card) => card.status === "available").length
+      : Math.max(0, Math.floor(availableCount)),
+  };
+}
+
+function timestampMs(value: unknown): number | null {
+  const numeric = number(value);
+  if (numeric !== null) return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function actionDescription(availableCount: number): ResourceActionResult["description"] {
+  return {
+    "en-US": `${availableCount} reset card${availableCount === 1 ? "" : "s"} available`,
+    "zh-CN": `可用重置卡 ${availableCount} 张`,
+  };
+}
+
+async function listResetCards(
+  resource: ResourceSnapshot,
+  _input: JsonValue,
+  context: PluginContext,
+): Promise<ResourceActionResult> {
+  const result = await fetchResetCredits(accountData(resource), context);
+  return {
+    title: { "en-US": "Codex reset cards", "zh-CN": "Codex 重置卡" },
+    description: actionDescription(result.availableCount),
+    cards: result.cards,
+  };
+}
+
+async function consumeResetCard(
+  resource: ResourceSnapshot,
+  input: JsonValue,
+  context: PluginContext,
+): Promise<ResourceActionResult> {
+  const inputObject = object(input);
+  const creditId = text(inputObject?.creditId ?? inputObject?.cardId);
+  if (!creditId) throw new Error("A reset card ID is required");
+
+  const data = accountData(resource);
+  const available = await fetchResetCredits(data, context);
+  const card = available.cards.find((item) => item.id === creditId && item.status === "available");
+  if (!card) throw new Error("The selected reset card is not available");
+
+  const response = await context.network.fetch(RESET_CREDITS_CONSUME_URL, {
+    method: "POST",
+    headers: { ...accountHeaders(data), "content-type": "application/json" },
+    body: JSON.stringify({ credit_id: creditId, redeem_request_id: crypto.randomUUID() }),
+  });
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(
+      `Codex reset card consumption failed (HTTP ${response.status}): ${response.body}`,
+    );
+  }
+
+  const patch = await refreshAccount(resource, context);
+  const refreshedResource: ResourceSnapshot = {
+    ...resource,
+    ...(patch.privateData ? { privateData: patch.privateData } : {}),
+  };
+  const refreshed = await fetchResetCredits(accountData(refreshedResource), context);
+  return {
+    title: { "en-US": "Codex reset card used", "zh-CN": "Codex 重置卡已使用" },
+    description: actionDescription(refreshed.availableCount),
+    cards: refreshed.cards,
+    patch,
+  };
+}
+
+export const listResetCardsAction: ResourceAction = {
+  id: LIST_RESET_CARDS_ACTION_ID,
+  displayName: { "en-US": "View reset cards", "zh-CN": "查看重置卡" },
+  description: {
+    "en-US": "List available Codex reset cards.",
+    "zh-CN": "查看当前账号的 Codex 重置卡。",
+  },
+  target: "resource",
+  run: listResetCards,
+};
+
+export const consumeResetCardAction: ResourceAction = {
+  id: CONSUME_RESET_CARD_ACTION_ID,
+  displayName: { "en-US": "Use reset card", "zh-CN": "使用重置卡" },
+  description: {
+    "en-US": "Redeem one available Codex reset card.",
+    "zh-CN": "消耗一张可用的 Codex 重置卡。",
+  },
+  target: "card",
+  destructive: true,
+  run: consumeResetCard,
+};
 
 export function presentAccount(resource: ResourceSnapshot): ResourceView {
   const data = accountData(resource);
@@ -301,6 +469,15 @@ export function presentAccount(resource: ResourceSnapshot): ResourceView {
       unit: "percent",
       value: fiveHour.remainingPercent,
       ...(fiveHour.resetAtMs !== null ? { resetAtMs: fiveHour.resetAtMs } : {}),
+    });
+  }
+  const resetCreditsAvailable = data.quota?.resetCreditsAvailable;
+  if (resetCreditsAvailable !== null && resetCreditsAvailable !== undefined) {
+    metrics.push({
+      id: "reset-credits",
+      label: { "en-US": "Reset cards", "zh-CN": "重置卡" },
+      unit: "count",
+      value: resetCreditsAvailable,
     });
   }
   return {
@@ -375,12 +552,14 @@ function collectCredentials(value: unknown, output: CredentialCandidate[]): void
   if (!accessToken) return;
   const refreshToken = firstText(tokens, ["refresh_token", "refreshToken"]) ??
     firstText(item, ["refresh_token", "refreshToken"]);
+  const accountId = firstText(tokens, ["account_id", "accountId", "chatgpt_account_id"]) ??
+    firstText(item, ["account_id", "accountId", "chatgpt_account_id"]);
   const idToken = firstText(tokens, ["id_token", "idToken"]) ??
     firstText(item, ["id_token", "idToken"]);
   const displayName = firstText(item, ["email", "display_name", "displayName", "name"]) ??
     firstText(tokens, ["email", "display_name", "displayName", "name"]) ??
     jwtDisplayName(idToken);
-  output.push({ accessToken, refreshToken, displayName });
+  output.push({ accessToken, refreshToken, ...(accountId ? { accountId } : {}), displayName });
 }
 
 export function parseCredentialFiles(files: ResourceImportFile[]): {

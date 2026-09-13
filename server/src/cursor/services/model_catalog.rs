@@ -871,6 +871,7 @@ mod tests {
             provider_type: "test".into(),
             max_output_tokens: None,
             images: false,
+            enabled: true,
             effort_options: vec!["low".into(), "medium".into(), "high".into()],
             context_options: vec!["200k".into(), "1m".into()],
         });

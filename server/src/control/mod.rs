@@ -175,12 +175,20 @@ pub fn api_router(service: ControlService) -> Router {
             axum::routing::delete(plugins::delete_resource),
         )
         .route(
+            "/__byok-api__/api/plugins/{plugin_id}/resources/{resource_type}/{resource_id}/actions/{action_id}",
+            post(plugins::action),
+        )
+        .route(
             "/__byok-api__/api/plugins/{plugin_id}/resources/{resource_type}/{resource_id}/refresh",
             post(plugins::refresh_resource),
         )
         .route(
             "/__byok-api__/api/plugins/{plugin_id}/providers/{provider_id}/models/sync",
             post(plugins::sync_models),
+        )
+        .route(
+            "/__byok-api__/api/plugins/{plugin_id}/providers/{provider_id}/models/enabled",
+            put(plugins::set_model_enabled),
         )
         .route(
             "/__byok-api__/api/settings/observability",

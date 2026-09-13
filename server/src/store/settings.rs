@@ -12,12 +12,14 @@ const PROXY_SETTINGS_KEY: &str = "outbound_proxy";
 const TAB_SETTINGS_KEY: &str = "cursor_tab";
 const DESKTOP_SETTINGS_KEY: &str = "desktop_lifecycle";
 const COMMIT_SETTINGS_KEY: &str = "commit_settings";
+const CURSOR_TAKEOVER_ENABLED_KEY: &str = "cursor_takeover_enabled";
 const DISABLED_PLUGIN_MODELS_KEY: &str = "disabled_plugin_models";
 const DISABLED_PLUGIN_ACCOUNTS_KEY: &str = "disabled_plugin_accounts";
 const PLUGIN_MODEL_OVERRIDES_KEY: &str = "plugin_model_overrides";
 
-/// Embedded default system prompt for commit message generation.
-pub const DEFAULT_COMMIT_PROMPT: &str = include_str!("../../prompt/cursor/commit/prompt.md");
+/// Embedded default system prompts for commit message generation.
+pub const DEFAULT_COMMIT_PROMPT_ZH_CN: &str = include_str!("../../prompt/cursor/commit/zh-CN.md");
+pub const DEFAULT_COMMIT_PROMPT_EN_US: &str = include_str!("../../prompt/cursor/commit/en-US.md");
 
 pub const PUBLIC_TAB_SERVICE_URL: &str = "https://tab.leokun.cn";
 
@@ -87,6 +89,24 @@ impl TabSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub enum CommitPromptLocale {
+    #[default]
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    #[serde(rename = "en-US")]
+    EnUs,
+}
+
+impl CommitPromptLocale {
+    pub fn default_prompt(self) -> &'static str {
+        match self {
+            Self::ZhCn => DEFAULT_COMMIT_PROMPT_ZH_CN.trim(),
+            Self::EnUs => DEFAULT_COMMIT_PROMPT_EN_US.trim(),
+        }
+    }
+}
+
 /// User preferences for Git commit message generation.
 ///
 /// Empty `model_id` means 直连: forward the original Cursor RPC unchanged.
@@ -98,6 +118,8 @@ pub struct CommitSettings {
     pub model_id: String,
     #[serde(default)]
     pub prompt: String,
+    #[serde(default)]
+    pub prompt_locale: CommitPromptLocale,
 }
 
 impl CommitSettings {
@@ -108,7 +130,7 @@ impl CommitSettings {
     pub fn effective_prompt(&self) -> &str {
         let trimmed = self.prompt.trim();
         if trimmed.is_empty() {
-            DEFAULT_COMMIT_PROMPT.trim()
+            self.prompt_locale.default_prompt()
         } else {
             trimmed
         }
@@ -200,6 +222,49 @@ fn read_proxy_settings(value: &str) -> ProxySettingsSecret {
 }
 
 impl Store {
+    pub(crate) async fn set_plugin_model_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let _write = self.writes.lock().await;
+        let mut disabled = self.disabled_plugin_models().await?;
+        if enabled {
+            disabled.remove(id);
+        } else {
+            disabled.insert(id.to_owned());
+        }
+        sqlx::query(
+            "INSERT INTO service_settings(setting_key, value_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(DISABLED_PLUGIN_MODELS_KEY)
+        .bind(serde_json::to_string(&disabled)?)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn cursor_takeover_enabled(&self) -> Result<bool> {
+        let value = sqlx::query_scalar::<_, String>(
+            "SELECT value_json FROM service_settings WHERE setting_key = ?",
+        )
+        .bind(CURSOR_TAKEOVER_ENABLED_KEY)
+        .fetch_optional(&self.pool)
+        .await?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .unwrap_or(Ok(true))
+    }
+
+    pub(crate) async fn set_cursor_takeover_enabled(&self, enabled: bool) -> Result<()> {
+        let _write = self.writes.lock().await;
+        sqlx::query(
+            "INSERT INTO service_settings(setting_key, value_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(CURSOR_TAKEOVER_ENABLED_KEY)
+        .bind(serde_json::to_string(&enabled)?)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
     pub(crate) async fn proxy_settings_secret(&self) -> Result<ProxySettingsSecret> {
         let value = sqlx::query_scalar::<_, String>(
             "SELECT value_json FROM service_settings WHERE setting_key = ?",
@@ -385,6 +450,7 @@ impl Store {
         let settings = CommitSettings {
             model_id: settings.model_id.trim().to_owned(),
             prompt: settings.prompt.trim().to_owned(),
+            prompt_locale: settings.prompt_locale,
         };
         let value_json = serde_json::to_string(&settings)?;
         let _write = self.writes.lock().await;
@@ -554,6 +620,58 @@ mod tests {
             .await
             .unwrap();
         assert!(store.plugin_model_overrides().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_locale_and_integration_preference_round_trip_without_losing_plugin_settings() {
+        use super::{CommitPromptLocale, CommitSettings};
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        assert!(store.cursor_takeover_enabled().await.unwrap());
+        let id = "plugin:example/provider/model";
+        let over = PluginModelOverride {
+            display_name: Some("Custom".into()),
+            ..Default::default()
+        };
+        store
+            .set_plugin_model_override(id, over.clone())
+            .await
+            .unwrap();
+        store.set_plugin_model_enabled(id, false).await.unwrap();
+        let settings = CommitSettings {
+            model_id: id.into(),
+            prompt: String::new(),
+            prompt_locale: CommitPromptLocale::EnUs,
+        };
+        store.set_commit_settings(settings.clone()).await.unwrap();
+        store.set_cursor_takeover_enabled(false).await.unwrap();
+        assert_eq!(store.commit_settings().await.unwrap(), settings);
+        assert_eq!(
+            settings.effective_prompt(),
+            super::DEFAULT_COMMIT_PROMPT_EN_US.trim()
+        );
+        assert!(!store.cursor_takeover_enabled().await.unwrap());
+        assert!(store.disabled_plugin_models().await.unwrap().contains(id));
+        assert_eq!(
+            store.plugin_model_overrides().await.unwrap().get(id),
+            Some(&over)
+        );
+        store.set_plugin_model_enabled(id, true).await.unwrap();
+        assert!(store.disabled_plugin_models().await.unwrap().is_empty());
+        for locale in [CommitPromptLocale::EnUs, CommitPromptLocale::ZhCn] {
+            let custom = CommitSettings {
+                prompt: " custom ".into(),
+                prompt_locale: locale,
+                ..Default::default()
+            };
+            assert_eq!(
+                store
+                    .set_commit_settings(custom)
+                    .await
+                    .unwrap()
+                    .effective_prompt(),
+                "custom"
+            );
+        }
     }
 
     #[test]

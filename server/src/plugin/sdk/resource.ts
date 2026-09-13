@@ -44,6 +44,45 @@ export type ResourceMetric = {
   resetAtMs?: number;
 };
 
+export type ResourceActionTarget = "resource" | "card";
+
+export type ResourceAction = {
+  id: string;
+  displayName: LocalizedText;
+  description?: LocalizedText;
+  target?: ResourceActionTarget;
+  destructive?: boolean;
+  run(
+    resource: ResourceSnapshot,
+    input: JsonValue,
+    context: PluginContext,
+  ): Promise<ResourceActionResult>;
+};
+
+export type ResourceActionField = {
+  id: string;
+  label: LocalizedText;
+  value: string;
+};
+
+/** 资源操作返回的通用详情卡片;不得包含凭证。 */
+export type ResourceActionCard = {
+  id: string;
+  title: LocalizedText;
+  status?: LocalizedText;
+  grantedAtMs?: number;
+  expiresAtMs?: number;
+  fields?: ResourceActionField[];
+};
+
+export type ResourceActionResult = {
+  title: LocalizedText;
+  description?: LocalizedText;
+  cards?: ResourceActionCard[];
+  /** 消费类操作可用它更新宿主保存的资源状态。 */
+  patch?: ResourcePatch;
+};
+
 /** 单条资源的用户可见投影;不得泄露凭证。displayName 是数据(如邮箱),保持纯字符串。 */
 export type ResourceView = {
   displayName: string;
@@ -66,7 +105,7 @@ export type OAuth2AddMethod = {
 };
 
 export type OAuth2Begin = {
-  /** 不透明流程状态(设备码、PKCE verifier 等);永远不会持久化。 */
+  /** 不透明流程状态(如设备码);永远不会持久化。 */
   session: JsonValue;
   userCode: string;
   verificationUrl: string;
@@ -82,7 +121,41 @@ export type OAuth2Poll =
   | { status: "denied"; message?: string }
   | { status: "failed"; message: string };
 
-export type ResourceAddMethod = OAuth2AddMethod;
+/** Core 托管浏览器回调、state 与 PKCE 的 OAuth 2.0 授权码流程。 */
+export type OAuth2AuthorizationCodeAddMethod = {
+  type: "oauth2.authorization-code";
+  id: string;
+  displayName: LocalizedText;
+  description?: LocalizedText;
+  /** 仅在上游 OAuth 客户端要求固定 loopback 地址时指定。 */
+  callback?: { port?: number; path?: string };
+  begin(
+    input: {
+      redirectUri: string;
+      state: string;
+      codeChallenge: string;
+    },
+    context: PluginContext,
+  ): Promise<OAuth2AuthorizationCodeBegin>;
+  complete(
+    session: JsonValue,
+    input: {
+      code: string;
+      redirectUri: string;
+      codeVerifier: string;
+    },
+    context: PluginContext,
+  ): Promise<ResourceDraft[]>;
+};
+
+export type OAuth2AuthorizationCodeBegin = {
+  session: JsonValue;
+  authorizationUrl: string;
+  expiresAtMs: number;
+  pollIntervalMs?: number;
+};
+
+export type ResourceAddMethod = OAuth2AddMethod | OAuth2AuthorizationCodeAddMethod;
 
 export type ResourceImportFile = {
   name: string;
@@ -111,6 +184,7 @@ export type ResourceSupport = {
   add?: ResourceAddMethod[];
   import?: ResourceImportSupport;
   present(resource: ResourceSnapshot): ResourceView;
+  actions?: ResourceAction[];
   /** 用户主动触发时重新读取上游状态(额度、凭证有效性)。 */
   refresh?(resource: ResourceSnapshot, context: PluginContext): Promise<ResourcePatch>;
   /** 可选的上游撤销;宿主随后删除本地记录。 */

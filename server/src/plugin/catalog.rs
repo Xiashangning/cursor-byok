@@ -255,11 +255,42 @@ fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> 
         }
         for method in &resource.add {
             validate_id(&method.id, "plugin add method id")?;
-            if method.method_type != super::descriptor::OAUTH2_ADD_METHOD {
+            if !matches!(
+                method.method_type.as_str(),
+                super::descriptor::OAUTH2_ADD_METHOD
+                    | super::descriptor::OAUTH2_AUTHORIZATION_CODE_ADD_METHOD
+            ) {
                 return Err(Error::Config(format!(
                     "plugin '{plugin_id}' add method '{}' uses unsupported type '{}'",
                     method.id, method.method_type
                 )));
+            }
+            if method.method_type == super::descriptor::OAUTH2_ADD_METHOD
+                && method.callback.is_some()
+            {
+                return Err(Error::Config(format!(
+                    "plugin '{plugin_id}' device OAuth method '{}' cannot declare callback settings",
+                    method.id
+                )));
+            }
+            if let Some(callback) = &method.callback {
+                if callback.port == Some(0) {
+                    return Err(Error::Config(format!(
+                        "plugin '{plugin_id}' OAuth callback port must be greater than zero"
+                    )));
+                }
+                if let Some(path) = callback.path.as_deref() {
+                    if !path.starts_with('/')
+                        || path.len() > 128
+                        || path.contains('?')
+                        || path.contains('#')
+                        || path.contains("//")
+                    {
+                        return Err(Error::Config(format!(
+                            "plugin '{plugin_id}' contains invalid OAuth callback path '{path}'"
+                        )));
+                    }
+                }
             }
         }
     }

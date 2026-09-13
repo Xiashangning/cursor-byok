@@ -12,6 +12,7 @@ type ModalProps = {
   banner?: ReactNode;
   busy?: boolean;
   wide?: boolean;
+  compact?: boolean;
   fullHeight?: boolean;
   role?: "dialog" | "alertdialog";
   ariaDescribedBy?: string;
@@ -38,7 +39,7 @@ function focusableElements(root: HTMLElement) {
     .filter((element) => element.getClientRects().length > 0);
 }
 
-export function Modal({ id, open, title, children, banner, busy, wide, fullHeight, role = "dialog", ariaDescribedBy, initialFocus = "first", onClose, onSubmit, secondaryAction, closeLabel = t("取消"), submitLabel = t("保存"), submitDisabled = false }: ModalProps) {
+export function Modal({ id, open, title, children, banner, busy, wide, compact, fullHeight, role = "dialog", ariaDescribedBy, initialFocus = "first", onClose, onSubmit, secondaryAction, closeLabel = t("取消"), submitLabel = t("保存"), submitDisabled = false }: ModalProps) {
   const dialog = useRef<HTMLDivElement>(null);
   const submitButton = useRef<HTMLButtonElement>(null);
   const closeRef = useRef(onClose);
@@ -50,6 +51,8 @@ export function Modal({ id, open, title, children, banner, busy, wide, fullHeigh
     if (!open) return;
     const previous = document.activeElement as HTMLElement | null;
     const onKey = (event: KeyboardEvent) => {
+      const modals = document.querySelectorAll('[aria-modal="true"]');
+      if (event.defaultPrevented || modals.item(modals.length - 1) !== dialog.current) return;
       if (event.key === "Escape" && !busyRef.current) {
         event.preventDefault();
         closeRef.current();
@@ -89,7 +92,7 @@ export function Modal({ id, open, title, children, banner, busy, wide, fullHeigh
   if (!open) return null;
   return createPortal(<div className={styles.mask}>
     <div className={styles.dragLayer} data-tauri-drag-region aria-hidden="true" />
-    <div id={id} ref={dialog} className={[styles.dialog, wide && styles.wide, fullHeight && styles.fullHeight].filter(Boolean).join(" ")} role={role} aria-modal="true" aria-labelledby={titleId} aria-describedby={ariaDescribedBy} tabIndex={-1}>
+    <div id={id} ref={dialog} className={[styles.dialog, wide && styles.wide, compact && styles.compact, fullHeight && styles.fullHeight].filter(Boolean).join(" ")} role={role} aria-modal="true" aria-labelledby={titleId} aria-describedby={ariaDescribedBy} tabIndex={-1}>
       <header id={titleId}>{title}</header>
       {banner && <div className={styles.banner}>{banner}</div>}
       <ScrollableContent alwaysShowVertical className={styles.body} contentClassName={styles.bodyContent}>{children}</ScrollableContent>
