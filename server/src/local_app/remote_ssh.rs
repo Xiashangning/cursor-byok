@@ -188,7 +188,7 @@ fn render_config(
         ));
     }
     output.push_str(&format!(
-        "Host *\n    ClearAllForwardings no\n    ExitOnForwardFailure yes\n    RemoteForward 127.0.0.1:{proxy_port} 127.0.0.1:{proxy_port}\n    RemoteCommand {unix_command}\n\nInclude \"{}\"\n",
+        "Host *\n    ClearAllForwardings no\n    ExitOnForwardFailure no\n    RemoteForward 127.0.0.1:{proxy_port} 127.0.0.1:{proxy_port}\n    RemoteCommand {unix_command}\n\nInclude \"{}\"\n",
         escape_ssh_quoted(source_config)
     ));
     output
@@ -375,7 +375,7 @@ mod tests {
         );
 
         assert!(rendered.contains("RemoteForward 127.0.0.1:31245 127.0.0.1:31245"));
-        assert!(rendered.contains("ExitOnForwardFailure yes"));
+        assert!(rendered.contains("ExitOnForwardFailure no"));
         assert!(rendered.contains("RemoteCommand bash -c"));
         assert!(rendered.contains("start.$$"));
         assert!(rendered.contains("Include \"/Users/test/My Config/ssh\""));

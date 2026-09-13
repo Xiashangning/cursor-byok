@@ -77,7 +77,7 @@ Cursor 重启后新建一个对话，再从模型列表中选择你配置的模�
     └── SSH RemoteForward ──> 本地 127.0.0.1:<代理端口> ──> Cursor Byok
 ```
 
-应用会在自身数据目录生成隔离的 SSH 配置，并让 Cursor Remote SSH 使用它。原有 SSH 配置会被原样包含，Cursor Byok 停止时会恢复原设置。远端只监听回环地址；如果端口无法占用，连接会直接失败，避免 Cursor 悄悄连到无关服务。
+应用会在自身数据目录生成隔离的 SSH 配置，并让 Cursor Remote SSH 使用它。原有 SSH 配置会被原样包含，Cursor Byok 停止时会恢复原设置。远端只监听回环地址；如果端口无法占用，SSH 会输出告警并继续连接。
 
 在 Cursor 远端服务启动前，同一条 SSH 会话会把本地 CA 证书写入远端用户的 Cursor Byok 私有目录，设置代理与证书环境，按需安装 `uv`，并执行 Semble 官方提供的 Cursor MCP（Model Context Protocol）无交互安装命令。之后由 Cursor 在远端启动 Semble MCP 服务，因此代码搜索读取远端文件系统，不会再拿远端路径到本地查找。
 
