@@ -215,7 +215,7 @@ make build-docker    # 构建 Docker 镜像
 
 ### Cursor CLI 接管
 
-仓库提供可选的 [Windows 原生 CLI 启动器](./support/cursor-cli/README.md)，复用运行中的助手模型配置、动态端口和本地身份。CLI 设置独立保存，保留工具审批。它目前需要从源码目录手动运行，桌面安装程序不会自动安装；macOS CLI 接管尚未验证。
+仓库提供可选的 [Windows/macOS CLI 启动器](./support/cursor-cli/README.md)，复用运行中的助手模型配置、动态端口和本地身份。CLI 设置独立保存，保留工具审批。它目前需要从源码目录手动运行，桌面安装程序不会自动安装；macOS 的真实供应商调用仍需在目标机器验证。
 
 欢迎提交 Issue 和 Pull Request。提交代码前请先阅读项目中的开发说明，并运行 `make check` 确认格式、测试和前端构建检查通过。
 
