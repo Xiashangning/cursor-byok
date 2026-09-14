@@ -48,6 +48,7 @@ pub struct ExecContext {
     pub root_conversation_id: String,
     pub default_subagent_model: String,
     pub default_subagent_model_variant: Option<String>,
+    pub child_models: HashMap<String, String>,
     pub model_directory: ModelDirectory,
     pub subagent_models: HashMap<SubagentKind, SubagentModel>,
     pub allow_subagents: bool,
@@ -164,15 +165,6 @@ pub(crate) fn parse_task_model_parameters(
 }
 
 impl ExecContext {
-    /// 归一模型选择:别名归到 base hash;变体 slug 归一后保留变体分量。
-    pub(crate) fn canonical_model(&self, model: &str) -> String {
-        let (base, parts) = self.model_directory.resolve(model);
-        match (parts, self.model_directory.variants.get(&base)) {
-            (Some(parts), Some(axis)) => axis.bake_slug(&base, &parts),
-            _ => base,
-        }
-    }
-
     pub(crate) fn subagent_model_for(&self, subagent_type: &str) -> Option<&SubagentModel> {
         self.subagent_models.get(&subagent_kind(subagent_type))
     }
@@ -193,7 +185,7 @@ impl ExecContext {
     }
 
     pub fn prepare_call(&self, call: &ToolCall) -> Result<ToolCall> {
-        if !call.name.eq_ignore_ascii_case("Task") {
+        if !is_orchestration_tool(&call.name) {
             return Ok(call.clone());
         }
         let arguments = call
@@ -207,13 +199,21 @@ impl ExecContext {
         if self.task_disabled(call) {
             return Ok(call.clone());
         }
+        let resumed_model = arguments
+            .get("resume")
+            .or_else(|| arguments.get("agent_id"))
+            .or_else(|| arguments.get("agentId"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| self.child_models.get(id));
         let override_model = self.subagent_model_for(subagent_type);
         let inherited = || {
-            self.default_subagent_model_variant
-                .clone()
+            resumed_model
+                .cloned()
+                .or_else(|| self.default_subagent_model_variant.clone())
                 .unwrap_or_else(|| self.default_subagent_model.clone())
         };
         let model = match override_model {
+            _ if resumed_model.is_some() && !arguments.contains_key("model") => inherited(),
             Some(SubagentModel::Model(model)) => model.clone(),
             Some(SubagentModel::Inherit) => inherited(),
             Some(SubagentModel::Disabled) => unreachable!("disabled Task returned above"),
@@ -513,7 +513,7 @@ impl CursorToolRuntime {
             .min()
     }
 
-    fn next_id(&self) -> Result<u32> {
+    pub(crate) fn next_id(&self) -> Result<u32> {
         self.next_id
             .fetch_add(1, Ordering::Relaxed)
             .checked_add(1)

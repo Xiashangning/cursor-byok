@@ -24,6 +24,7 @@ pub fn requested_model(request: &pb::AgentRunRequest) -> Result<ModelSpec> {
             reasoning: ReasoningSpec {
                 enabled: details.is_some_and(|model| model.thinking_details.is_some()),
                 effort: None,
+                explicitly_disabled: false,
             },
             latency: ModelLatency::Standard,
             max_output_tokens: None,
@@ -89,6 +90,7 @@ fn from_requested(
             enabled: model.max_mode
                 || details.is_some_and(|model| model.thinking_details.is_some()),
             effort: None,
+            explicitly_disabled: false,
         },
         latency: ModelLatency::Standard,
         max_output_tokens: None,
@@ -96,15 +98,30 @@ fn from_requested(
         supports_image_generation: false,
         extra_params: serde_json::json!({}),
     };
+    apply_requested_parameters(&mut spec, model)?;
+    Ok(spec)
+}
+
+pub(super) fn apply_requested_parameters(
+    spec: &mut ModelSpec,
+    model: &pb::RequestedModel,
+) -> Result<()> {
     for parameter in &model.parameters {
         match parameter.id.as_str() {
             "effort" | "reasoning" => {
-                let effort = parameter.value.trim();
+                let effort = parameter.value.trim().to_ascii_lowercase();
+                spec.reasoning.explicitly_disabled = matches!(effort.as_str(), "none" | "off");
                 spec.reasoning.effort =
-                    (effort != "none" && !effort.is_empty()).then(|| effort.to_string());
-                spec.reasoning.enabled |= spec.reasoning.effort.is_some();
+                    (!spec.reasoning.explicitly_disabled && !effort.is_empty()).then_some(effort);
+                spec.reasoning.enabled = spec.reasoning.effort.is_some();
             }
-            "thinking" => spec.reasoning.enabled |= parse_bool(parameter)?,
+            "thinking" => {
+                spec.reasoning.enabled = parse_bool(parameter)?;
+                spec.reasoning.explicitly_disabled = !spec.reasoning.enabled;
+                if spec.reasoning.explicitly_disabled {
+                    spec.reasoning.effort = None;
+                }
+            }
             "fast" => {
                 if parse_bool(parameter)? {
                     spec.latency = ModelLatency::Fast;
@@ -122,7 +139,7 @@ fn from_requested(
             _ => {}
         }
     }
-    Ok(spec)
+    Ok(())
 }
 
 fn parse_bool(parameter: &pb::requested_model::ModelParameterValue) -> Result<bool> {

@@ -41,14 +41,14 @@ pub async fn stream(registry: &TransportRegistry, request_id: &str) -> Result<Re
 }
 
 fn local_body_stream(
-    mut receiver: mpsc::UnboundedReceiver<Bytes>,
+    receiver: mpsc::UnboundedReceiver<Bytes>,
     handle: TransportHandle,
     trace: Option<CursorTraceRecorder>,
 ) -> impl tokio_stream::Stream<Item = std::result::Result<Bytes, Infallible>> {
+    let mut guard = LocalRunGuard::new(handle, receiver);
     async_stream::stream! {
-        let mut guard = LocalRunGuard::new(handle);
         let mut trace = TraceStreamSink::new(trace, "byok_server");
-        while let Some(chunk) = receiver.recv().await {
+        while let Some(chunk) = guard.receiver.recv().await {
             let terminal = is_end_stream_frame(&chunk);
             trace.chunk(&chunk);
             if terminal {
@@ -97,13 +97,15 @@ fn end_stream_error(frame: &Bytes) -> Option<String> {
 
 struct LocalRunGuard {
     handle: TransportHandle,
+    receiver: mpsc::UnboundedReceiver<Bytes>,
     completed: bool,
 }
 
 impl LocalRunGuard {
-    fn new(handle: TransportHandle) -> Self {
+    fn new(handle: TransportHandle, receiver: mpsc::UnboundedReceiver<Bytes>) -> Self {
         Self {
             handle,
+            receiver,
             completed: false,
         }
     }
@@ -115,10 +117,13 @@ impl LocalRunGuard {
 
 impl Drop for LocalRunGuard {
     fn drop(&mut self) {
+        self.receiver.close();
         if !self.completed {
             let handle = self.handle.clone();
             tokio::spawn(async move {
-                handle.disconnect().await;
+                let _ = handle
+                    .command(crate::cursor::conversation::TransportCommand::OutputDetached)
+                    .await;
             });
         }
     }

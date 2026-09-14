@@ -816,7 +816,7 @@ impl ConversationOutput {
     }
 
     async fn forward_completion(
-        &self,
+        &mut self,
         mut completion: ToolCompletion,
         completions: &mut HashMap<String, ToolCompletion>,
         interrupted_tool_calls: &HashSet<String>,
@@ -845,6 +845,22 @@ impl ConversationOutput {
             &result.call_id,
         )? {
             return Ok(None);
+        }
+        if let Some(pb::tool_call::Tool::TaskToolCall(task)) = completion.tool_call().tool.as_ref()
+        {
+            if let (Some(args), Some(pb::task_result::Result::Success(success))) = (
+                task.args.as_ref(),
+                task.result
+                    .as_ref()
+                    .and_then(|result| result.result.as_ref()),
+            ) {
+                if let (Some(id), Some(model)) = (success.agent_id.as_ref(), args.model.as_ref()) {
+                    self.context
+                        .exec
+                        .child_models
+                        .insert(id.clone(), model.clone());
+                }
+            }
         }
         completions.insert(result.call_id.clone(), completion.clone());
         let Some(dispatched) = self.tools.continue_after(&result.call_id).await? else {

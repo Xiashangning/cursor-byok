@@ -438,8 +438,9 @@ fn apply_variant_parts(model: &mut ModelSpec, parts: ModelVariantParts) {
         model.context_window_tokens = Some(tokens);
     }
     if let Some(effort) = parts.effort {
-        model.reasoning.effort = Some(effort);
-        model.reasoning.enabled = true;
+        model.reasoning.explicitly_disabled = matches!(effort.as_str(), "none" | "off");
+        model.reasoning.enabled = !model.reasoning.explicitly_disabled;
+        model.reasoning.effort = model.reasoning.enabled.then_some(effort);
     }
     if parts.fast {
         model.latency = crate::model::ModelLatency::Fast;
@@ -483,7 +484,11 @@ fn model_variant_id(axis: &ModelVariantAxis, base: &str, selected: &ModelSpec) -
     let effort = if axis.effort_options.is_empty() {
         None
     } else {
-        Some(selected.reasoning.effort.clone()?)
+        Some(if selected.reasoning.explicitly_disabled {
+            "none".into()
+        } else {
+            selected.reasoning.effort.clone()?
+        })
     };
     Some(axis.bake_slug(
         base,
@@ -680,6 +685,39 @@ pub(crate) fn background_terminal_completions(
     insert_messages::terminal_completions(action).map(Some)
 }
 
+pub(crate) async fn compile_background_action(
+    action: &pb::BackgroundTaskCompletionAction,
+    mode: i32,
+    blobs: &BlobSynchronizer,
+    store: &Store,
+    conversation_id: &ConversationId,
+) -> Result<Vec<CanonicalMessage>> {
+    let mut messages = Vec::new();
+    for projected in insert_messages::project(action, mode)?.completions {
+        let terminal = projected.terminal;
+        let mut message = match store
+            .message(conversation_id, &format!("runtime:{}", terminal.event_id))
+            .await?
+        {
+            Some(message) => message,
+            None => {
+                break_messages::compile_background(
+                    terminal.event_id.clone(),
+                    &projected.turn_user,
+                    &pb::RequestContext::default(),
+                    &projected.context,
+                    blobs,
+                )
+                .await?
+                .0
+            }
+        };
+        message.terminal_completion = Some(terminal);
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
 fn execution_run_id(request_id: &str) -> RunId {
     let execution_id = Uuid::new_v4().simple().to_string();
     RunId::new(format!("{request_id}:{}", &execution_id[..8]))
@@ -713,7 +751,7 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
                 Error::Protocol("Cursor user message action has no UserMessage".into())
             })?;
             let mode = if user.mode == pb::AgentMode::Unspecified as i32 {
-                conversation_mode.unwrap_or(user.mode)
+                mode
             } else {
                 user.mode
             };
@@ -898,6 +936,18 @@ fn exec_context(
             .unwrap_or_else(|| conversation_id.to_string()),
         default_subagent_model: model_id.into(),
         default_subagent_model_variant: inherited_model_variant.clone(),
+        child_models: request
+            .conversation_state
+            .as_ref()
+            .into_iter()
+            .flat_map(|state| &state.subagent_states)
+            .filter_map(|(id, state)| {
+                state
+                    .model_id
+                    .as_ref()
+                    .map(|model| (id.clone(), model.clone()))
+            })
+            .collect(),
         model_directory: model_directory.clone(),
         subagent_models,
         allow_subagents: request.subagent_type_name.is_none(),

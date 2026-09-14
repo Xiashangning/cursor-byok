@@ -507,12 +507,11 @@ async fn drive_completion(
         .unwrap();
     let mut seqno = 1;
     let out = drive(handle, &mut output, &mut seqno, |exec| {
-        assert_eq!(exec.id, 0);
         assert!(matches!(
             exec.message,
             Some(pb::exec_server_message::Message::RequestContextArgs(_))
         ));
-        vec![stream_close(0), request_context_success(0)]
+        vec![stream_close(exec.id), request_context_success(exec.id)]
     })
     .await;
     (
@@ -537,8 +536,7 @@ async fn drive_forwarded_completion(handle: &TransportHandle, message: pb::Agent
         .unwrap();
     let mut seqno = 1;
     let out = drive(handle, &mut output, &mut seqno, |exec| {
-        assert_eq!(exec.id, 0);
-        vec![stream_close(0), request_context_success(0)]
+        vec![stream_close(exec.id), request_context_success(exec.id)]
     })
     .await;
     assert_eq!(out.terminal, serde_json::json!({}));

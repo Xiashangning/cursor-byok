@@ -75,8 +75,11 @@ impl ConversationRuntime {
             );
             let mut inbox = OrderedInbox::starting_at(0);
             let tool_runtime_factory = CursorToolRuntime::default();
-            let context_sync =
-                RequestContextSynchronizer::new(handle.clone(), dependencies.store.clone());
+            let context_sync = RequestContextSynchronizer::new(
+                handle.clone(),
+                dependencies.store.clone(),
+                tool_runtime_factory.clone(),
+            );
             let mut current = None::<RunGeneration>;
             let mut next_generation = 1_u64;
             let mut pending_finish = None::<(u64, TransportFinish)>;
@@ -145,7 +148,25 @@ impl ConversationRuntime {
                     }
                 };
                 match command {
-                    TransportCommand::Disconnect => {
+                    TransportCommand::ContinueRequest(mut request) => {
+                        request.conversation_state =
+                            handle.latest_checkpoint().or(request.conversation_state);
+                        waiting_for_action = false;
+                        start_generation(
+                            &registry,
+                            &handle,
+                            &dependencies,
+                            &blob_sync,
+                            &context_sync,
+                            &tool_runtime_factory,
+                            &mut current,
+                            &mut next_generation,
+                            *request,
+                        )
+                        .await;
+                    }
+                    TransportCommand::OutputDetached if handle.has_subscribers() => continue,
+                    TransportCommand::Disconnect | TransportCommand::OutputDetached => {
                         handle.mark_disconnected();
                         if let Some(generation) = current.as_ref() {
                             generation.superseded.cancel();
@@ -419,8 +440,9 @@ impl ConversationRuntime {
                                             };
                                             let mut request = previous.request.clone();
                                             request.action = Some(conversation_action);
-                                            request.conversation_state = None;
-                                            request.pre_fetched_blobs.clear();
+                                            request.conversation_state = handle
+                                                .latest_checkpoint()
+                                                .or(request.conversation_state);
                                             waiting_for_action = false;
                                             start_generation(
                                                 &registry,
@@ -525,6 +547,78 @@ async fn start_generation(
     next_generation: &mut u64,
     request: pb::AgentRunRequest,
 ) {
+    // Notifications join the existing lifecycle; they must never supersede its generation.
+    if let (
+        Some(previous),
+        Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)),
+    ) = (
+        current
+            .as_ref()
+            .filter(|generation| !generation.finished.is_cancelled()),
+        request
+            .action
+            .as_ref()
+            .and_then(|action| action.action.as_ref()),
+    ) {
+        let registry = registry.clone();
+        let handle = handle.clone();
+        let blobs = blob_sync.clone();
+        let store = dependencies.store.clone();
+        let action = action.clone();
+        let previous_finished = previous.finished.clone();
+        let results = previous.results.clone();
+        let mode = handle
+            .latest_checkpoint()
+            .and_then(|state| state.mode)
+            .or_else(|| {
+                previous
+                    .request
+                    .conversation_state
+                    .as_ref()
+                    .and_then(|state| state.mode)
+            })
+            .unwrap_or(pb::AgentMode::Agent as i32);
+        tokio::spawn(async move {
+            let conversation_id = compile::request_conversation_id(handle.request_id(), &request);
+            let messages = match compile::compile_background_action(
+                &action,
+                mode,
+                &blobs,
+                &store,
+                &conversation_id,
+            )
+            .await
+            {
+                Ok(messages) => messages,
+                Err(error) => {
+                    results.send_error(error);
+                    return;
+                }
+            };
+            let event_id = messages[0]
+                .runtime_event_id
+                .clone()
+                .expect("completion identity");
+            let result = registry
+                .deliver(
+                    &conversation_id,
+                    CompiledMessages {
+                        event_id,
+                        target_run_id: None,
+                        messages,
+                        delivery: MessageDelivery::InsertMessages,
+                    },
+                )
+                .await;
+            if matches!(result, CommandResult::RunEnded | CommandResult::RunClosing) {
+                previous_finished.cancelled().await;
+                let _ = handle
+                    .command(TransportCommand::ContinueRequest(Box::new(request)))
+                    .await;
+            }
+        });
+        return;
+    }
     let previous_finished = if let Some(previous) = current.take() {
         previous.superseded.cancel();
         if let Some(run) = previous.run.lock().clone() {
@@ -787,22 +881,6 @@ fn spawn_run_request(
                 }
             }
         }
-        let pending = registry.take_pending(&prepared.conversation_id).await;
-        if !pending.is_empty() {
-            let mut messages = pending
-                .into_iter()
-                .flat_map(|pending| pending.messages)
-                .collect::<Vec<_>>();
-            messages.extend(prepared.initial_messages);
-            prepared.initial_messages = messages;
-            if let Ok(checkpoint) = dependencies
-                .store
-                .ensure_conversation(&prepared.conversation_id)
-                .await
-            {
-                prepared.base_checkpoint_id = checkpoint;
-            }
-        }
         if generation.superseded.is_cancelled() {
             return;
         }
@@ -816,9 +894,30 @@ fn spawn_run_request(
             *generation.run.lock() = None;
             return;
         }
-        registry
+        let pending = registry
             .activate(conversation_id.clone(), run_id.clone(), run_handle.clone())
             .await;
+        if !pending.is_empty() {
+            let mut messages = pending
+                .into_iter()
+                .filter(|pending| {
+                    pending
+                        .target_run_id
+                        .as_ref()
+                        .is_none_or(|target| target == &run_id)
+                })
+                .flat_map(|pending| pending.messages)
+                .collect::<Vec<_>>();
+            messages.extend(prepared.initial_messages);
+            prepared.initial_messages = messages;
+            if let Ok(checkpoint) = dependencies
+                .store
+                .ensure_conversation(&conversation_id)
+                .await
+            {
+                prepared.base_checkpoint_id = checkpoint;
+            }
+        }
         let cancellation = run_handle.cancellation();
         let engine = RunEngine::new(dependencies.store.clone(), dependencies.provider.clone());
         let core_run = tokio::spawn(async move { engine.run(prepared, port, cancellation).await });
