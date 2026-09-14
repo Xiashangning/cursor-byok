@@ -45,32 +45,6 @@ pub struct DiscoveredModels {
     pub models: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct LegacyModelImportResult {
-    pub imported: usize,
-    pub skipped: usize,
-    pub total: usize,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct LegacyModelImportPreview {
-    pub source: String,
-    pub total: usize,
-    pub new_models: usize,
-    pub existing_models: usize,
-    pub models: Vec<LegacyModelImportPreviewItem>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct LegacyModelImportPreviewItem {
-    pub model_hash: String,
-    pub display_name: String,
-    pub model_id: String,
-    #[serde(rename = "type")]
-    pub model_type: ModelType,
-    pub existing: bool,
-}
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct ModelDiscoveryInput {
     #[serde(rename = "type")]
@@ -532,40 +506,6 @@ impl ControlService {
             },
         )
         .await
-    }
-
-    pub async fn import_v0049_models(&self) -> Result<LegacyModelImportResult> {
-        let path = crate::config::v0049_config_path()?;
-        let outcome = self.store.import_v0049_model_config(&path).await?;
-        Ok(LegacyModelImportResult {
-            imported: outcome.imported,
-            skipped: outcome.skipped,
-            total: outcome.total,
-        })
-    }
-
-    pub async fn preview_v0049_models(&self) -> Result<LegacyModelImportPreview> {
-        let path = crate::config::v0049_config_path()?;
-        let plan = self.store.preview_v0049_model_config(&path).await?;
-        let total = plan.models.len();
-        let existing_models = plan.models.iter().filter(|model| model.existing).count();
-        Ok(LegacyModelImportPreview {
-            source: path.display().to_string(),
-            total,
-            new_models: total - existing_models,
-            existing_models,
-            models: plan
-                .models
-                .into_iter()
-                .map(|model| LegacyModelImportPreviewItem {
-                    model_hash: model.model_hash,
-                    display_name: model.input.display_name,
-                    model_id: model.input.model_id,
-                    model_type: model.input.model_type,
-                    existing: model.existing,
-                })
-                .collect(),
-        })
     }
 
     pub async fn calls(&self, limit: i64) -> Result<Vec<CallSummary>> {

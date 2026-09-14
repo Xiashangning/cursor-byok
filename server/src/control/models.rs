@@ -11,10 +11,7 @@ use crate::{
     Result,
 };
 
-use super::{
-    ControlService, DiscoveredModels, LegacyModelImportPreview, LegacyModelImportResult,
-    ModelConnectivityResult, ModelDiscoveryInput,
-};
+use super::{ControlService, DiscoveredModels, ModelConnectivityResult, ModelDiscoveryInput};
 
 #[derive(Deserialize)]
 pub struct SaveModels {
@@ -83,16 +80,4 @@ pub async fn discover(
     Json(input): Json<ModelDiscoveryInput>,
 ) -> Result<Json<DiscoveredModels>> {
     Ok(Json(service.discover_models(&input).await?))
-}
-
-pub async fn import_v0049(
-    State(service): State<ControlService>,
-) -> Result<Json<LegacyModelImportResult>> {
-    Ok(Json(service.import_v0049_models().await?))
-}
-
-pub async fn preview_v0049(
-    State(service): State<ControlService>,
-) -> Result<Json<LegacyModelImportPreview>> {
-    Ok(Json(service.preview_v0049_models().await?))
 }

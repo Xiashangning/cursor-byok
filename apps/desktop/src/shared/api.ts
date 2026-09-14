@@ -68,28 +68,6 @@ export interface ModelDiscoveryInput {
   custom_headers: Record<string, string>;
 }
 
-export interface LegacyModelImportPreviewItem {
-  model_hash: string;
-  display_name: string;
-  model_id: string;
-  type: ModelType;
-  existing: boolean;
-}
-
-export interface LegacyModelImportPreview {
-  source: string;
-  total: number;
-  new_models: number;
-  existing_models: number;
-  models: LegacyModelImportPreviewItem[];
-}
-
-export interface LegacyModelImportResult {
-  imported: number;
-  skipped: number;
-  total: number;
-}
-
 export interface ModelConnectivityResult {
   duration_ms: number;
   first_valid_response_ms: number | null;
@@ -562,8 +540,6 @@ export const api = {
   createModels: (models: ModelInput[]) => request<Model[]>("/models", { method: "POST", body: JSON.stringify({ models }) }),
   reorderModels: (modelHashes: string[]) => request<Model[]>("/models/order", { method: "PUT", body: JSON.stringify({ model_hashes: modelHashes }) }),
   discoverModels: (input: ModelDiscoveryInput) => request<{ models: string[] }>("/models/discover", { method: "POST", body: JSON.stringify(input) }),
-  previewV0049Models: () => request<LegacyModelImportPreview>("/models/import-v0049"),
-  importV0049Models: () => request<LegacyModelImportResult>("/models/import-v0049", { method: "POST" }),
   updateModel: (hash: string, model: ModelInput) => request<Model>(`/models/${hash}`, { method: "PUT", body: JSON.stringify(model) }),
   deleteModel: (hash: string) => request<void>(`/models/${hash}`, { method: "DELETE" }),
   testModel: (hash: string, testId: string, signal?: AbortSignal) => request<ModelConnectivityResult>(`/models/${encodeURIComponent(hash)}/test/${encodeURIComponent(testId)}`, { method: "POST", signal }),

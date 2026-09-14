@@ -120,32 +120,6 @@ impl Store {
         Ok(saved)
     }
 
-    pub(super) async fn create_models_if_missing(
-        &self,
-        inputs: &[ModelConfigInput],
-    ) -> Result<usize> {
-        let mut normalized = Vec::with_capacity(inputs.len());
-        let mut hashes = HashSet::with_capacity(inputs.len());
-        for input in inputs {
-            let input = normalize_model_input(input)?;
-            let hash = model_hash(&input)?;
-            if hashes.insert(hash.clone()) {
-                normalized.push((hash, input));
-            }
-        }
-        let now = now_ms();
-        let _write = self.writes.lock().await;
-        let mut transaction = self.pool.begin().await?;
-        let mut inserted = 0;
-        for (hash, input) in &normalized {
-            inserted += usize::from(
-                insert_model_with_conflict(&mut transaction, hash, input, now, true).await?,
-            );
-        }
-        transaction.commit().await?;
-        Ok(inserted)
-    }
-
     pub async fn update_model(
         &self,
         current_hash: &str,

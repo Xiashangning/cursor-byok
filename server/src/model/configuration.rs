@@ -740,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_matches_the_v0049_channel_identity() {
+    fn hash_covers_url_model_key_name_and_endpoint() {
         let input = input();
         let expected = Sha256::digest(
             "https://example.com/custom/generate\nmodel-a\nsecret\nModel A\n/v1/responses"

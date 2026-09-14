@@ -7,7 +7,6 @@ import { PluginModelEditor, type PluginModelEditorHandle } from "./PluginModelEd
 import { CursorModelTestResult, type CursorModelTestState } from "./CursorModelTestResult";
 import styles from "./CursorSettings.module.scss";
 import { PageContent } from "../../shell/layout/PageContent";
-import { LegacyModelImport } from "./LegacyModelImport";
 import { ConfirmDialog } from "../../shared/ui/ConfirmDialog";
 import { FormField, SecretTextInput, TextInput } from "../../shared/ui/FormControls";
 import controls from "../../shared/ui/Controls.module.scss";
@@ -301,9 +300,7 @@ export function CursorSettingsPage() {
   };
   const content = <CursorCaProvider><CursorCaGate busy={cursorBusy} waitingForRefresh={waitingForCaRefresh} onInitialize={() => void initializeCa()} onRefresh={() => void refreshCa()}>
     <div className={styles.page}>
-      <LegacyModelImport>{({ busy: importingLegacyModels, previewing, open }) =>
-        <CursorModelProvider><CursorModelGate busy={cursorBusy || importingLegacyModels} previewingImport={previewing} onAdd={openNew} onImport={open}>{list}</CursorModelGate></CursorModelProvider>
-      }</LegacyModelImport>
+      <CursorModelProvider><CursorModelGate busy={cursorBusy} onAdd={openNew}>{list}</CursorModelGate></CursorModelProvider>
     </div>
   </CursorCaGate></CursorCaProvider>;
 
