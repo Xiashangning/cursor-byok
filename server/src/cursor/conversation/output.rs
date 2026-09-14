@@ -828,6 +828,7 @@ impl ConversationOutput {
             let blob_id = self.store.put_blob(&image.data, &[]).await?;
             completion.persist_read_image(&blob_id, &image)?;
         }
+        completion.resolve_completion_owner(&self.context.exec.child_tool_calls);
         let result = completion.result();
         if result.call_id.is_empty() {
             return Err(Error::Protocol("tool result call_id is empty".into()));
@@ -859,6 +860,14 @@ impl ConversationOutput {
                         .exec
                         .child_models
                         .insert(id.clone(), model.clone());
+                    if success.background_reason
+                        != pb::SubagentBackgroundReason::QueuedFollowUp as i32
+                    {
+                        self.context
+                            .exec
+                            .child_tool_calls
+                            .insert(id.clone(), result.call_id.clone());
+                    }
                 }
             }
         }

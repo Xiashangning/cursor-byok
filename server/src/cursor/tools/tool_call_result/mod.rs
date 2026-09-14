@@ -44,6 +44,22 @@ impl ToolCompletion {
         &self.result
     }
 
+    pub(crate) fn resolve_completion_owner(
+        &mut self,
+        owners: &std::collections::HashMap<String, String>,
+    ) {
+        if let Some(completion) = self.result.consumed_completion.as_mut() {
+            if completion.tool_call_id.is_empty() {
+                if let Some(owner) = owners.get(&completion.task_id) {
+                    completion.tool_call_id = owner.clone();
+                } else {
+                    // An unowned await result cannot consume every execution of this task.
+                    self.result.consumed_completion = None;
+                }
+            }
+        }
+    }
+
     pub fn tool_call(&self) -> &pb::ToolCall {
         &self.tool_call
     }
@@ -92,6 +108,11 @@ impl ToolCompletion {
     ) -> Self {
         if result.consumed_completion.is_none() {
             result.consumed_completion = consumed_completion(&tool);
+            if matches!(&tool, pb::tool_call::Tool::TaskToolCall(_)) {
+                if let Some(completion) = result.consumed_completion.as_mut() {
+                    completion.tool_call_id = call.call_id.clone();
+                }
+            }
         }
         // Apply the model-visible size gate once, at the tool completion
         // boundary. Canonical history and every provider projection then
@@ -154,7 +175,6 @@ fn consumed_completion(tool: &pb::tool_call::Tool) -> Option<crate::model::Termi
             }
         },
         pb::tool_call::Tool::TaskToolCall(tool) => {
-            let args = tool.args.as_ref()?;
             let pb::task_result::Result::Success(success) =
                 tool.result.as_ref()?.result.as_ref()?
             else {
@@ -163,7 +183,8 @@ fn consumed_completion(tool: &pb::tool_call::Tool) -> Option<crate::model::Termi
             if success.is_background {
                 return None;
             }
-            args.resume
+            success
+                .agent_id
                 .as_deref()
                 .filter(|task_id| !task_id.is_empty())?
                 .to_owned()
@@ -172,6 +193,7 @@ fn consumed_completion(tool: &pb::tool_call::Tool) -> Option<crate::model::Termi
     };
     Some(crate::model::TerminalCompletion {
         task_id,
+        tool_call_id: String::new(),
         kind: "subagent".into(),
         status: "success".into(),
         payload_digest: None,

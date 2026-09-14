@@ -123,9 +123,11 @@ pub(super) fn apply_requested_parameters(
                 }
             }
             "fast" => {
-                if parse_bool(parameter)? {
-                    spec.latency = ModelLatency::Fast;
-                }
+                spec.latency = if parse_bool(parameter)? {
+                    ModelLatency::Fast
+                } else {
+                    ModelLatency::Standard
+                };
             }
             "context" => {
                 spec.context_window_tokens =

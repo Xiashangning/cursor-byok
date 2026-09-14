@@ -199,6 +199,14 @@ impl Store {
             (stored_category.as_deref(), stored_summary.as_deref())
         };
         let now = now_ms();
+        if terminal_status == "completed" {
+            sqlx::query(
+                "UPDATE background_completion_claims SET processed = 1 WHERE handling_run_id = ?",
+            )
+            .bind(run_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "UPDATE runs SET status = ?, turn_usage_json = ?, failure_category = ?,
              failure_summary = ?, updated_at_ms = ?

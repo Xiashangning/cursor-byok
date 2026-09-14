@@ -158,7 +158,20 @@ impl RunEngine {
             }
         }
         if terminal_completion_run && !inserted_initial_message {
-            return (RunOutcome::Completed, usage);
+            let completions = prepared
+                .initial_messages
+                .iter()
+                .filter_map(|message| message.terminal_completion.clone())
+                .collect::<Vec<_>>();
+            match self
+                .store
+                .background_completions_processed(&prepared.conversation_id, &completions)
+                .await
+            {
+                Ok(true) => return (RunOutcome::Completed, usage),
+                Ok(false) => {}
+                Err(error) => return (RunOutcome::Failed(error.into()), usage),
+            }
         }
 
         if let RunAction::Resume {

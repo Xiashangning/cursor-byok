@@ -43,6 +43,9 @@ pub struct ToolCall {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalCompletion {
     pub task_id: String,
+    /// The originating tool call identifies one execution of a reusable task.
+    #[serde(default)]
+    pub tool_call_id: String,
     pub kind: String,
     pub status: String,
     pub payload_digest: Option<String>,

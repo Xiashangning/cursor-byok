@@ -24,6 +24,13 @@ pub fn response_event(
             text: text.clone(),
             thinking_style: Some(pb::ThinkingStyle::Default as i32),
         }),
+        ModelEvent::ToolCallStart { name, .. }
+            if name.eq_ignore_ascii_case("send-message-to-agent") =>
+        {
+            // Until arguments are complete there is no child identity to render.
+            // A blank Task card incorrectly presents this update as a creation.
+            return Ok(None);
+        }
         ModelEvent::ToolCallStart { call_id, name, .. } => {
             Message::PartialToolCall(pb::PartialToolCallUpdate {
                 call_id: call_id.clone(),

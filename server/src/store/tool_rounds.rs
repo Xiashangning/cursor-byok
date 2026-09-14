@@ -208,7 +208,7 @@ impl Store {
                 provider_parts: Vec::new(),
             }),
             runtime_event_id: None,
-            terminal_completion: None,
+            terminal_completion: result.consumed_completion.clone(),
         };
         if let Some(completion) = result.consumed_completion.as_ref() {
             Self::claim_completion_tx(

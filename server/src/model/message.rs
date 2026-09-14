@@ -88,7 +88,7 @@ pub struct CanonicalMessage {
     pub content: MessageContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_event_id: Option<String>,
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_completion: Option<TerminalCompletion>,
 }
 

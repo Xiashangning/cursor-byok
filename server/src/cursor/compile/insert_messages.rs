@@ -123,7 +123,7 @@ fn project_completion(
         ),
         pb::BackgroundTaskKind::Unspecified => unreachable!(),
     };
-    completion
+    let tool_call_id = completion
         .tool_call_id
         .as_deref()
         .filter(|id| !id.is_empty())
@@ -134,13 +134,14 @@ fn project_completion(
         pb::BackgroundTaskKind::Shell => "shell",
         pb::BackgroundTaskKind::Unspecified => unreachable!(),
     };
-    let lifecycle = serde_json::to_vec(&(kind_name, completion.task_id.as_str()))?;
+    let lifecycle = serde_json::to_vec(&(kind_name, completion.task_id.as_str(), tool_call_id))?;
     let event_id = format!(
         "background-completed:{}",
         BlobId::digest(&lifecycle).to_base64()
     );
     let terminal = TerminalCompletion {
         task_id: completion.task_id.clone(),
+        tool_call_id: tool_call_id.into(),
         kind: kind_name.into(),
         status: status_name(status).into(),
         payload_digest: Some(BlobId::digest(&completion.encode_to_vec()).to_base64()),
@@ -256,15 +257,16 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_identity_uses_task_id_not_reusable_call_or_agent_ids() {
+    fn lifecycle_identity_includes_both_task_and_originating_tool_call() {
         let action = pb::BackgroundTaskCompletionAction {
             completions: vec![
                 completion("task-1", "reused-call"),
                 completion("task-2", "reused-call"),
+                completion("task-1", "new-call"),
             ],
         };
         let projection = project(&action, pb::AgentMode::Agent as i32).unwrap();
-        assert_eq!(projection.completions.len(), 2);
+        assert_eq!(projection.completions.len(), 3);
         assert_ne!(
             projection.completions[0].terminal.event_id,
             projection.completions[1].terminal.event_id

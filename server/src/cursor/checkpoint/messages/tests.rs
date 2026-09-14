@@ -11,6 +11,43 @@ use crate::model::{
 use super::{decode, decode_pending, encode::wire_message, staged_tool_round};
 
 #[test]
+fn completion_receipt_round_trips_without_changing_provider_history() {
+    let mut message = CanonicalMessage::text(
+        "runtime:completion",
+        Role::User,
+        crate::model::Origin::Runtime,
+        "finished",
+    );
+    message.runtime_event_id = Some("completion".into());
+    let provider_before = project_messages(&[message.clone()]).unwrap();
+    message.terminal_completion = Some(crate::model::TerminalCompletion {
+        task_id: "child".into(),
+        tool_call_id: "execution-call".into(),
+        kind: "subagent".into(),
+        status: "success".into(),
+        payload_digest: Some("digest".into()),
+        event_id: "completion".into(),
+    });
+    assert_eq!(
+        project_messages(&[message.clone()]).unwrap(),
+        provider_before
+    );
+    let persisted: CanonicalMessage =
+        serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
+    assert_eq!(persisted, message);
+    let wire = super::stable_messages("", &[message.clone()], "test-model").unwrap();
+    let recovered = decode(&wire[0], "internal".into()).unwrap();
+    assert_eq!(recovered, message);
+    assert_eq!(
+        super::stable_messages("", &[recovered], "test-model").unwrap(),
+        wire
+    );
+    let next = CanonicalMessage::text("next", Role::User, crate::model::Origin::User, "next turn");
+    let extended = super::stable_messages("", &[message, next], "test-model").unwrap();
+    assert_eq!(&extended[..wire.len()], wire.as_slice());
+}
+
+#[test]
 fn pending_tool_round_is_one_complete_assistant_message_and_round_trips() {
     let replay_state = ProviderReplayState {
         provider_kind: "anthropic".into(),

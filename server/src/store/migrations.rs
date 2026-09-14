@@ -505,7 +505,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(checksum_after, checksum_before);
-            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             assert_eq!(checkpoint_table_exists, 1);
             assert_eq!(argument_error_column_exists, 1);
             assert_eq!(consumed_completion_table_exists, 1);
@@ -590,7 +590,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(checksum_after, checksum_before);
-            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
             assert_eq!(
                 model_options,
                 (
@@ -601,6 +601,86 @@ mod tests {
             assert_eq!(conversation_count, 1);
             assert_eq!(consumed_completion_table_exists, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn v11_completion_claims_upgrade_without_inventing_execution_ids() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let historical = migrator_with_line_endings(MigrationLineEndings::Lf);
+        Migrator {
+            migrations: Cow::Owned(historical.iter().take(11).cloned().collect()),
+            ..Migrator::DEFAULT
+        }
+        .run(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations(conversation_id, updated_at_ms) VALUES ('parent', 7)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO background_completion_claims(conversation_id, task_kind, task_id, terminal_status, disposition, payload_digest, runtime_event_id, created_at_ms) VALUES ('parent', 'subagent', 'child', 'success', 'projected', 'digest', 'old-event', 42), ('parent', 'subagent', 'awaited', 'success', 'consumed', NULL, NULL, 43)").execute(&pool).await.unwrap();
+        run(&pool, Path::new("v11-upgrade.db")).await.unwrap();
+        #[derive(Debug, PartialEq, sqlx::FromRow)]
+        struct CompletionClaimRow {
+            task_id: String,
+            tool_call_id: Option<String>,
+            terminal_status: String,
+            disposition: String,
+            payload_digest: Option<String>,
+            runtime_event_id: Option<String>,
+            created_at_ms: i64,
+            processed: bool,
+            handling_run_id: Option<String>,
+        }
+        let rows: Vec<CompletionClaimRow> = sqlx::query_as(
+            "SELECT task_id, tool_call_id, terminal_status, disposition, payload_digest,
+                    runtime_event_id, created_at_ms, processed, handling_run_id
+             FROM background_completion_claims ORDER BY created_at_ms",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                CompletionClaimRow {
+                    task_id: "child".into(),
+                    tool_call_id: None,
+                    terminal_status: "success".into(),
+                    disposition: "projected".into(),
+                    payload_digest: Some("digest".into()),
+                    runtime_event_id: Some("old-event".into()),
+                    created_at_ms: 42,
+                    processed: false,
+                    handling_run_id: None,
+                },
+                CompletionClaimRow {
+                    task_id: "awaited".into(),
+                    tool_call_id: None,
+                    terminal_status: "success".into(),
+                    disposition: "consumed".into(),
+                    payload_digest: None,
+                    runtime_event_id: None,
+                    created_at_ms: 43,
+                    processed: true,
+                    handling_run_id: None,
+                },
+            ]
+        );
+        // Unknown historical ownership is not a wildcard for new executions.
+        sqlx::query("INSERT INTO background_completion_claims(conversation_id, task_kind, task_id, tool_call_id, terminal_status, disposition, created_at_ms) VALUES ('parent', 'subagent', 'child', 'new-call', 'success', 'consumed', 44)").execute(&pool).await.unwrap();
+        assert!(sqlx::query("INSERT INTO background_completion_claims(conversation_id, task_kind, task_id, tool_call_id, terminal_status, disposition, created_at_ms) VALUES ('parent', 'subagent', 'child', '', 'success', 'consumed', 44)").execute(&pool).await.is_err());
+        let violations = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(violations.is_empty());
     }
 
     #[test]

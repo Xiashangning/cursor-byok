@@ -41,13 +41,14 @@ impl Store {
     ) -> Result<bool> {
         for completion in completions {
             let Some(row) = sqlx::query(
-                "SELECT terminal_status, disposition, payload_digest, runtime_event_id
+                "SELECT terminal_status, disposition, payload_digest, runtime_event_id, processed
                  FROM background_completion_claims
-                 WHERE conversation_id = ? AND task_kind = ? AND task_id = ?",
+                 WHERE conversation_id = ? AND task_kind = ? AND task_id = ? AND tool_call_id = ?",
             )
             .bind(conversation_id.as_str())
             .bind(&completion.kind)
             .bind(&completion.task_id)
+            .bind(&completion.tool_call_id)
             .fetch_optional(&self.pool)
             .await?
             else {
@@ -55,8 +56,46 @@ impl Store {
             };
             let compare_payload = row.get::<&str, _>(1) == "projected";
             validate_existing(&row, completion, compare_payload)?;
+            if !row.get::<bool, _>(4) {
+                return Ok(false);
+            }
         }
         Ok(!completions.is_empty())
+    }
+
+    pub(crate) async fn restore_completion_claims_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        conversation_id: &ConversationId,
+        messages: &[crate::model::CanonicalMessage],
+    ) -> Result<()> {
+        use crate::model::{MessageContent, Role};
+        let final_response = messages.iter().rposition(|message| {
+            message.role == Role::Assistant
+                && matches!(&message.content, MessageContent::Assistant { tool_calls, .. } if tool_calls.is_empty())
+        });
+        for (index, message) in messages.iter().enumerate() {
+            let Some(completion) = message
+                .terminal_completion
+                .as_ref()
+                .filter(|completion| !completion.tool_call_id.is_empty())
+            else {
+                continue;
+            };
+            let disposition = if message.role == Role::Tool {
+                CompletionDisposition::Consumed
+            } else {
+                CompletionDisposition::Projected
+            };
+            Self::claim_completion_tx(tx, conversation_id, completion, disposition).await?;
+            if disposition == CompletionDisposition::Consumed
+                || final_response.is_some_and(|final_index| final_index > index)
+            {
+                sqlx::query("UPDATE background_completion_claims SET processed = 1 WHERE conversation_id = ? AND task_kind = ? AND task_id = ? AND tool_call_id = ?")
+                    .bind(conversation_id.as_str()).bind(&completion.kind).bind(&completion.task_id).bind(&completion.tool_call_id)
+                    .execute(&mut **tx).await?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn claim_completion_tx(
@@ -66,13 +105,14 @@ impl Store {
         disposition: CompletionDisposition,
     ) -> Result<CompletionClaim> {
         if let Some(row) = sqlx::query(
-            "SELECT terminal_status, disposition, payload_digest, runtime_event_id
+            "SELECT terminal_status, disposition, payload_digest, runtime_event_id, processed
              FROM background_completion_claims
-             WHERE conversation_id = ? AND task_kind = ? AND task_id = ?",
+             WHERE conversation_id = ? AND task_kind = ? AND task_id = ? AND tool_call_id = ?",
         )
         .bind(conversation_id.as_str())
         .bind(&completion.kind)
         .bind(&completion.task_id)
+        .bind(&completion.tool_call_id)
         .fetch_optional(&mut **tx)
         .await?
         {
@@ -103,18 +143,20 @@ impl Store {
         };
         sqlx::query(
             "INSERT INTO background_completion_claims(
-                 conversation_id, task_kind, task_id, terminal_status, disposition,
-                 payload_digest, runtime_event_id, created_at_ms
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 conversation_id, task_kind, task_id, tool_call_id, terminal_status, disposition,
+                 payload_digest, runtime_event_id, created_at_ms, processed
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(conversation_id.as_str())
         .bind(&completion.kind)
         .bind(&completion.task_id)
+        .bind(&completion.tool_call_id)
         .bind(&completion.status)
         .bind(disposition.as_str())
         .bind(payload_digest)
         .bind(runtime_event_id)
         .bind(now_ms())
+        .bind(disposition == CompletionDisposition::Consumed)
         .execute(&mut **tx)
         .await?;
         Ok(CompletionClaim::Acquired)
@@ -149,6 +191,7 @@ mod tests {
     fn completion(status: &str, digest: &str) -> TerminalCompletion {
         TerminalCompletion {
             task_id: "task-1".into(),
+            tool_call_id: "create-call".into(),
             kind: "subagent".into(),
             status: status.into(),
             payload_digest: Some(digest.into()),

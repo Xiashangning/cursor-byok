@@ -201,8 +201,9 @@ impl CheckpointBuilder {
         pending_tool_calls: Vec<String>,
         presentation: &PendingSteps,
     ) -> Result<pb::ConversationStateStructure> {
-        self.record_background_subagents(presentation);
+        self.record_subagents(presentation);
         self.record_consumed_subagent_completions(presentation);
+        self.record_terminal_completions(messages);
         let root_ids = self.project_roots(messages).await?;
         let turn_ids = self.project_turns(mode, presentation).await?;
         let (todo_ids, plan_id) = self.build_derived_state(messages).await?;
@@ -244,7 +245,38 @@ impl CheckpointBuilder {
         Ok(checkpoint)
     }
 
-    fn record_background_subagents(&mut self, presentation: &PendingSteps) {
+    fn record_terminal_completions(&mut self, messages: &[CanonicalMessage]) {
+        for completion in messages
+            .iter()
+            .filter_map(|message| message.terminal_completion.as_ref())
+        {
+            if completion.kind != "subagent" {
+                continue;
+            }
+            let Some(run) = self
+                .base
+                .subagent_runs_by_parent_tool_call_id
+                .get_mut(&completion.tool_call_id)
+            else {
+                continue;
+            };
+            if run.task_id.as_deref() != Some(completion.task_id.as_str()) {
+                continue;
+            }
+            let status = match completion.status.as_str() {
+                "success" => pb::SubagentRunStatus::Success,
+                "error" => pb::SubagentRunStatus::Error,
+                "aborted" => pb::SubagentRunStatus::Aborted,
+                _ => continue,
+            };
+            run.status = status as i32;
+            run.completed_timestamp_ms
+                .get_or_insert_with(crate::cursor::tools::runtime::now_ms);
+            run.completion_reason = Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32);
+        }
+    }
+
+    fn record_subagents(&mut self, presentation: &PendingSteps) {
         for step in &presentation.steps {
             let Some(pb::conversation_step::Message::ToolCall(call)) = step.message.as_ref() else {
                 continue;
@@ -258,9 +290,6 @@ impl CheckpointBuilder {
             let Some(pb::task_result::Result::Success(success)) = result.result.as_ref() else {
                 continue;
             };
-            if !success.is_background {
-                continue;
-            }
             let Some(agent_id) = success.agent_id.as_ref().filter(|id| !id.is_empty()) else {
                 continue;
             };
@@ -274,7 +303,10 @@ impl CheckpointBuilder {
             self.base
                 .subagent_states
                 .entry(agent_id.clone())
-                .and_modify(|state| state.last_used_timestamp_ms = last_used_timestamp_ms)
+                .and_modify(|state| {
+                    state.last_used_timestamp_ms = last_used_timestamp_ms;
+                    state.model_id = args.model.clone();
+                })
                 .or_insert_with(|| pb::SubagentPersistedState {
                     conversation_state: None,
                     created_timestamp_ms: started_at_ms,
@@ -287,6 +319,28 @@ impl CheckpointBuilder {
                     cloud_requested_environment_build_id: None,
                     machine: args.machine.clone(),
                 });
+            if !success.is_background {
+                continue;
+            }
+            if success.background_reason == pb::SubagentBackgroundReason::QueuedFollowUp as i32
+                && self
+                    .base
+                    .subagent_runs_by_parent_tool_call_id
+                    .values()
+                    .any(|run| {
+                        run.subagent_id.as_ref() == Some(agent_id)
+                            && matches!(
+                                pb::SubagentRunStatus::try_from(run.status),
+                                Ok(pb::SubagentRunStatus::Running
+                                    | pb::SubagentRunStatus::Backgrounded)
+                            )
+                    })
+            {
+                continue;
+            }
+            self.base
+                .subagent_runs_by_parent_tool_call_id
+                .retain(|_, run| run.subagent_id.as_ref() != Some(agent_id));
             self.base.subagent_runs_by_parent_tool_call_id.insert(
                 tool_call_id.clone(),
                 pb::SubagentRunState {
@@ -393,6 +447,14 @@ fn reset_resumed_subagent_runs(state: &mut pb::ConversationStateStructure, calls
         else {
             continue;
         };
+        if matches!(
+            pb::SubagentRunStatus::try_from(previous.status),
+            Ok(pb::SubagentRunStatus::Running | pb::SubagentRunStatus::Backgrounded)
+        ) {
+            // A follow-up to live work still belongs to its original tool call.
+            // Rebind only after the IDE reports a genuinely new execution.
+            continue;
+        }
         state
             .subagent_runs_by_parent_tool_call_id
             .retain(|_, run| run.subagent_id.as_deref() != Some(subagent_id));
@@ -465,6 +527,47 @@ fn context_limit(selected: Option<u64>, previous: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn updating_a_running_child_preserves_its_completion_owner() {
+        for status in [
+            pb::SubagentRunStatus::Running,
+            pb::SubagentRunStatus::Backgrounded,
+        ] {
+            let run = pb::SubagentRunState {
+                parent_tool_call_id: "create-call".into(),
+                subagent_id: Some("child".into()),
+                status: status as i32,
+                task_id: Some("child".into()),
+                ..Default::default()
+            };
+            let mut state = pb::ConversationStateStructure {
+                subagent_runs_by_parent_tool_call_id: std::collections::HashMap::from([(
+                    "create-call".into(),
+                    run.clone(),
+                )]),
+                ..Default::default()
+            };
+            let call = ToolCall {
+                index: 0,
+                call_id: "update-call".into(),
+                model_call_id: "model-call".into(),
+                name: "send-message-to-agent".into(),
+                arguments_text: String::new(),
+                arguments: serde_json::json!({"agent_id":"child", "prompt":"keep working"}),
+                argument_error: None,
+            };
+            reset_resumed_subagent_runs(&mut state, &[call]);
+            assert_eq!(state.subagent_runs_by_parent_tool_call_id.len(), 1);
+            assert_eq!(
+                state
+                    .subagent_runs_by_parent_tool_call_id
+                    .get("create-call"),
+                Some(&run),
+                "an update must not orphan the original completion's tool_call_id"
+            );
+        }
+    }
 
     #[test]
     fn resumed_subagent_starts_a_new_running_lifecycle() {

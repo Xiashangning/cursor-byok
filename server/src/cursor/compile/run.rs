@@ -170,7 +170,7 @@ pub(crate) async fn prepare(
     };
     let mut model = model::requested_model(request)?;
     let requested_model_id = model.model_id.clone();
-    let mut inherited_subagent_model_variant = None;
+    let mut selected_axis = None;
     if let Some(configured_model) = store.resolve_model(&model.model_id).await? {
         model.model_id = configured_model.model_hash.clone();
         configured_model.configure(&mut model);
@@ -180,11 +180,7 @@ pub(crate) async fn prepare(
         {
             apply_variant_parts(&mut model, parts);
         }
-        inherited_subagent_model_variant = model_variant_id(
-            &configured_model.variant_axis(),
-            &configured_model.model_hash,
-            &model,
-        );
+        selected_axis = Some(configured_model.variant_axis());
     } else if let Some((descriptor, axis, parts)) =
         resolve_plugin_model(&plugin_models, &requested_model_id)
     {
@@ -192,8 +188,15 @@ pub(crate) async fn prepare(
         if let Some(parts) = parts {
             apply_variant_parts(&mut model, parts);
         }
-        inherited_subagent_model_variant = model_variant_id(&axis, &descriptor.id, &model);
+        selected_axis = Some(axis);
     }
+    // Explicit parameters override both saved defaults and the selected variant.
+    if let Some(requested) = request.requested_model.as_ref() {
+        model::apply_requested_parameters(&mut model, requested)?;
+    }
+    let inherited_subagent_model_variant = selected_axis
+        .as_ref()
+        .and_then(|axis| model_variant_id(axis, &model.model_id, &model));
     let dynamic = context::dynamic_mcp(request, &request_context)?;
     let subagent_model_overrides = model::overrides(request)?;
     let model_directory = load_model_directory(store, &plugin_models).await?;
@@ -387,7 +390,9 @@ pub(crate) async fn prepare(
     let (base_checkpoint_id, reused) = store
         .match_checkpoint_prefix(&conversation_id, base_checkpoint_id, &initial_messages)
         .await?;
-    initial_messages.drain(..reused);
+    if !background_completion {
+        initial_messages.drain(..reused);
+    }
     let action = if compacting {
         RunAction::Compact
     } else if starts_turn {
@@ -946,6 +951,17 @@ fn exec_context(
                     .model_id
                     .as_ref()
                     .map(|model| (id.clone(), model.clone()))
+            })
+            .collect(),
+        child_tool_calls: request
+            .conversation_state
+            .as_ref()
+            .into_iter()
+            .flat_map(|state| &state.subagent_runs_by_parent_tool_call_id)
+            .filter_map(|(call_id, run)| {
+                run.subagent_id
+                    .as_ref()
+                    .map(|id| (id.clone(), call_id.clone()))
             })
             .collect(),
         model_directory: model_directory.clone(),

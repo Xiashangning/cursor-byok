@@ -104,6 +104,7 @@ impl Store {
         let _write = self.writes.lock().await;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let current = Self::ensure_conversation_tx(&mut tx, conversation_id).await?;
+        Self::restore_completion_claims_tx(&mut tx, conversation_id, messages).await?;
         if let Some(existing) = sqlx::query_scalar::<_, i64>(
             "SELECT checkpoint_id FROM conversation_checkpoints
              WHERE conversation_id = ? AND state_digest = ?",
@@ -234,6 +235,19 @@ impl Store {
                 super::CompletionDisposition::Projected,
             )
             .await?;
+            if claim != super::CompletionClaim::AlreadyConsumed {
+                sqlx::query(
+                    "UPDATE background_completion_claims SET handling_run_id = ?
+                     WHERE conversation_id = ? AND task_kind = ? AND task_id = ? AND tool_call_id = ? AND processed = 0",
+                )
+                .bind(run_id.as_str())
+                .bind(conversation_id.as_str())
+                .bind(&completion.kind)
+                .bind(&completion.task_id)
+                .bind(&completion.tool_call_id)
+                .execute(&mut *tx)
+                .await?;
+            }
             if claim != super::CompletionClaim::Acquired {
                 tx.commit().await?;
                 return Ok((expected, false));

@@ -1,8 +1,15 @@
 //! Maps conversation IDs to active conversation runtimes.
 
-use std::{collections::HashMap, sync::Arc};
+#[cfg(test)]
+#[path = "registry_tests.rs"]
+mod tests;
 
-use tokio::sync::{mpsc, Mutex, Notify};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
+
+use tokio::sync::{mpsc, Mutex, Notify, OwnedMutexGuard};
 
 use crate::{
     cursor::{prompting::PromptCompiler, transport::TransportHandle},
@@ -42,6 +49,7 @@ struct RegistryInner {
 struct RegistryState {
     current: HashMap<ConversationId, ActiveRun>,
     pending: HashMap<ConversationId, PendingMessages>,
+    completion_starts: HashMap<ConversationId, Weak<Mutex<()>>>,
 }
 
 #[derive(Clone)]
@@ -85,6 +93,35 @@ impl ConversationRegistry {
         receiver: mpsc::Receiver<TransportCommand>,
     ) {
         super::ConversationRuntime::spawn(self.clone(), handle, receiver);
+    }
+
+    /// Serialize completion admission through activation, not provider execution.
+    /// Without this boundary, two idle observations can create competing runs.
+    pub(crate) async fn lock_completion_start(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut state = self.inner.state.lock().await;
+            state
+                .completion_starts
+                .retain(|_, lock| lock.strong_count() > 0);
+            match state
+                .completion_starts
+                .get(conversation_id)
+                .and_then(Weak::upgrade)
+            {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    state
+                        .completion_starts
+                        .insert(conversation_id.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
     }
 
     pub(crate) async fn activate(
@@ -169,8 +206,24 @@ impl ConversationRegistry {
                     .entry(conversation_id.clone())
                     .or_default()
                     .push(pending);
+                #[cfg(test)]
+                self.inner.changed.notify_waiters();
             }
             return result;
+        }
+    }
+
+    pub(crate) async fn discard_pending_completions(
+        &self,
+        conversation_id: &ConversationId,
+        completions: &[crate::model::TerminalCompletion],
+    ) {
+        let mut state = self.inner.state.lock().await;
+        if let Some(pending) = state.pending.get_mut(conversation_id) {
+            pending.remove_completions(completions);
+            if pending.is_empty() {
+                state.pending.remove(conversation_id);
+            }
         }
     }
 
