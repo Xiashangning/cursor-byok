@@ -130,10 +130,11 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
             let model_parameters = task_model_parameters(call)?;
             let model_id = string("model")?;
             let background = !call.name.eq_ignore_ascii_case("Task");
+            let followup = normalize(&call.name) == "sendmessagetoagent";
             let resume_agent_id = optional_string("resume")
                 .or_else(|| optional_string("agent_id"))
                 .or_else(|| optional_string("agentId"));
-            if normalize(&call.name) == "sendmessagetoagent" && resume_agent_id.is_none() {
+            if followup && resume_agent_id.is_none() {
                 return Err(Error::Protocol(
                     "send-message-to-agent is missing agent_id".into(),
                 ));
@@ -160,7 +161,17 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                     .or(background.then_some(true)),
                 continuation_config: None,
                 parent_conversation_id: Some(context.conversation_id.clone()),
-                interrupt: call.arguments.get("interrupt").and_then(Value::as_bool),
+                // follow-up 默认打断运行中的子代理；显式 false 保留忙时失败语义。
+                interrupt: if followup {
+                    Some(
+                        call.arguments
+                            .get("interrupt")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                    )
+                } else {
+                    call.arguments.get("interrupt").and_then(Value::as_bool)
+                },
                 mode: if readonly {
                     pb::TaskMode::Plan as i32
                 } else {
@@ -747,6 +758,23 @@ mod tests {
                 if args.resume_agent_id.as_deref() == Some("agent-1")
                     && args.parent_conversation_id.as_deref() == Some("conversation-1")
                     && args.mode == pb::TaskMode::Plan as i32
+                    && args.interrupt == Some(true)
+        ));
+        // 显式 interrupt:false 保留忙时失败语义。
+        assert!(matches!(
+            message(&call(
+                "send-message-to-agent",
+                json!({"agent_id":"agent-1","prompt":"continue","interrupt":false})
+            )),
+            pb::exec_server_message::Message::SubagentArgs(args) if args.interrupt == Some(false)
+        ));
+        // Task 未显式 interrupt 时不打断。
+        assert!(matches!(
+            message(&call(
+                "Task",
+                json!({"prompt":"inspect","resume":"agent-1","model":"m"})
+            )),
+            pb::exec_server_message::Message::SubagentArgs(args) if args.interrupt.is_none()
         ));
         assert!(matches!(
             message(&call("AWAIT", json!({"task_id":"agent-1","block_until_ms":5000}))),

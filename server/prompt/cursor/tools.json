@@ -865,7 +865,7 @@
       "type": "function",
       "function": {
         "name": "send-message-to-agent",
-        "description": "Send a follow-up instruction to an existing background agent.",
+        "description": "Send a follow-up instruction to an existing background agent. The message is delivered immediately: if the agent is currently running, that run is interrupted and the follow-up takes priority. The agent continues in the background afterwards; use AWAIT when you need its next result before continuing.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -876,6 +876,10 @@
             "prompt": {
               "type": "string",
               "description": "Follow-up instruction."
+            },
+            "interrupt": {
+              "description": "If false and the agent is currently running, the send fails instead of interrupting it. Defaults to true.",
+              "type": "boolean"
             },
             "responding_to_message_ids": {
               "type": "array",

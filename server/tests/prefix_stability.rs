@@ -268,7 +268,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "69bb0d0f7a70d9f19e97f8a882790101377823f3e5b37b811263df68d11128d6",
+        "bd9d2ce92cee37f99a20ce8e32ea9918d6043e9f87529af0f8a71d23ae897182",
     );
     assert_mode(
         &assets,
@@ -305,7 +305,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
     );
     assert_eq!(
         schema_digest(&assets.mode(Mode::Agent).tools),
-        "5d0ddfb7988dd8b75821e8706c83158cc27bd1ad3fd202c9a964cb1167d7098a"
+        "d263ab463a7815a28d950a7e97d6d7f683c4e6c557b0f3e075109e802e2dc060"
     );
     let task = assets
         .mode(Mode::Agent)
