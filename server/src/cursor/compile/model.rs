@@ -107,12 +107,17 @@ pub(super) fn apply_requested_parameters(
     model: &pb::RequestedModel,
 ) -> Result<()> {
     for parameter in &model.parameters {
+        // 空值是 Cursor 回程携带的未赋值占位,视为未设置;
+        // 不能把占位当成显式的"关闭",否则会抹掉变体 slug 与配置默认的 effort。
+        let value = parameter.value.trim();
+        if value.is_empty() {
+            continue;
+        }
         match parameter.id.as_str() {
             "effort" | "reasoning" => {
-                let effort = parameter.value.trim().to_ascii_lowercase();
+                let effort = value.to_ascii_lowercase();
                 spec.reasoning.explicitly_disabled = matches!(effort.as_str(), "none" | "off");
-                spec.reasoning.effort =
-                    (!spec.reasoning.explicitly_disabled && !effort.is_empty()).then_some(effort);
+                spec.reasoning.effort = (!spec.reasoning.explicitly_disabled).then_some(effort);
                 spec.reasoning.enabled = spec.reasoning.effort.is_some();
             }
             "thinking" => {
@@ -175,5 +180,30 @@ mod tests {
         assert_eq!(model.model_id, "test-model");
         assert_eq!(model.latency, ModelLatency::Standard);
         assert!(!model.reasoning.enabled);
+    }
+
+    #[test]
+    fn empty_parameter_values_are_unset_not_explicit_disables() {
+        let requested = pb::RequestedModel {
+            model_id: "test-model".into(),
+            parameters: ["reasoning", "context", "thinking", "fast"]
+                .into_iter()
+                .map(|id| pb::requested_model::ModelParameterValue {
+                    id: id.into(),
+                    value: "  ".into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut spec = ModelSpec::new("test-model");
+        spec.reasoning.enabled = true;
+        spec.reasoning.effort = Some("high".into());
+
+        apply_requested_parameters(&mut spec, &requested).unwrap();
+
+        assert_eq!(spec.reasoning.effort.as_deref(), Some("high"));
+        assert!(spec.reasoning.enabled);
+        assert!(spec.context_window_tokens.is_none());
+        assert_eq!(spec.latency, ModelLatency::Standard);
     }
 }

@@ -11,7 +11,8 @@ use crate::{
 
 pub(super) const FOLLOW_UP: &str = concat!(
     "Perform any necessary follow-up actions in response to the subagent completion above. ",
-    "If no follow-up work is needed, no further action is required. ",
+    "If no follow-up work is needed and the result adds nothing new, ",
+    "respond with an empty message: no text and no tool calls. ",
     "If you mention an agent or subagent in your response, link it with the `[Name](id)` ",
     "Don't use generic label such as `[agent]`, `[worker]`, or `[subagent]`. ",
     "For cloud subagents, when the agent has edited code, link to `[Review](bc-id#changes)`, ",
@@ -22,8 +23,10 @@ pub(super) const FOLLOW_UP: &str = concat!(
 );
 
 pub(super) const SHELL_FOLLOW_UP: &str = concat!(
-    "Briefly inform the user about the task result and perform any follow-up actions (if needed). ",
-    "If there's no follow-ups needed, don't explicitly say that."
+    "Perform any follow-up actions required by the background task result above. ",
+    "If no follow-up is needed and the result adds nothing the user does not already know, ",
+    "respond with an empty message: no text and no tool calls. ",
+    "Otherwise briefly inform the user about the task result."
 );
 
 #[derive(Debug)]

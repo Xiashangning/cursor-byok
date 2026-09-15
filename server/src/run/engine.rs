@@ -211,6 +211,12 @@ impl RunEngine {
                 Ok(messages) => messages,
                 Err(error) => return (RunOutcome::Failed(error.into()), usage),
             };
+            // A background completion notification at the history tail allows
+            // the follow-up cycle to stay silent: an empty response appends no
+            // assistant message and keeps the earlier summary as the tail.
+            let tail_is_background_notification = messages
+                .last()
+                .is_some_and(|message| message.terminal_completion.is_some());
             let history = match crate::model::project_messages(&messages) {
                 Ok(history) => history,
                 Err(error) => return (RunOutcome::Failed(error.into()), usage),
@@ -663,33 +669,37 @@ impl RunEngine {
             }
 
             if cycle.calls.is_empty() {
-                let assistant = CanonicalMessage {
-                    message_id: format!("{}:assistant:{provider_call_index}", prepared.run_id),
-                    role: Role::Assistant,
-                    origin: Origin::Assistant,
-                    content: MessageContent::Assistant {
-                        text: cycle.text,
-                        thinking: cycle.reasoning,
-                        tool_round_id: None,
-                        replay_state: cycle.replay_state,
-                        tool_calls: Vec::new(),
-                    },
-                    runtime_event_id: None,
-                    terminal_completion: None,
-                };
-                checkpoint = match self
-                    .store
-                    .append_checkpoint(
-                        &prepared.conversation_id,
-                        &prepared.run_id,
-                        checkpoint,
-                        &[assistant],
-                    )
-                    .await
-                {
-                    Ok(checkpoint) => checkpoint,
-                    Err(error) => return (RunOutcome::Failed(error.into()), usage),
-                };
+                let silent_follow_up =
+                    cycle.text.trim().is_empty() && tail_is_background_notification;
+                if !silent_follow_up {
+                    let assistant = CanonicalMessage {
+                        message_id: format!("{}:assistant:{provider_call_index}", prepared.run_id),
+                        role: Role::Assistant,
+                        origin: Origin::Assistant,
+                        content: MessageContent::Assistant {
+                            text: cycle.text,
+                            thinking: cycle.reasoning,
+                            tool_round_id: None,
+                            replay_state: cycle.replay_state,
+                            tool_calls: Vec::new(),
+                        },
+                        runtime_event_id: None,
+                        terminal_completion: None,
+                    };
+                    checkpoint = match self
+                        .store
+                        .append_checkpoint(
+                            &prepared.conversation_id,
+                            &prepared.run_id,
+                            checkpoint,
+                            &[assistant],
+                        )
+                        .await
+                    {
+                        Ok(checkpoint) => checkpoint,
+                        Err(error) => return (RunOutcome::Failed(error.into()), usage),
+                    };
+                }
                 if !pending_insertions.is_empty() {
                     let inserted = match super::messages::append_batches(
                         &self.store,

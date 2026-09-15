@@ -13,8 +13,8 @@ use support::{
     wait_for_provider_requests, FakeProvider,
 };
 
-const FOLLOW_UP: &str = "Perform any necessary follow-up actions in response to the subagent completion above. If no follow-up work is needed, no further action is required. If you mention an agent or subagent in your response, link it with the `[Name](id)` Don't use generic label such as `[agent]`, `[worker]`, or `[subagent]`.";
-const SHELL_FOLLOW_UP: &str = "Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.";
+const FOLLOW_UP: &str = "Perform any necessary follow-up actions in response to the subagent completion above. If no follow-up work is needed and the result adds nothing new, respond with an empty message: no text and no tool calls. If you mention an agent or subagent in your response, link it with the `[Name](id)` Don't use generic label such as `[agent]`, `[worker]`, or `[subagent]`.";
+const SHELL_FOLLOW_UP: &str = "Perform any follow-up actions required by the background task result above. If no follow-up is needed and the result adds nothing the user does not already know, respond with an empty message: no text and no tool calls. Otherwise briefly inform the user about the task result.";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runtime_completion_actions_join_concurrent_parent_tool_rounds() {
@@ -1032,6 +1032,57 @@ async fn background_shell_completion_wakes_the_parent_with_the_captured_notifica
     assert_eq!(metadata.task_id.as_deref(), Some("977679"));
 }
 
+#[tokio::test]
+async fn silent_background_completion_follow_up_stays_on_the_notification_tail() {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(vec![
+        cursor_server::provider::ModelEvent::Start {
+            model_call_id: "silent-follow-up".into(),
+        },
+        cursor_server::provider::ModelEvent::Done(cursor_server::provider::FinishReason::Stop),
+    ]);
+    let registry = registry(store.clone(), provider.clone());
+    let handle = registry
+        .get_or_create("silent-completion-request")
+        .await
+        .unwrap();
+    drive_completion(
+        &handle,
+        shell_completion_run(pb::ConversationStateStructure::default()),
+    )
+    .await;
+
+    // The follow-up turn ran once and produced no assistant message: the
+    // conversation tail stays on the simulated notification.
+    assert_eq!(provider.requests().len(), 1);
+    let messages = store
+        .load_current_messages(&cursor_server::model::ConversationId::new(
+            "parent-conversation",
+        ))
+        .await
+        .unwrap();
+    let tail = messages.last().expect("notification tail");
+    assert_eq!(tail.role, Role::User);
+    assert!(tail.terminal_completion.is_some());
+
+    // The completed run marked the receipt processed: redelivery is a no-op.
+    let retry = registry
+        .get_or_create("silent-completion-retry")
+        .await
+        .unwrap();
+    drive_ignored_completion(
+        &retry,
+        completion_batch_run(
+            "shell-retry-run",
+            pb::ConversationStateStructure::default(),
+            vec![shell_completion()],
+        ),
+    )
+    .await;
+    assert_eq!(provider.requests().len(), 1);
+}
+
 async fn drive_failed_completion(handle: &TransportHandle, message: pb::AgentClientMessage) {
     let mut output = handle.subscribe();
     handle
@@ -1168,28 +1219,26 @@ fn completion_batch_run(
     )
 }
 
+fn shell_completion() -> pb::BackgroundTaskCompletion {
+    pb::BackgroundTaskCompletion {
+        task_id: "977679".into(),
+        kind: pb::BackgroundTaskKind::Shell as i32,
+        status: pb::BackgroundTaskStatus::Aborted as i32,
+        title: "Start Python HTTP server on 9000".into(),
+        detail: Some("terminated_by_user".into()),
+        output_path: Some("/tmp/977679.txt".into()),
+        reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
+        tool_call_id: Some("shell-call".into()),
+        ..Default::default()
+    }
+}
+
 fn shell_completion_run(
     conversation_state: pb::ConversationStateStructure,
 ) -> pb::AgentClientMessage {
-    run_request(
-        "parent-conversation",
+    completion_batch_run(
         "shell-parent-run",
-        "test-model",
-        Some(conversation_state),
-        pb::conversation_action::Action::BackgroundTaskCompletionAction(
-            pb::BackgroundTaskCompletionAction {
-                completions: vec![pb::BackgroundTaskCompletion {
-                    task_id: "977679".into(),
-                    kind: pb::BackgroundTaskKind::Shell as i32,
-                    status: pb::BackgroundTaskStatus::Aborted as i32,
-                    title: "Start Python HTTP server on 9000".into(),
-                    detail: Some("terminated_by_user".into()),
-                    output_path: Some("/tmp/977679.txt".into()),
-                    reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
-                    tool_call_id: Some("shell-call".into()),
-                    ..Default::default()
-                }],
-            },
-        ),
+        conversation_state,
+        vec![shell_completion()],
     )
 }

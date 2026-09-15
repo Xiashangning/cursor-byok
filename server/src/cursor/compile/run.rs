@@ -171,6 +171,7 @@ pub(crate) async fn prepare(
     let mut model = model::requested_model(request)?;
     let requested_model_id = model.model_id.clone();
     let mut selected_axis = None;
+    let mut variant_applied = false;
     if let Some(configured_model) = store.resolve_model(&model.model_id).await? {
         model.model_id = configured_model.model_hash.clone();
         configured_model.configure(&mut model);
@@ -179,20 +180,30 @@ pub(crate) async fn prepare(
             .parse_slug(&configured_model.model_hash, &requested_model_id)
         {
             apply_variant_parts(&mut model, parts);
+            variant_applied = true;
         }
         selected_axis = Some(configured_model.variant_axis());
     } else if let Some((descriptor, axis, parts)) =
         resolve_plugin_model(&plugin_models, &requested_model_id)
     {
         model.model_id = descriptor.id.clone();
-        if let Some(parts) = parts {
-            apply_variant_parts(&mut model, parts);
+        match parts {
+            Some(parts) => {
+                apply_variant_parts(&mut model, parts);
+                variant_applied = true;
+            }
+            // 插件模型没有 configure() 兜底:裸 id 按目录默认变体口径填充。
+            None => apply_plugin_defaults(&mut model, &axis),
         }
         selected_axis = Some(axis);
     }
-    // Explicit parameters override both saved defaults and the selected variant.
-    if let Some(requested) = request.requested_model.as_ref() {
-        model::apply_requested_parameters(&mut model, requested)?;
+    // 显式参数覆盖保存的默认值;根会话里也覆盖所选变体(模型选择器换档)。
+    // 子代理的变体 slug 由父代理 Task 调用烘焙,本身就是权威选择,
+    // Cursor 回程回声的 parameters 不得改写它。
+    if !variant_applied || request.subagent_type_name.is_none() {
+        if let Some(requested) = request.requested_model.as_ref() {
+            model::apply_requested_parameters(&mut model, requested)?;
+        }
     }
     let inherited_subagent_model_variant = selected_axis
         .as_ref()
@@ -438,6 +449,8 @@ pub(crate) async fn prepare(
 }
 
 /// 把变体 slug 解析出的档位应用到 ModelSpec;两个模型来源(内置/插件)共用。
+/// slug 烘焙时三个轴(context/effort/fast)都已确定,应用时全部钉死,
+/// 使子代理路径可以安全地跳过回程 parameters 的二次应用。
 fn apply_variant_parts(model: &mut ModelSpec, parts: ModelVariantParts) {
     if let Some(tokens) = crate::model::parse_token_count(&parts.context) {
         model.context_window_tokens = Some(tokens);
@@ -447,9 +460,27 @@ fn apply_variant_parts(model: &mut ModelSpec, parts: ModelVariantParts) {
         model.reasoning.enabled = !model.reasoning.explicitly_disabled;
         model.reasoning.effort = model.reasoning.enabled.then_some(effort);
     }
-    if parts.fast {
-        model.latency = crate::model::ModelLatency::Fast;
+    model.latency = if parts.fast {
+        crate::model::ModelLatency::Fast
+    } else {
+        crate::model::ModelLatency::Standard
+    };
+}
+
+/// 插件模型没有 configure() 兜底:裸 id 请求按目录默认变体口径填充
+/// context/effort;请求已显式携带的值与显式关闭的 reasoning 优先。
+fn apply_plugin_defaults(model: &mut ModelSpec, axis: &ModelVariantAxis) {
+    let Some(defaults) = axis.default_parts() else {
+        return;
+    };
+    if model.context_window_tokens.is_none() {
+        model.context_window_tokens = crate::model::parse_token_count(&defaults.context);
     }
+    if model.reasoning.explicitly_disabled || model.reasoning.effort.is_some() {
+        return;
+    }
+    model.reasoning.effort = defaults.effort;
+    model.reasoning.enabled |= model.reasoning.effort.is_some();
 }
 
 /// 插件模型的变体轴:没有配置窗口,轴即描述符的生效档位(已并入用户覆盖)。
@@ -1089,6 +1120,37 @@ mod tests {
             effort_options: vec!["low".into(), "high".into()],
             context_options: vec!["200k".into(), "1m".into()],
         }
+    }
+
+    #[test]
+    fn plugin_bare_id_fills_catalog_default_variant() {
+        let axis = plugin_variant_axis(&plugin_model());
+        let mut selected = crate::model::ModelSpec::new("plugin/codex/gpt-5");
+
+        apply_plugin_defaults(&mut selected, &axis);
+
+        assert_eq!(selected.context_window_tokens, Some(200_000));
+        assert_eq!(selected.reasoning.effort.as_deref(), Some("high"));
+        assert!(selected.reasoning.enabled);
+    }
+
+    #[test]
+    fn plugin_defaults_keep_explicit_request_values_and_disablement() {
+        let axis = plugin_variant_axis(&plugin_model());
+        let mut selected = crate::model::ModelSpec::new("plugin/codex/gpt-5");
+        selected.context_window_tokens = Some(1_000_000);
+        selected.reasoning.effort = Some("low".into());
+
+        apply_plugin_defaults(&mut selected, &axis);
+
+        assert_eq!(selected.context_window_tokens, Some(1_000_000));
+        assert_eq!(selected.reasoning.effort.as_deref(), Some("low"));
+
+        let mut disabled = crate::model::ModelSpec::new("plugin/codex/gpt-5");
+        disabled.reasoning.explicitly_disabled = true;
+        apply_plugin_defaults(&mut disabled, &axis);
+        assert_eq!(disabled.reasoning.effort, None);
+        assert!(!disabled.reasoning.enabled);
     }
 
     #[test]
