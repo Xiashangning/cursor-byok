@@ -456,7 +456,7 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
                         .or_else(|| optional("subagentType"))
                         .unwrap_or_default(),
                 )),
-                model: optional("model"),
+                model: optional("model_display").or_else(|| optional("model")),
                 resume,
                 agent_id: None,
                 attachments: call

@@ -1,9 +1,8 @@
 //! Hydrates request context blobs supplied by Cursor.
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use parking_lot::Mutex;
 use prost::Message;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 
 use crate::{
     cursor::{protocol::proto::agent::v1 as pb, transport::TransportHandle},
@@ -17,32 +16,15 @@ type ContextSender = oneshot::Sender<Result<pb::RequestContext>>;
 pub(crate) struct RequestContextSynchronizer {
     handle: TransportHandle,
     store: Store,
-    pending: Arc<Mutex<HashMap<u32, ContextSender>>>,
-    runtime: crate::cursor::tools::runtime::CursorToolRuntime,
-}
-
-struct PendingContext {
-    id: u32,
-    pending: Arc<Mutex<HashMap<u32, ContextSender>>>,
-}
-
-impl Drop for PendingContext {
-    fn drop(&mut self) {
-        self.pending.lock().remove(&self.id);
-    }
+    pending: Arc<Mutex<Option<ContextSender>>>,
 }
 
 impl RequestContextSynchronizer {
-    pub(crate) fn new(
-        handle: TransportHandle,
-        store: Store,
-        runtime: crate::cursor::tools::runtime::CursorToolRuntime,
-    ) -> Self {
+    pub(crate) fn new(handle: TransportHandle, store: Store) -> Self {
         Self {
             handle,
             store,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            runtime,
+            pending: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -65,12 +47,14 @@ impl RequestContextSynchronizer {
 
     pub(crate) async fn load(&self, conversation_id: &str) -> Result<pb::RequestContext> {
         let (sender, receiver) = oneshot::channel();
-        let id = self.runtime.next_id()?;
-        self.pending.lock().insert(id, sender);
-        let _pending = PendingContext {
-            id,
-            pending: self.pending.clone(),
-        };
+        let mut pending = self.pending.lock().await;
+        if pending.is_some() {
+            return Err(Error::Protocol(
+                "Cursor request context is already being loaded".into(),
+            ));
+        }
+        *pending = Some(sender);
+        drop(pending);
 
         tracing::info!(
             request_id = self.handle.request_id(),
@@ -78,11 +62,11 @@ impl RequestContextSynchronizer {
             "requesting uncached Cursor context"
         );
 
-        self.handle.emit(&pb::AgentServerMessage {
+        if let Err(error) = self.handle.emit(&pb::AgentServerMessage {
             ttft_breakdown: None,
             message: Some(pb::agent_server_message::Message::ExecServerMessage(
                 pb::ExecServerMessage {
-                    id,
+                    id: 0,
                     message: Some(pb::exec_server_message::Message::RequestContextArgs(
                         pb::RequestContextArgs {
                             notes_session_id: Some(conversation_id.into()),
@@ -92,23 +76,33 @@ impl RequestContextSynchronizer {
                     ..Default::default()
                 },
             )),
-        })?;
+        }) {
+            self.pending.lock().await.take();
+            return Err(error);
+        }
 
         let cancellation = self.handle.disconnect_token();
-        tokio::select! {
+        let result = tokio::select! {
             result = receiver => result.map_err(|_| Error::Protocol("request context response channel closed".into()))?,
             _ = cancellation.cancelled() => Err(Error::Cancelled),
             _ = tokio::time::sleep(Duration::from_secs(60)) => Err(Error::Protocol("request context timed out".into())),
+        };
+        if result.is_err() {
+            self.pending.lock().await.take();
         }
+        result
     }
 
     pub(crate) async fn handle_client(&self, message: &pb::ExecClientMessage) -> bool {
+        if message.id != 0 {
+            return false;
+        }
         let Some(pb::exec_client_message::Message::RequestContextResult(result)) =
             message.message.as_ref()
         else {
             return false;
         };
-        let Some(sender) = self.pending.lock().remove(&message.id) else {
+        let Some(sender) = self.pending.lock().await.take() else {
             tracing::warn!(
                 request_id = self.handle.request_id(),
                 "unexpected Cursor request context result"
@@ -138,11 +132,15 @@ impl RequestContextSynchronizer {
     }
 
     pub(crate) async fn handle_stream_close(&self, id: u32) -> bool {
-        self.pending.lock().contains_key(&id)
+        id == 0 && self.pending.lock().await.is_some()
     }
 
     pub(crate) async fn handle_throw(&self, id: u32, message: String) -> bool {
-        let sender = self.pending.lock().remove(&id);
+        let sender = if id == 0 {
+            self.pending.lock().await.take()
+        } else {
+            None
+        };
         let Some(sender) = sender else { return false };
         let _ = sender.send(Err(Error::Protocol(message)));
         true

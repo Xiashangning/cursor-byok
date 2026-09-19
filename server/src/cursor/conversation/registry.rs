@@ -1,15 +1,8 @@
 //! Maps conversation IDs to active conversation runtimes.
 
-#[cfg(test)]
-#[path = "registry_tests.rs"]
-mod tests;
+use std::{collections::HashMap, sync::Arc};
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
-
-use tokio::sync::{mpsc, Mutex, Notify, OwnedMutexGuard};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::{
     cursor::{prompting::PromptCompiler, transport::TransportHandle},
@@ -40,16 +33,10 @@ pub(crate) struct ConversationDependencies {
 }
 
 struct RegistryInner {
-    state: Mutex<RegistryState>,
+    current: Mutex<HashMap<ConversationId, ActiveRun>>,
+    pending: Mutex<HashMap<ConversationId, PendingMessages>>,
     changed: Notify,
     pub dependencies: ConversationDependencies,
-}
-
-#[derive(Default)]
-struct RegistryState {
-    current: HashMap<ConversationId, ActiveRun>,
-    pending: HashMap<ConversationId, PendingMessages>,
-    completion_starts: HashMap<ConversationId, Weak<Mutex<()>>>,
 }
 
 #[derive(Clone)]
@@ -69,7 +56,8 @@ impl ConversationRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
-                state: Mutex::new(RegistryState::default()),
+                current: Mutex::new(HashMap::new()),
+                pending: Mutex::new(HashMap::new()),
                 changed: Notify::new(),
                 dependencies: ConversationDependencies {
                     store,
@@ -95,48 +83,13 @@ impl ConversationRegistry {
         super::ConversationRuntime::spawn(self.clone(), handle, receiver);
     }
 
-    /// Serialize completion admission through activation, not provider execution.
-    /// Without this boundary, two idle observations can create competing runs.
-    pub(crate) async fn lock_completion_start(
-        &self,
-        conversation_id: &ConversationId,
-    ) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut state = self.inner.state.lock().await;
-            state
-                .completion_starts
-                .retain(|_, lock| lock.strong_count() > 0);
-            match state
-                .completion_starts
-                .get(conversation_id)
-                .and_then(Weak::upgrade)
-            {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(Mutex::new(()));
-                    state
-                        .completion_starts
-                        .insert(conversation_id.clone(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
-        };
-        lock.lock_owned().await
-    }
-
     pub(crate) async fn activate(
         &self,
         conversation_id: ConversationId,
         run_id: RunId,
         handle: RunHandle,
-    ) -> Vec<CompiledMessages> {
-        let mut state = self.inner.state.lock().await;
-        let pending = state
-            .pending
-            .remove(&conversation_id)
-            .map(|mut pending| pending.drain().collect())
-            .unwrap_or_default();
-        let previous = state.current.insert(
+    ) {
+        let previous = self.inner.current.lock().await.insert(
             conversation_id,
             ActiveRun {
                 run_id: run_id.clone(),
@@ -146,90 +99,70 @@ impl ConversationRegistry {
         if let Some(previous) = previous.filter(|previous| previous.run_id != run_id) {
             previous.handle.cancel();
         }
-        pending
     }
 
     pub async fn deliver(
         &self,
         conversation_id: &ConversationId,
-        mut compiled: CompiledMessages,
+        compiled: CompiledMessages,
     ) -> CommandResult {
         if compiled.delivery == MessageDelivery::Ignore {
             return CommandResult::Applied;
         }
-        loop {
-            let mut state = self.inner.state.lock().await;
-            let Some(active) = state.current.get(conversation_id).cloned() else {
-                state
-                    .pending
-                    .entry(conversation_id.clone())
-                    .or_default()
-                    .push(compiled);
-                return CommandResult::RunEnded;
-            };
-            drop(state);
-            if compiled
-                .target_run_id
-                .as_ref()
-                .is_some_and(|target| target != &active.run_id)
-            {
-                return CommandResult::StaleTarget;
-            }
-            let pending = compiled.clone();
-            let result = match compiled.delivery {
-                MessageDelivery::Ignore => CommandResult::Applied,
-                MessageDelivery::InsertMessages => {
-                    active
-                        .handle
-                        .insert_messages(compiled.event_id, compiled.messages)
-                        .await
-                }
-                MessageDelivery::BreakMessages => {
-                    active
-                        .handle
-                        .break_messages(compiled.event_id, compiled.messages)
-                        .await
-                }
-            };
-            if matches!(result, CommandResult::RunClosing | CommandResult::RunEnded) {
-                let mut state = self.inner.state.lock().await;
-                if state
-                    .current
-                    .get(conversation_id)
-                    .is_some_and(|current| current.run_id != active.run_id)
-                {
-                    compiled = pending;
-                    continue;
-                }
-                state
-                    .pending
-                    .entry(conversation_id.clone())
-                    .or_default()
-                    .push(pending);
-                #[cfg(test)]
-                self.inner.changed.notify_waiters();
-            }
-            return result;
+        let active = self
+            .inner
+            .current
+            .lock()
+            .await
+            .get(conversation_id)
+            .cloned();
+        let Some(active) = active else {
+            self.inner
+                .pending
+                .lock()
+                .await
+                .entry(conversation_id.clone())
+                .or_default()
+                .push(compiled);
+            return CommandResult::RunEnded;
+        };
+        if compiled
+            .target_run_id
+            .as_ref()
+            .is_some_and(|target| target != &active.run_id)
+        {
+            return CommandResult::StaleTarget;
         }
-    }
-
-    pub(crate) async fn discard_pending_completions(
-        &self,
-        conversation_id: &ConversationId,
-        completions: &[crate::model::TerminalCompletion],
-    ) {
-        let mut state = self.inner.state.lock().await;
-        if let Some(pending) = state.pending.get_mut(conversation_id) {
-            pending.remove_completions(completions);
-            if pending.is_empty() {
-                state.pending.remove(conversation_id);
+        let pending = compiled.clone();
+        let result = match compiled.delivery {
+            MessageDelivery::Ignore => CommandResult::Applied,
+            MessageDelivery::InsertMessages => {
+                active
+                    .handle
+                    .insert_messages(compiled.event_id, compiled.messages)
+                    .await
             }
+            MessageDelivery::BreakMessages => {
+                active
+                    .handle
+                    .break_messages(compiled.event_id, compiled.messages)
+                    .await
+            }
+        };
+        if matches!(result, CommandResult::RunClosing | CommandResult::RunEnded) {
+            self.inner
+                .pending
+                .lock()
+                .await
+                .entry(conversation_id.clone())
+                .or_default()
+                .push(pending);
         }
+        result
     }
 
     pub(crate) async fn release(&self, conversation_id: &ConversationId, run_id: &RunId) {
-        let mut state = self.inner.state.lock().await;
-        let current = &mut state.current;
+        let mut current = self.inner.current.lock().await;
         if current
             .get(conversation_id)
             .is_some_and(|run| &run.run_id == run_id)
@@ -246,10 +179,9 @@ impl ConversationRegistry {
             changed.as_mut().enable();
             if !self
                 .inner
-                .state
+                .current
                 .lock()
                 .await
-                .current
                 .contains_key(conversation_id)
             {
                 return;
@@ -258,8 +190,21 @@ impl ConversationRegistry {
         }
     }
 
+    pub(crate) async fn take_pending(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Vec<CompiledMessages> {
+        self.inner
+            .pending
+            .lock()
+            .await
+            .remove(conversation_id)
+            .map(|mut pending| pending.drain().collect())
+            .unwrap_or_default()
+    }
+
     pub async fn shutdown(&self) {
-        let current = std::mem::take(&mut self.inner.state.lock().await.current);
+        let current = std::mem::take(&mut *self.inner.current.lock().await);
         for active in current.into_values() {
             active.handle.cancel();
         }

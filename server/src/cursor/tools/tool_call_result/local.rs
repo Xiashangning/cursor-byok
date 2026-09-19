@@ -40,7 +40,6 @@ pub(crate) fn subagents_disabled(call: &ToolCall) -> Result<ToolCompletion> {
             content: SUBAGENTS_DISABLED_REMINDER.into(),
             is_error: true,
             image: None,
-            consumed_completion: None,
         },
         tool,
     ))
@@ -80,7 +79,6 @@ fn todo_write(call: &ToolCall) -> Result<ToolCompletion> {
             content: call.arguments.to_string(),
             is_error: false,
             image: None,
-            consumed_completion: None,
         },
         tool,
     ))
@@ -126,7 +124,6 @@ fn update_current_step(call: &ToolCall, message_index: usize) -> Result<ToolComp
             .to_string(),
             is_error: false,
             image: None,
-            consumed_completion: None,
         },
         tool,
     ))

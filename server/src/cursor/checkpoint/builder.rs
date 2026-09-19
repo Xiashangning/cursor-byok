@@ -10,7 +10,7 @@ use crate::{
         services::blob_sync::BlobSynchronizer,
         transport::TransportHandle,
     },
-    model::{CanonicalMessage, ToolCall, ToolDefinition, ToolRoundAssistant},
+    model::{CanonicalMessage, ConversationId, ToolCall, ToolDefinition, ToolRoundAssistant},
     store::Store,
     Result,
 };
@@ -20,6 +20,7 @@ use super::{derived, roots::RootFrontier, turns::TurnFrontier};
 #[derive(Clone)]
 pub struct CheckpointBuilder {
     pub(super) store: Store,
+    pub(super) conversation_id: ConversationId,
     pub(super) sync: BlobSynchronizer,
     pub(super) parent_tool_call_id: Option<String>,
     pub(super) base: pb::ConversationStateStructure,
@@ -38,12 +39,14 @@ pub struct CheckpointBuilder {
 impl CheckpointBuilder {
     pub fn new(
         store: Store,
+        conversation_id: ConversationId,
         sync: BlobSynchronizer,
         parent_tool_call_id: Option<String>,
         base: Option<pb::ConversationStateStructure>,
     ) -> Self {
         Self {
             store,
+            conversation_id,
             sync,
             parent_tool_call_id,
             base: base.unwrap_or_default(),
@@ -57,49 +60,6 @@ impl CheckpointBuilder {
             roots: None,
             turn: None,
             turns_initialized: false,
-        }
-    }
-
-    pub fn record_background_completion_action(
-        &mut self,
-        action: &pb::BackgroundTaskCompletionAction,
-    ) {
-        for completion in &action.completions {
-            if completion.kind != pb::BackgroundTaskKind::Subagent as i32
-                || completion.reason != pb::BackgroundTaskCompletionReason::TaskFinished as i32
-                || completion.task_id.is_empty()
-            {
-                continue;
-            }
-            let Some(tool_call_id) = completion
-                .tool_call_id
-                .as_deref()
-                .filter(|tool_call_id| !tool_call_id.is_empty())
-            else {
-                continue;
-            };
-            let Some(run) = self
-                .base
-                .subagent_runs_by_parent_tool_call_id
-                .get_mut(tool_call_id)
-            else {
-                continue;
-            };
-            if run.subagent_id.as_deref() != completion.subagent_id.as_deref() {
-                continue;
-            }
-            let status = match pb::BackgroundTaskStatus::try_from(completion.status) {
-                Ok(pb::BackgroundTaskStatus::Success) => pb::SubagentRunStatus::Success,
-                Ok(pb::BackgroundTaskStatus::Error) => pb::SubagentRunStatus::Error,
-                Ok(pb::BackgroundTaskStatus::Aborted) => pb::SubagentRunStatus::Aborted,
-                _ => continue,
-            };
-            run.task_id = Some(completion.task_id.clone());
-            run.status = status as i32;
-            run.detail = completion.detail.clone();
-            run.output_path = completion.output_path.clone();
-            run.completed_timestamp_ms = Some(crate::cursor::tools::runtime::now_ms());
-            run.completion_reason = Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32);
         }
     }
 
@@ -201,9 +161,17 @@ impl CheckpointBuilder {
         pending_tool_calls: Vec<String>,
         presentation: &PendingSteps,
     ) -> Result<pb::ConversationStateStructure> {
-        self.record_subagents(presentation);
-        self.record_consumed_subagent_completions(presentation);
-        self.record_terminal_completions(messages);
+        self.record_background_subagents(presentation);
+        let consumed = self.record_consumed_subagent_completions(presentation);
+        for (subagent_id, parent_tool_call_id) in consumed {
+            self.store
+                .record_consumed_subagent_completion(
+                    &self.conversation_id,
+                    &subagent_id,
+                    &parent_tool_call_id,
+                )
+                .await?;
+        }
         let root_ids = self.project_roots(messages).await?;
         let turn_ids = self.project_turns(mode, presentation).await?;
         let (todo_ids, plan_id) = self.build_derived_state(messages).await?;
@@ -245,38 +213,7 @@ impl CheckpointBuilder {
         Ok(checkpoint)
     }
 
-    fn record_terminal_completions(&mut self, messages: &[CanonicalMessage]) {
-        for completion in messages
-            .iter()
-            .filter_map(|message| message.terminal_completion.as_ref())
-        {
-            if completion.kind != "subagent" {
-                continue;
-            }
-            let Some(run) = self
-                .base
-                .subagent_runs_by_parent_tool_call_id
-                .get_mut(&completion.tool_call_id)
-            else {
-                continue;
-            };
-            if run.task_id.as_deref() != Some(completion.task_id.as_str()) {
-                continue;
-            }
-            let status = match completion.status.as_str() {
-                "success" => pb::SubagentRunStatus::Success,
-                "error" => pb::SubagentRunStatus::Error,
-                "aborted" => pb::SubagentRunStatus::Aborted,
-                _ => continue,
-            };
-            run.status = status as i32;
-            run.completed_timestamp_ms
-                .get_or_insert_with(crate::cursor::tools::runtime::now_ms);
-            run.completion_reason = Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32);
-        }
-    }
-
-    fn record_subagents(&mut self, presentation: &PendingSteps) {
+    fn record_background_subagents(&mut self, presentation: &PendingSteps) {
         for step in &presentation.steps {
             let Some(pb::conversation_step::Message::ToolCall(call)) = step.message.as_ref() else {
                 continue;
@@ -290,6 +227,9 @@ impl CheckpointBuilder {
             let Some(pb::task_result::Result::Success(success)) = result.result.as_ref() else {
                 continue;
             };
+            if !success.is_background {
+                continue;
+            }
             let Some(agent_id) = success.agent_id.as_ref().filter(|id| !id.is_empty()) else {
                 continue;
             };
@@ -303,10 +243,7 @@ impl CheckpointBuilder {
             self.base
                 .subagent_states
                 .entry(agent_id.clone())
-                .and_modify(|state| {
-                    state.last_used_timestamp_ms = last_used_timestamp_ms;
-                    state.model_id = args.model.clone();
-                })
+                .and_modify(|state| state.last_used_timestamp_ms = last_used_timestamp_ms)
                 .or_insert_with(|| pb::SubagentPersistedState {
                     conversation_state: None,
                     created_timestamp_ms: started_at_ms,
@@ -319,28 +256,6 @@ impl CheckpointBuilder {
                     cloud_requested_environment_build_id: None,
                     machine: args.machine.clone(),
                 });
-            if !success.is_background {
-                continue;
-            }
-            if success.background_reason == pb::SubagentBackgroundReason::QueuedFollowUp as i32
-                && self
-                    .base
-                    .subagent_runs_by_parent_tool_call_id
-                    .values()
-                    .any(|run| {
-                        run.subagent_id.as_ref() == Some(agent_id)
-                            && matches!(
-                                pb::SubagentRunStatus::try_from(run.status),
-                                Ok(pb::SubagentRunStatus::Running
-                                    | pb::SubagentRunStatus::Backgrounded)
-                            )
-                    })
-            {
-                continue;
-            }
-            self.base
-                .subagent_runs_by_parent_tool_call_id
-                .retain(|_, run| run.subagent_id.as_ref() != Some(agent_id));
             self.base.subagent_runs_by_parent_tool_call_id.insert(
                 tool_call_id.clone(),
                 pb::SubagentRunState {
@@ -354,25 +269,28 @@ impl CheckpointBuilder {
                     output_path: None,
                     completed_timestamp_ms: None,
                     completion_reason: None,
-                    task_id: Some(agent_id.clone()),
                 },
             );
         }
     }
 
-    fn record_consumed_subagent_completions(&mut self, presentation: &PendingSteps) {
+    fn record_consumed_subagent_completions(
+        &mut self,
+        presentation: &PendingSteps,
+    ) -> Vec<(String, String)> {
+        let mut consumed = Vec::new();
         for step in &presentation.steps {
             let Some(pb::conversation_step::Message::ToolCall(call)) = step.message.as_ref() else {
                 continue;
             };
-            let Some((task_id, status)) = consumed_subagent_completion(call) else {
+            let Some((agent_id, status)) = consumed_subagent_completion(call) else {
                 continue;
             };
             let Some(state) = self
                 .base
                 .subagent_runs_by_parent_tool_call_id
                 .values_mut()
-                .find(|state| state.task_id.as_deref() == Some(task_id))
+                .find(|state| state.subagent_id.as_deref() == Some(agent_id))
             else {
                 continue;
             };
@@ -381,7 +299,9 @@ impl CheckpointBuilder {
                 .completed_at_ms
                 .or_else(|| Some(crate::cursor::tools::runtime::now_ms()));
             state.completion_reason = Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32);
+            consumed.push((agent_id.to_owned(), state.parent_tool_call_id.clone()));
         }
+        consumed
     }
 
     pub async fn publish(
@@ -447,14 +367,6 @@ fn reset_resumed_subagent_runs(state: &mut pb::ConversationStateStructure, calls
         else {
             continue;
         };
-        if matches!(
-            pb::SubagentRunStatus::try_from(previous.status),
-            Ok(pb::SubagentRunStatus::Running | pb::SubagentRunStatus::Backgrounded)
-        ) {
-            // A follow-up to live work still belongs to its original tool call.
-            // Rebind only after the IDE reports a genuinely new execution.
-            continue;
-        }
         state
             .subagent_runs_by_parent_tool_call_id
             .retain(|_, run| run.subagent_id.as_deref() != Some(subagent_id));
@@ -477,7 +389,6 @@ fn reset_resumed_subagent_runs(state: &mut pb::ConversationStateStructure, calls
                 output_path: None,
                 completed_timestamp_ms: None,
                 completion_reason: None,
-                task_id: Some(subagent_id.to_owned()),
             },
         );
     }
@@ -489,9 +400,8 @@ fn consumed_subagent_completion(call: &pb::ToolCall) -> Option<(&str, pb::Subage
             let agent_id = tool.args.as_ref()?.task_id.as_str();
             let status = match tool.result.as_ref()?.result.as_ref()? {
                 pb::await_result::Result::Complete(_) => pb::SubagentRunStatus::Success,
-                pb::await_result::Result::Error(_) | pb::await_result::Result::StillRunning(_) => {
-                    return None
-                }
+                pb::await_result::Result::Error(_) => pb::SubagentRunStatus::Error,
+                pb::await_result::Result::StillRunning(_) => return None,
                 pb::await_result::Result::Success(success) => {
                     match success.await_result.as_ref()? {
                         pb::await_success::AwaitResult::Complete(_) => {
@@ -527,47 +437,6 @@ fn context_limit(selected: Option<u64>, previous: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn updating_a_running_child_preserves_its_completion_owner() {
-        for status in [
-            pb::SubagentRunStatus::Running,
-            pb::SubagentRunStatus::Backgrounded,
-        ] {
-            let run = pb::SubagentRunState {
-                parent_tool_call_id: "create-call".into(),
-                subagent_id: Some("child".into()),
-                status: status as i32,
-                task_id: Some("child".into()),
-                ..Default::default()
-            };
-            let mut state = pb::ConversationStateStructure {
-                subagent_runs_by_parent_tool_call_id: std::collections::HashMap::from([(
-                    "create-call".into(),
-                    run.clone(),
-                )]),
-                ..Default::default()
-            };
-            let call = ToolCall {
-                index: 0,
-                call_id: "update-call".into(),
-                model_call_id: "model-call".into(),
-                name: "send-message-to-agent".into(),
-                arguments_text: String::new(),
-                arguments: serde_json::json!({"agent_id":"child", "prompt":"keep working"}),
-                argument_error: None,
-            };
-            reset_resumed_subagent_runs(&mut state, &[call]);
-            assert_eq!(state.subagent_runs_by_parent_tool_call_id.len(), 1);
-            assert_eq!(
-                state
-                    .subagent_runs_by_parent_tool_call_id
-                    .get("create-call"),
-                Some(&run),
-                "an update must not orphan the original completion's tool_call_id"
-            );
-        }
-    }
 
     #[test]
     fn resumed_subagent_starts_a_new_running_lifecycle() {
@@ -651,26 +520,6 @@ mod tests {
                     result: Some(pb::await_result::Result::StillRunning(
                         pb::AwaitTaskStillRunning::default(),
                     )),
-                }),
-            })),
-            ..Default::default()
-        };
-
-        assert_eq!(consumed_subagent_completion(&call), None);
-    }
-
-    #[test]
-    fn failed_await_call_does_not_consume_the_terminal_result() {
-        let call = pb::ToolCall {
-            tool: Some(pb::tool_call::Tool::AwaitToolCall(pb::AwaitToolCall {
-                args: Some(pb::AwaitArgs {
-                    task_id: "agent-1".into(),
-                    ..Default::default()
-                }),
-                result: Some(pb::AwaitResult {
-                    result: Some(pb::await_result::Result::Error(pb::AwaitError {
-                        error: "not found".into(),
-                    })),
                 }),
             })),
             ..Default::default()

@@ -44,22 +44,6 @@ impl ToolCompletion {
         &self.result
     }
 
-    pub(crate) fn resolve_completion_owner(
-        &mut self,
-        owners: &std::collections::HashMap<String, String>,
-    ) {
-        if let Some(completion) = self.result.consumed_completion.as_mut() {
-            if completion.tool_call_id.is_empty() {
-                if let Some(owner) = owners.get(&completion.task_id) {
-                    completion.tool_call_id = owner.clone();
-                } else {
-                    // An unowned await result cannot consume every execution of this task.
-                    self.result.consumed_completion = None;
-                }
-            }
-        }
-    }
-
     pub fn tool_call(&self) -> &pb::ToolCall {
         &self.tool_call
     }
@@ -106,14 +90,6 @@ impl ToolCompletion {
         mut result: ToolResult,
         mut tool: pb::tool_call::Tool,
     ) -> Self {
-        if result.consumed_completion.is_none() {
-            result.consumed_completion = consumed_completion(&tool);
-            if matches!(&tool, pb::tool_call::Tool::TaskToolCall(_)) {
-                if let Some(completion) = result.consumed_completion.as_mut() {
-                    completion.tool_call_id = call.call_id.clone();
-                }
-            }
-        }
         // Apply the model-visible size gate once, at the tool completion
         // boundary. Canonical history and every provider projection then
         // carry the same bounded result without reprocessing it.
@@ -149,56 +125,10 @@ impl ToolCompletion {
                 content: output,
                 is_error,
                 image: None,
-                consumed_completion: None,
             },
             tool,
         ))
     }
-}
-
-fn consumed_completion(tool: &pb::tool_call::Tool) -> Option<crate::model::TerminalCompletion> {
-    let task_id = match tool {
-        pb::tool_call::Tool::AwaitToolCall(tool) => match tool.result.as_ref()?.result.as_ref()? {
-            pb::await_result::Result::Complete(complete) => {
-                (!complete.task_id.is_empty()).then(|| complete.task_id.clone())?
-            }
-            pb::await_result::Result::Success(success) => {
-                let pb::await_success::AwaitResult::Complete(complete) =
-                    success.await_result.as_ref()?
-                else {
-                    return None;
-                };
-                (!complete.task_id.is_empty()).then(|| complete.task_id.clone())?
-            }
-            pb::await_result::Result::StillRunning(_) | pb::await_result::Result::Error(_) => {
-                return None;
-            }
-        },
-        pb::tool_call::Tool::TaskToolCall(tool) => {
-            let pb::task_result::Result::Success(success) =
-                tool.result.as_ref()?.result.as_ref()?
-            else {
-                return None;
-            };
-            if success.is_background {
-                return None;
-            }
-            success
-                .agent_id
-                .as_deref()
-                .filter(|task_id| !task_id.is_empty())?
-                .to_owned()
-        }
-        _ => return None,
-    };
-    Some(crate::model::TerminalCompletion {
-        task_id,
-        tool_call_id: String::new(),
-        kind: "subagent".into(),
-        status: "success".into(),
-        payload_digest: None,
-        event_id: String::new(),
-    })
 }
 
 #[derive(Clone)]
@@ -243,37 +173,5 @@ pub(super) fn prost_json(value: &prost_types::Value) -> Value {
                 .collect(),
         ),
         Some(Kind::ListValue(value)) => Value::Array(value.values.iter().map(prost_json).collect()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_an_actual_await_completion_is_consumed() {
-        let complete = pb::tool_call::Tool::AwaitToolCall(pb::AwaitToolCall {
-            result: Some(pb::AwaitResult {
-                result: Some(pb::await_result::Result::Complete(pb::AwaitTaskComplete {
-                    task_id: "task-1".into(),
-                    ..Default::default()
-                })),
-            }),
-            ..Default::default()
-        });
-        let error = pb::tool_call::Tool::AwaitToolCall(pb::AwaitToolCall {
-            result: Some(pb::AwaitResult {
-                result: Some(pb::await_result::Result::Error(pb::AwaitError {
-                    error: "not found".into(),
-                })),
-            }),
-            ..Default::default()
-        });
-
-        assert_eq!(
-            consumed_completion(&complete).map(|completion| completion.task_id),
-            Some("task-1".into())
-        );
-        assert_eq!(consumed_completion(&error), None);
     }
 }

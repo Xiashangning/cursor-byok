@@ -193,7 +193,6 @@ impl Store {
                 }],
             },
             runtime_event_id: None,
-            terminal_completion: None,
         };
         let result_message = CanonicalMessage {
             message_id: format!("{}:{}:result", round_id, result.call_id),
@@ -208,17 +207,7 @@ impl Store {
                 provider_parts: Vec::new(),
             }),
             runtime_event_id: None,
-            terminal_completion: result.consumed_completion.clone(),
         };
-        if let Some(completion) = result.consumed_completion.as_ref() {
-            Self::claim_completion_tx(
-                &mut tx,
-                conversation_id,
-                completion,
-                super::CompletionDisposition::Consumed,
-            )
-            .await?;
-        }
         let checkpoint = Self::append_checkpoint_tx(
             &mut tx,
             conversation_id,

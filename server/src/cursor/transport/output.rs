@@ -40,14 +40,6 @@ impl OutputHub {
         receiver
     }
 
-    pub fn has_subscribers(&self) -> bool {
-        self.state
-            .lock()
-            .subscribers
-            .iter()
-            .any(|subscriber| !subscriber.is_closed())
-    }
-
     pub fn close(&self) -> bool {
         let mut state = self.state.lock();
         if state.closed {

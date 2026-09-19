@@ -140,12 +140,7 @@ impl RunHandle {
 
     pub async fn tool_result(&self, result: ToolResult) -> CommandResult {
         self.phase.with_phase(|phase| match phase {
-            RunPhase::Running
-                if self
-                    .commands
-                    .send(RunCommand::ToolResult(Box::new(result)))
-                    .is_ok() =>
-            {
+            RunPhase::Running if self.commands.send(RunCommand::ToolResult(result)).is_ok() => {
                 CommandResult::Applied
             }
             RunPhase::Running | RunPhase::Ended => CommandResult::RunEnded,

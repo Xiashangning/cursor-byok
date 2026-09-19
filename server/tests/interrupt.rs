@@ -18,9 +18,8 @@ use cursor_server::{
 use prost::Message;
 use support::{
     acknowledge_kv, drive, kv_ack, openai_model_input, read_success, registry, run_request,
-    stream_close, subagent_result_error, subagent_result_success, temp_store, text_of,
-    text_response_with_usage, tool_response, user_message_action, wait_for_provider_requests,
-    FakeProvider,
+    subagent_result_error, subagent_result_success, temp_store, text_of, text_response_with_usage,
+    tool_response, user_message_action, wait_for_provider_requests, FakeProvider,
 };
 
 #[tokio::test]
@@ -772,13 +771,7 @@ async fn injected_user_context_aborts_pending_tools_and_ignores_late_results() {
         if let Ok(Some(frame)) =
             tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await
         {
-            let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-            if flags & connect::END_STREAM_FLAG != 0 {
-                panic!(
-                    "interrupted Run ended early: {}",
-                    String::from_utf8_lossy(&payload)
-                );
-            }
+            let (_, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
             let server = pb::AgentServerMessage::decode(payload).unwrap();
             if let Some(pb::agent_server_message::Message::ExecServerControlMessage(control)) =
                 server.message
@@ -877,53 +870,6 @@ async fn injected_user_context_detaches_subagents_without_cancelling_them() {
         .await
         .unwrap();
     append_seqno += 1;
-    let queued_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        assert!(
-            tokio::time::Instant::now() < queued_deadline,
-            "Task injection was not queued"
-        );
-        let frame = tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await;
-        let Ok(Some(frame)) = frame else {
-            continue;
-        };
-        let (_, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        let queued = match server.message {
-            Some(pb::agent_server_message::Message::InteractionUpdate(update)) => {
-                match update.message {
-                    Some(pb::interaction_update::Message::ContextInjectionState(update)) => {
-                        matches!(
-                            update.state.and_then(|state| state.state),
-                            Some(pb::context_injection_state::State::Queued(_))
-                        )
-                    }
-                    _ => false,
-                }
-            }
-            _ => false,
-        };
-        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-        if queued {
-            break;
-        }
-    }
-    handle
-        .command(TransportCommand::Append {
-            seqno: append_seqno,
-            message: Box::new(subagent_result_success(exec_id, "detached-child")),
-        })
-        .await
-        .unwrap();
-    append_seqno += 1;
-    handle
-        .command(TransportCommand::Append {
-            seqno: append_seqno,
-            message: Box::new(stream_close(exec_id)),
-        })
-        .await
-        .unwrap();
-    append_seqno += 1;
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while provider.requests().len() < 2 {
@@ -934,13 +880,7 @@ async fn injected_user_context_detaches_subagents_without_cancelling_them() {
         if let Ok(Some(frame)) =
             tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await
         {
-            let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-            if flags & connect::END_STREAM_FLAG != 0 {
-                panic!(
-                    "interrupted Run ended early: {}",
-                    String::from_utf8_lossy(&payload)
-                );
-            }
+            let (_, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
             let server = pb::AgentServerMessage::decode(payload).unwrap();
             if let Some(pb::agent_server_message::Message::ExecServerControlMessage(control)) =
                 server.message
@@ -955,17 +895,21 @@ async fn injected_user_context_detaches_subagents_without_cancelling_them() {
         }
     }
 
+    handle
+        .command(TransportCommand::Append {
+            seqno: append_seqno,
+            message: Box::new(subagent_result_success(exec_id, "detached-child")),
+        })
+        .await
+        .unwrap();
+    append_seqno += 1;
     release.notify_one();
 
     let out = drive(&handle, &mut output, &mut append_seqno, |_| vec![]).await;
     assert_eq!(out.terminal, serde_json::json!({}));
 
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
-    let history = serde_json::to_string(&requests[1].history).unwrap();
-    assert!(!history.contains("Tool execution was interrupted by a newer user message."));
-    assert!(history.contains("detached-child"));
-    assert_eq!(history.matches("detached-child").count(), 1);
+    let history = serde_json::to_string(&provider.requests()[1].history).unwrap();
+    assert!(history.contains("Tool execution was interrupted by a newer user message."));
     assert!(history.contains("injected follow-up"));
 }
 

@@ -16,7 +16,6 @@ pub struct ToolCallStream {
 }
 
 enum Presentation {
-    Deferred,
     Plain,
     DynamicMcp(pb::McpToolDefinition),
     Edit(EditProjection),
@@ -62,7 +61,6 @@ impl ToolCallStream {
                     Presentation::Edit(EditProjection::new("target_notebook", "new_string"))
                 }
                 "createplan" => Presentation::CreatePlan(CreatePlanProjection::default()),
-                "sendmessagetoagent" => Presentation::Deferred,
                 "task" => Presentation::Task(TaskProjection::default()),
                 _ => Presentation::Plain,
             },
@@ -76,7 +74,6 @@ impl ToolCallStream {
         raw_delta: &str,
     ) -> Result<Vec<pb::AgentServerMessage>> {
         match &mut self.presentation {
-            Presentation::Deferred => Ok(Vec::new()),
             Presentation::Plain => Ok(vec![interaction::arguments_delta(call, raw_delta)?]),
             Presentation::DynamicMcp(definition) => {
                 Ok(vec![interaction::dynamic_mcp_arguments_delta(

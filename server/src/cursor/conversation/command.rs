@@ -25,7 +25,5 @@ pub enum TransportCommand {
         generation: u64,
         finish: RunFinish,
     },
-    ContinueRequest(Box<pb::AgentRunRequest>),
-    OutputDetached,
     Disconnect,
 }

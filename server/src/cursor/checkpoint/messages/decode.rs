@@ -59,11 +59,6 @@ pub fn decode(data: &[u8], internal_id: String) -> Result<CanonicalMessage> {
         origin,
         content,
         runtime_event_id,
-        terminal_completion: value
-            .pointer("/providerOptions/cursor/terminalCompletion")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?,
     })
 }
 

@@ -33,7 +33,6 @@ pub struct TransportHandle {
     trace: CursorTraceRecorder,
     lifecycle: TransportLifecycle,
     disconnect: CancellationToken,
-    latest_checkpoint: Arc<parking_lot::Mutex<Option<pb::ConversationStateStructure>>>,
 }
 
 impl TransportHandle {
@@ -52,7 +51,6 @@ impl TransportHandle {
             trace,
             lifecycle: TransportLifecycle::new(),
             disconnect: CancellationToken::new(),
-            latest_checkpoint: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -115,25 +113,12 @@ impl TransportHandle {
         self.output.subscribe()
     }
 
-    pub(crate) fn has_subscribers(&self) -> bool {
-        self.output.has_subscribers()
-    }
-
     pub fn emit_frame(&self, frame: Bytes) -> bool {
         self.output.emit(frame)
     }
 
-    pub(crate) fn latest_checkpoint(&self) -> Option<pb::ConversationStateStructure> {
-        self.latest_checkpoint.lock().clone()
-    }
-
     pub fn emit(&self, message: &pb::AgentServerMessage) -> Result<()> {
         if self.emit_frame(connect::encode_message(message)?) {
-            if let Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(state)) =
-                message.message.as_ref()
-            {
-                *self.latest_checkpoint.lock() = Some(state.clone());
-            }
             Ok(())
         } else {
             Err(Error::RunNotFound(self.request_id.clone()))

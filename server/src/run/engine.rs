@@ -110,11 +110,6 @@ impl RunEngine {
             checkpoint_id = checkpoint.0,
             "Run claimed conversation ownership"
         );
-        let terminal_completion_run = prepared
-            .initial_messages
-            .iter()
-            .any(|message| message.terminal_completion.is_some());
-        let mut inserted_initial_message = false;
         if !prepared.initial_messages.is_empty() {
             let mut changed = false;
             for message in &prepared.initial_messages {
@@ -131,7 +126,6 @@ impl RunEngine {
                     Ok((next, inserted)) => {
                         checkpoint = next;
                         changed |= inserted;
-                        inserted_initial_message |= inserted;
                     }
                     Err(error) => return (RunOutcome::Failed(error.into()), usage),
                 }
@@ -155,22 +149,6 @@ impl RunEngine {
                 if let Err(outcome) = wait_for_state_ready(ready, cancellation).await {
                     return (outcome, usage);
                 }
-            }
-        }
-        if terminal_completion_run && !inserted_initial_message {
-            let completions = prepared
-                .initial_messages
-                .iter()
-                .filter_map(|message| message.terminal_completion.clone())
-                .collect::<Vec<_>>();
-            match self
-                .store
-                .background_completions_processed(&prepared.conversation_id, &completions)
-                .await
-            {
-                Ok(true) => return (RunOutcome::Completed, usage),
-                Ok(false) => {}
-                Err(error) => return (RunOutcome::Failed(error.into()), usage),
             }
         }
 
@@ -211,12 +189,6 @@ impl RunEngine {
                 Ok(messages) => messages,
                 Err(error) => return (RunOutcome::Failed(error.into()), usage),
             };
-            // A background completion notification at the history tail allows
-            // the follow-up cycle to stay silent: an empty response appends no
-            // assistant message and keeps the earlier summary as the tail.
-            let tail_is_background_notification = messages
-                .last()
-                .is_some_and(|message| message.terminal_completion.is_some());
             let history = match crate::model::project_messages(&messages) {
                 Ok(history) => history,
                 Err(error) => return (RunOutcome::Failed(error.into()), usage),
@@ -597,7 +569,6 @@ impl RunEngine {
                         }],
                     },
                     runtime_event_id: Some(event_id),
-                    terminal_completion: None,
                 };
                 checkpoint = match self
                     .store
@@ -669,37 +640,32 @@ impl RunEngine {
             }
 
             if cycle.calls.is_empty() {
-                let silent_follow_up =
-                    cycle.text.trim().is_empty() && tail_is_background_notification;
-                if !silent_follow_up {
-                    let assistant = CanonicalMessage {
-                        message_id: format!("{}:assistant:{provider_call_index}", prepared.run_id),
-                        role: Role::Assistant,
-                        origin: Origin::Assistant,
-                        content: MessageContent::Assistant {
-                            text: cycle.text,
-                            thinking: cycle.reasoning,
-                            tool_round_id: None,
-                            replay_state: cycle.replay_state,
-                            tool_calls: Vec::new(),
-                        },
-                        runtime_event_id: None,
-                        terminal_completion: None,
-                    };
-                    checkpoint = match self
-                        .store
-                        .append_checkpoint(
-                            &prepared.conversation_id,
-                            &prepared.run_id,
-                            checkpoint,
-                            &[assistant],
-                        )
-                        .await
-                    {
-                        Ok(checkpoint) => checkpoint,
-                        Err(error) => return (RunOutcome::Failed(error.into()), usage),
-                    };
-                }
+                let assistant = CanonicalMessage {
+                    message_id: format!("{}:assistant:{provider_call_index}", prepared.run_id),
+                    role: Role::Assistant,
+                    origin: Origin::Assistant,
+                    content: MessageContent::Assistant {
+                        text: cycle.text,
+                        thinking: cycle.reasoning,
+                        tool_round_id: None,
+                        replay_state: cycle.replay_state,
+                        tool_calls: Vec::new(),
+                    },
+                    runtime_event_id: None,
+                };
+                checkpoint = match self
+                    .store
+                    .append_checkpoint(
+                        &prepared.conversation_id,
+                        &prepared.run_id,
+                        checkpoint,
+                        &[assistant],
+                    )
+                    .await
+                {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => return (RunOutcome::Failed(error.into()), usage),
+                };
                 if !pending_insertions.is_empty() {
                     let inserted = match super::messages::append_batches(
                         &self.store,
@@ -937,7 +903,6 @@ impl RunEngine {
                 }],
             },
             runtime_event_id: Some(event_id),
-            terminal_completion: None,
         };
         let mut replacement = retained_request_context.into_iter().collect::<Vec<_>>();
         replacement.push(summary_message);

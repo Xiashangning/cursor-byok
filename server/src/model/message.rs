@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{TerminalCompletion, ToolImageReference, ToolRoundId};
+use super::{ToolImageReference, ToolRoundId};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -88,8 +88,6 @@ pub struct CanonicalMessage {
     pub content: MessageContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_event_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_completion: Option<TerminalCompletion>,
 }
 
 impl CanonicalMessage {
@@ -107,7 +105,6 @@ impl CanonicalMessage {
                 parts: vec![ContentPart::Text { text: text.into() }],
             },
             runtime_event_id: None,
-            terminal_completion: None,
         }
     }
 
@@ -123,7 +120,6 @@ impl CanonicalMessage {
             origin,
             content: MessageContent::Parts { parts },
             runtime_event_id: None,
-            terminal_completion: None,
         }
     }
 }
@@ -164,7 +160,6 @@ impl RuntimeEvent {
                 parts: vec![ContentPart::Text { text: self.text }],
             },
             runtime_event_id: Some(self.event_id),
-            terminal_completion: None,
         }
     }
 }

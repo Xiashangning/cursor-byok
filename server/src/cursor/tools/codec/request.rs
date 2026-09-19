@@ -126,58 +126,25 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                 .into(),
             tool_call_id: call.call_id.clone(),
         }),
-        "task" | "createagent" | "sendmessagetoagent" => {
+        "task" => {
             let model_parameters = task_model_parameters(call)?;
             let model_id = string("model")?;
-            let background = !call.name.eq_ignore_ascii_case("Task");
-            let followup = normalize(&call.name) == "sendmessagetoagent";
-            let resume_agent_id = optional_string("resume")
-                .or_else(|| optional_string("agent_id"))
-                .or_else(|| optional_string("agentId"));
-            if followup && resume_agent_id.is_none() {
-                return Err(Error::Protocol(
-                    "send-message-to-agent is missing agent_id".into(),
-                ));
-            }
-            let readonly = call
-                .arguments
-                .get("readonly")
-                .or_else(|| call.arguments.get("readOnly"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
             Message::SubagentArgs(pb::SubagentArgs {
                 tool_call_id: call.call_id.clone(),
-                subagent_type: optional_string("subagent_type")
-                    .or_else(|| optional_string("subagentType"))
-                    .unwrap_or_else(|| "generalPurpose".into()),
+                subagent_type: optional_string("subagent_type").unwrap_or_default(),
                 model_id,
                 prompt: string("prompt")?,
-                readonly,
-                resume_agent_id,
+                readonly: false,
+                resume_agent_id: optional_string("resume"),
                 run_in_background: call
                     .arguments
                     .get("run_in_background")
-                    .and_then(Value::as_bool)
-                    .or(background.then_some(true)),
+                    .and_then(Value::as_bool),
                 continuation_config: None,
                 parent_conversation_id: Some(context.conversation_id.clone()),
-                // follow-up 默认打断运行中的子代理；显式 false 保留忙时失败语义。
-                interrupt: if followup {
-                    Some(
-                        call.arguments
-                            .get("interrupt")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(true),
-                    )
-                } else {
-                    call.arguments.get("interrupt").and_then(Value::as_bool)
-                },
-                mode: if readonly {
-                    pb::TaskMode::Plan as i32
-                } else {
-                    pb::TaskMode::Agent as i32
-                },
-                fork_agent_id: optional_string("fork"),
+                interrupt: call.arguments.get("interrupt").and_then(Value::as_bool),
+                mode: 0,
+                fork_agent_id: None,
                 root_parent_conversation_id: Some(context.root_conversation_id.clone()),
                 selected_context: task_attachments(call),
                 direct_meta_parent_child_subagent: None,
@@ -192,6 +159,68 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                 },
                 cloud_base_branch: optional_string("cloud_base_branch"),
                 model_parameters,
+                credentials: None,
+            })
+        }
+        "createagent" => Message::ForceBackgroundSubagentArgs(pb::ForceBackgroundSubagentArgs {
+            tool_call_id: call.call_id.clone(),
+        }),
+        "sendmessagetoagent" => {
+            let prompt = string("prompt")?;
+            let agent_id = optional_string("agent_id").or_else(|| optional_string("agentId"));
+            let requested_model = optional_string("model").filter(|model| !model.is_empty());
+            let subagent_type = optional_string("subagent_type")
+                .or_else(|| optional_string("subagentType"))
+                .unwrap_or_default();
+            let model_id = match context.subagent_model_for(&subagent_type) {
+                Some(crate::cursor::tools::runtime::SubagentModel::Model(model)) => model.clone(),
+                Some(crate::cursor::tools::runtime::SubagentModel::Inherit) => {
+                    context.default_subagent_model.clone()
+                }
+                Some(crate::cursor::tools::runtime::SubagentModel::Disabled) => {
+                    return Err(Error::Protocol(
+                        "send-message-to-agent is disabled by the subagent model override".into(),
+                    ))
+                }
+                None => requested_model
+                    .map(|model| context.canonical_model(&model))
+                    .unwrap_or_else(|| context.default_subagent_model.clone()),
+            };
+            let readonly = call
+                .arguments
+                .get("readonly")
+                .or_else(|| call.arguments.get("readOnly"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Message::SubagentArgs(pb::SubagentArgs {
+                tool_call_id: call.call_id.clone(),
+                subagent_type,
+                model_id,
+                prompt,
+                readonly,
+                resume_agent_id: agent_id,
+                run_in_background: None,
+                continuation_config: None,
+                parent_conversation_id: Some(context.conversation_id.clone()),
+                // follow-up 默认打断运行中的子代理；显式 false 保留忙时失败语义。
+                interrupt: Some(
+                    call.arguments
+                        .get("interrupt")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                ),
+                mode: if readonly {
+                    pb::TaskMode::Plan as i32
+                } else {
+                    pb::TaskMode::Agent as i32
+                },
+                fork_agent_id: None,
+                root_parent_conversation_id: Some(context.root_conversation_id.clone()),
+                selected_context: None,
+                direct_meta_parent_child_subagent: None,
+                environment: pb::SubagentExecutionEnvironment::Local as i32,
+                cloud_base_branch: None,
+                model_parameters: Vec::new(),
                 credentials: None,
             })
         }
@@ -529,11 +558,7 @@ fn task_model_parameters(call: &ToolCall) -> Result<Vec<pb::requested_model::Mod
 }
 
 fn task_attachments(call: &ToolCall) -> Option<pb::SelectedContext> {
-    let paths = call
-        .arguments
-        .get("file_attachments")
-        .or_else(|| call.arguments.get("attachments"))?
-        .as_array()?;
+    let paths = call.arguments.get("file_attachments")?.as_array()?;
     let mut context = pb::SelectedContext::default();
     for path in paths.iter().filter_map(Value::as_str) {
         let extension = std::path::Path::new(path)
@@ -614,13 +639,17 @@ mod tests {
     }
 
     fn message(call: &ToolCall) -> pb::exec_server_message::Message {
-        let context = crate::cursor::tools::runtime::ExecContext {
-            conversation_id: "conversation-1".into(),
-            root_conversation_id: "root-1".into(),
-            default_subagent_model: "model-1".into(),
-            ..Default::default()
-        };
-        let server = request(7, &context.prepare_call(call).unwrap(), &context).unwrap();
+        let server = request(
+            7,
+            call,
+            &crate::cursor::tools::runtime::ExecContext {
+                conversation_id: "conversation-1".into(),
+                root_conversation_id: "root-1".into(),
+                default_subagent_model: "model-1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let Some(pb::agent_server_message::Message::ExecServerMessage(server)) = server.message
         else {
             panic!("expected ExecServerMessage")
@@ -720,12 +749,10 @@ mod tests {
             .insert("deepseek flash".into(), "hash-deepseek".into());
         let server = request(
             7,
-            &context
-                .prepare_call(&call(
-                    "send-message-to-agent",
-                    json!({"agent_id":"agent-1","prompt":"continue","model":"DeepSeek Flash"}),
-                ))
-                .unwrap(),
+            &call(
+                "send-message-to-agent",
+                json!({"agent_id":"agent-1","prompt":"continue","model":"DeepSeek Flash"}),
+            ),
             &context,
         )
         .unwrap();
@@ -743,11 +770,8 @@ mod tests {
     fn orchestration_tools_encode_to_client_exec_messages() {
         assert!(matches!(
             message(&call("create-agent", json!({"title":"Inspect","prompt":"inspect"}))),
-            pb::exec_server_message::Message::SubagentArgs(args)
+            pb::exec_server_message::Message::ForceBackgroundSubagentArgs(args)
                 if args.tool_call_id == "call-1"
-                    && args.prompt == "inspect"
-                    && args.run_in_background == Some(true)
-                    && args.subagent_type == "generalPurpose"
         ));
         assert!(matches!(
             message(&call(

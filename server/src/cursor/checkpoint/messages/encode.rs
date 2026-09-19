@@ -32,25 +32,9 @@ pub fn stable_messages(
             },
         );
     }
-    let receipts = messages
-        .iter()
-        .filter_map(|message| {
-            message
-                .terminal_completion
-                .as_ref()
-                .map(|completion| (message.message_id.as_str(), completion))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
     projected
         .iter()
-        .map(|message| {
-            let mut wire = wire_message(message, model, None)?;
-            if let Some(completion) = receipts.get(message.message_id.as_str()) {
-                wire["providerOptions"]["cursor"]["terminalCompletion"] =
-                    serde_json::to_value(completion)?;
-            }
-            serde_json::to_vec(&wire).map_err(Into::into)
-        })
+        .map(|message| serde_json::to_vec(&wire_message(message, model, None)?).map_err(Into::into))
         .collect::<std::result::Result<_, _>>()
 }
 

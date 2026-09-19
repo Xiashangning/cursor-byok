@@ -28,7 +28,7 @@ impl MessageBatch {
 
 #[derive(Debug)]
 pub enum RunCommand {
-    ToolResult(Box<ToolResult>),
+    ToolResult(ToolResult),
     InsertMessages(MessageBatch),
     BreakMessages(MessageBatch),
     Cancel,

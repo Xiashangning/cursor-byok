@@ -41,25 +41,11 @@ pub struct ToolCall {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TerminalCompletion {
-    pub task_id: String,
-    /// The originating tool call identifies one execution of a reusable task.
-    #[serde(default)]
-    pub tool_call_id: String,
-    pub kind: String,
-    pub status: String,
-    pub payload_digest: Option<String>,
-    pub event_id: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolResult {
     pub call_id: String,
     pub content: String,
     pub is_error: bool,
     pub image: Option<ToolImageReference>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consumed_completion: Option<TerminalCompletion>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

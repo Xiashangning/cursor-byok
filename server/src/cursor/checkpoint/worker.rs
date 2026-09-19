@@ -192,29 +192,13 @@ async fn build_final(
     presentation: &PendingSteps,
 ) -> Result<FinalCheckpoints> {
     let messages = store.load_checkpoint_messages(checkpoint_id).await?;
+    let (assistant, stable) = messages
+        .split_last()
+        .ok_or_else(|| Error::Store("final checkpoint contains no assistant".into()))?;
     let started_at_ms = crate::cursor::tools::runtime::now_ms();
-    let staged = match messages.split_last() {
-        Some((assistant, stable))
-            if assistant.role == crate::model::Role::Assistant
-                && matches!(
-                    &assistant.content,
-                    crate::model::MessageContent::Assistant { tool_calls, .. }
-                        if tool_calls.is_empty()
-                ) =>
-        {
-            builder
-                .staged_final(stable, mode, assistant, started_at_ms, presentation)
-                .await?
-        }
-        // A silent background-completion follow-up leaves the notification at
-        // the tail: the final state adds no assistant step.
-        Some(_) => builder.settled(&messages, mode, presentation).await?,
-        None => {
-            return Err(Error::Store(
-                "final checkpoint contains no assistant".into(),
-            ))
-        }
-    };
+    let staged = builder
+        .staged_final(stable, mode, assistant, started_at_ms, presentation)
+        .await?;
     let settled = builder
         .settled(&messages, mode, &PendingSteps::default())
         .await?;

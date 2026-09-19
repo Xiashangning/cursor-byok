@@ -43,8 +43,6 @@ fn exec_context() -> ExecContext {
         root_conversation_id: "conversation".into(),
         default_subagent_model: "model".into(),
         default_subagent_model_variant: None,
-        child_models: Default::default(),
-        child_tool_calls: Default::default(),
         model_directory: Default::default(),
         subagent_models: std::collections::HashMap::new(),
         terminals_folder: "/tmp/terminals".into(),

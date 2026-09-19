@@ -84,7 +84,6 @@ pub(crate) fn complete(
             content,
             is_error,
             image: None,
-            consumed_completion: None,
         },
         Tool::McpToolCall(pb::McpToolCall {
             args: Some(pb::McpArgs {

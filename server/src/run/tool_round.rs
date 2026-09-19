@@ -130,22 +130,15 @@ pub(super) async fn execute(
                 }
             }
             Some(RunCommand::BreakMessages(messages)) => {
-                pending_insertions.push(messages);
-                let interrupted_calls = calls
+                for call in calls
                     .iter()
-                    .filter(|call| {
-                        !completed_call_ids.contains(&call.call_id)
-                            && !call.name.eq_ignore_ascii_case("Task")
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for call in interrupted_calls {
+                    .filter(|call| !completed_call_ids.contains(&call.call_id))
+                {
                     let result = ToolResult {
                         call_id: call.call_id.clone(),
                         content: "Tool execution was interrupted by a newer user message.".into(),
                         is_error: true,
                         image: None,
-                        consumed_completion: None,
                     };
                     let committed = store
                         .commit_tool_result(
@@ -157,8 +150,6 @@ pub(super) async fn execute(
                         .await
                         .map_err(failed)?;
                     checkpoint = committed.checkpoint_id;
-                    completed_call_ids.insert(call.call_id.clone());
-                    remaining -= 1;
                     let (barrier, ready) = if committed.settled {
                         let (barrier, ready) = CommitBarrier::before_continue();
                         (barrier, Some(ready))
@@ -182,6 +173,27 @@ pub(super) async fn execute(
                         super::engine::wait_for_state_ready(ready, cancellation).await?;
                     }
                 }
+                checkpoint = super::messages::append_batches(
+                    store,
+                    prepared,
+                    client,
+                    cancellation,
+                    checkpoint,
+                    pending_insertions,
+                )
+                .await?
+                .0;
+                checkpoint = super::messages::append_batches(
+                    store,
+                    prepared,
+                    client,
+                    cancellation,
+                    checkpoint,
+                    vec![messages],
+                )
+                .await?
+                .0;
+                return Ok(checkpoint);
             }
             Some(RunCommand::InsertMessages(insertion)) => pending_insertions.push(insertion),
             Some(RunCommand::Cancel) => return Err(RunOutcome::Cancelled),

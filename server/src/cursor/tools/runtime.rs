@@ -48,8 +48,6 @@ pub struct ExecContext {
     pub root_conversation_id: String,
     pub default_subagent_model: String,
     pub default_subagent_model_variant: Option<String>,
-    pub child_models: HashMap<String, String>,
-    pub child_tool_calls: HashMap<String, String>,
     pub model_directory: ModelDirectory,
     pub subagent_models: HashMap<SubagentKind, SubagentModel>,
     pub allow_subagents: bool,
@@ -166,6 +164,15 @@ pub(crate) fn parse_task_model_parameters(
 }
 
 impl ExecContext {
+    /// 归一模型选择:别名归到 base hash;变体 slug 归一后保留变体分量。
+    pub(crate) fn canonical_model(&self, model: &str) -> String {
+        let (base, parts) = self.model_directory.resolve(model);
+        match (parts, self.model_directory.variants.get(&base)) {
+            (Some(parts), Some(axis)) => axis.bake_slug(&base, &parts),
+            _ => base,
+        }
+    }
+
     pub(crate) fn subagent_model_for(&self, subagent_type: &str) -> Option<&SubagentModel> {
         self.subagent_models.get(&subagent_kind(subagent_type))
     }
@@ -186,7 +193,7 @@ impl ExecContext {
     }
 
     pub fn prepare_call(&self, call: &ToolCall) -> Result<ToolCall> {
-        if !is_orchestration_tool(&call.name) {
+        if !call.name.eq_ignore_ascii_case("Task") {
             return Ok(call.clone());
         }
         let arguments = call
@@ -200,21 +207,13 @@ impl ExecContext {
         if self.task_disabled(call) {
             return Ok(call.clone());
         }
-        let resumed_model = arguments
-            .get("resume")
-            .or_else(|| arguments.get("agent_id"))
-            .or_else(|| arguments.get("agentId"))
-            .and_then(serde_json::Value::as_str)
-            .and_then(|id| self.child_models.get(id));
         let override_model = self.subagent_model_for(subagent_type);
         let inherited = || {
-            resumed_model
-                .cloned()
-                .or_else(|| self.default_subagent_model_variant.clone())
+            self.default_subagent_model_variant
+                .clone()
                 .unwrap_or_else(|| self.default_subagent_model.clone())
         };
         let model = match override_model {
-            _ if resumed_model.is_some() && !arguments.contains_key("model") => inherited(),
             Some(SubagentModel::Model(model)) => model.clone(),
             Some(SubagentModel::Inherit) => inherited(),
             Some(SubagentModel::Disabled) => unreachable!("disabled Task returned above"),
@@ -514,7 +513,7 @@ impl CursorToolRuntime {
             .min()
     }
 
-    pub(crate) fn next_id(&self) -> Result<u32> {
+    fn next_id(&self) -> Result<u32> {
         self.next_id
             .fetch_add(1, Ordering::Relaxed)
             .checked_add(1)
@@ -579,78 +578,6 @@ mod tests {
                 },
             )]),
             display_names: HashMap::from([(hash.to_string(), display_name.to_string())]),
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_generations_share_ids_without_cross_routing_reordered_replies() {
-        use crate::cursor::tools::codec::{self, ClientExecEvent};
-        let factory = CursorToolRuntime::default();
-        let barrier = Arc::new(tokio::sync::Barrier::new(16));
-        let mut jobs = tokio::task::JoinSet::new();
-        for index in 0..16 {
-            let runtime = factory.next_run();
-            let barrier = barrier.clone();
-            jobs.spawn(async move {
-                let call = task(serde_json::json!({"prompt":"work", "model":"model"}));
-                let call = ToolCall {
-                    call_id: format!("call-{index}"),
-                    ..call
-                };
-                let context = ExecContext {
-                    conversation_id: format!("conversation-{index}"),
-                    ..Default::default()
-                };
-                barrier.wait().await;
-                // Context requests and execs allocate from the same transport ID space.
-                let context_id = runtime.next_id().unwrap();
-                let exec_id = runtime.reserve_exec(&call, &context).await.unwrap();
-                (index, runtime, call, context_id, exec_id)
-            });
-        }
-        let mut pending = Vec::new();
-        let mut ids = HashSet::new();
-        while let Some(result) = jobs.join_next().await {
-            let entry = result.unwrap();
-            assert!(ids.insert(entry.3));
-            assert!(ids.insert(entry.4));
-            pending.push(entry);
-        }
-        pending.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        for (index, runtime, call, _, exec_id) in &pending {
-            let response = pb::ExecClientMessage {
-                id: *exec_id,
-                message: Some(pb::exec_client_message::Message::SubagentResult(
-                    pb::SubagentResult {
-                        result: Some(pb::subagent_result::Result::Success(pb::SubagentSuccess {
-                            agent_id: format!("child-{index}"),
-                            ..Default::default()
-                        })),
-                    },
-                )),
-                ..Default::default()
-            };
-            let other = &pending[(*index + 1) % pending.len()].1;
-            if !Arc::ptr_eq(&runtime.execs, &other.execs) {
-                assert!(matches!(
-                    codec::client_event(&response, other).await.unwrap(),
-                    ClientExecEvent::Pending
-                ));
-            }
-            let ClientExecEvent::Completed(completion) =
-                codec::client_event(&response, runtime).await.unwrap()
-            else {
-                panic!("expected completion")
-            };
-            assert_eq!(completion.result().call_id, call.call_id);
-            assert!(completion
-                .result()
-                .content
-                .contains(&format!("child-{index}")));
-            assert!(matches!(
-                codec::client_event(&response, runtime).await.unwrap(),
-                ClientExecEvent::Pending
-            ));
         }
     }
 

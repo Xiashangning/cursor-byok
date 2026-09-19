@@ -218,7 +218,6 @@ mod tests {
                 }],
             },
             runtime_event_id: None,
-            terminal_completion: None,
         }];
 
         let projected = project_messages(&messages).unwrap();
@@ -246,7 +245,6 @@ mod tests {
                 }],
             }),
             runtime_event_id: None,
-            terminal_completion: None,
         };
 
         let projected = project_messages(std::slice::from_ref(&message)).unwrap();

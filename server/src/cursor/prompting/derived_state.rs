@@ -148,7 +148,6 @@ mod tests {
                     }],
                 },
                 runtime_event_id: None,
-                terminal_completion: None,
             },
             CanonicalMessage {
                 message_id: "result".into(),
@@ -163,7 +162,6 @@ mod tests {
                     provider_parts: Vec::new(),
                 }),
                 runtime_event_id: None,
-                terminal_completion: None,
             },
         ]
     }
