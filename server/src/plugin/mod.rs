@@ -9,6 +9,7 @@ mod installation;
 mod manifest;
 mod oauth_callback;
 mod protocol;
+mod quota;
 mod registry;
 mod runtime;
 mod state;

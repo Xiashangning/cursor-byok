@@ -18,6 +18,7 @@ use super::{
         OAUTH2_AUTHORIZATION_CODE_ADD_METHOD,
     },
     oauth_callback::{self, CallbackHandle, CallbackOutcome, CallbackRequest},
+    quota,
     runtime::PluginRuntime,
     state::{now_ms, PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel},
     wire,
@@ -33,6 +34,8 @@ use crate::{
 
 const OAUTH_SLOW_DOWN_STEP_MS: i64 = 5_000;
 const MAX_IMPORT_DRAFTS: usize = 256;
+/// 插件资源额度的后台刷新周期。
+const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct PluginRegistry {
@@ -47,6 +50,8 @@ struct RegistryInner {
     entries: RwLock<Option<Vec<PluginEntry>>>,
     workers: Mutex<HashMap<String, Arc<PluginWorker>>>,
     oauth_sessions: Mutex<HashMap<String, OAuthSession>>,
+    /// Cursor 模型目录消费的单行额度摘要,key 为 `{plugin_id}/{resource_type}`。
+    quota_summaries: RwLock<HashMap<String, String>>,
     rr_counter: std::sync::atomic::AtomicUsize,
 }
 
@@ -145,6 +150,7 @@ impl PluginRegistry {
                 entries: RwLock::new(None),
                 workers: Mutex::new(HashMap::new()),
                 oauth_sessions: Mutex::new(HashMap::new()),
+                quota_summaries: RwLock::new(HashMap::new()),
                 rr_counter: std::sync::atomic::AtomicUsize::new(0),
             }),
         })
@@ -895,8 +901,115 @@ impl PluginRegistry {
         let record = self
             .find_record(plugin_id, resource_type, resource_id)
             .await?;
+        self.refresh_record(&entry, &executable, resource_type, &record)
+            .await
+    }
+
+    /// 启动后台额度刷新循环:每分钟刷新一次全部可刷新资源并把聚合摘要
+    /// 写入缓存,供 Cursor 模型目录追加到插件模型的 hover 备注末尾。
+    /// interval 首 tick 立即执行;运行时未就绪的 tick 直接跳过。
+    pub fn start_quota_refresh(&self) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(QUOTA_REFRESH_INTERVAL);
+            loop {
+                interval.tick().await;
+                registry.refresh_quota_summaries().await;
+            }
+        });
+    }
+
+    /// Cursor 模型目录消费的单行额度摘要;provider 无资源类型或无额度数据时为 None。
+    pub async fn quota_summary(&self, plugin_id: &str, provider_id: &str) -> Option<String> {
+        let executable = self.inner.runtime.executable()?;
+        let entry = self.find_entry(&executable, plugin_id).await.ok()?;
+        let resource_type = find_provider(&entry, provider_id)
+            .ok()?
+            .resource_type
+            .as_deref()?;
+        let key = quota_key(plugin_id, resource_type);
+        self.inner
+            .quota_summaries
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+    }
+
+    /// 一轮额度刷新:对每个可刷新资源类型,先逐账号调用插件 refresh 落盘,
+    /// 再用 present 投影聚合成一行摘要;整轮结果整体替换缓存。
+    async fn refresh_quota_summaries(&self) {
+        let Some(executable) = self.inner.runtime.executable() else {
+            return;
+        };
+        let disabled = self
+            .inner
+            .store
+            .disabled_plugin_accounts()
+            .await
+            .unwrap_or_default();
+        let mut summaries = HashMap::new();
+        for entry in self.entries(&executable).await {
+            let plugin_id = entry.manifest.id.clone();
+            for definition in &entry.definition.resources {
+                if !definition.can_refresh {
+                    continue;
+                }
+                let resource_type = definition.resource_type.as_str();
+                let records = match self.inner.state.resources(&plugin_id, resource_type).await {
+                    Ok(records) => records,
+                    Err(error) => {
+                        tracing::warn!(plugin = %plugin_id, %error, "cannot load plugin resources for quota refresh");
+                        continue;
+                    }
+                };
+                let enabled: Vec<ResourceRecord> = records
+                    .into_iter()
+                    .filter(|record| !disabled.contains(&record.id))
+                    .collect();
+                if enabled.is_empty() {
+                    continue;
+                }
+                for record in &enabled {
+                    if let Err(error) = self
+                        .refresh_record(&entry, &executable, resource_type, record)
+                        .await
+                    {
+                        tracing::warn!(plugin = %plugin_id, account = %record.key, %error, "plugin quota refresh failed");
+                    }
+                }
+                // 重新读取以拿到 refresh 写入的最新 private_data。
+                let records = self
+                    .inner
+                    .state
+                    .resources(&plugin_id, resource_type)
+                    .await
+                    .unwrap_or_else(|_| enabled.clone());
+                let enabled: Vec<ResourceRecord> = records
+                    .into_iter()
+                    .filter(|record| !disabled.contains(&record.id))
+                    .collect();
+                let views = self
+                    .present_resources(&entry, &executable, definition, &enabled)
+                    .await;
+                if let Some(line) = quota::quota_line(&views) {
+                    summaries.insert(quota_key(&plugin_id, resource_type), line);
+                }
+            }
+        }
+        *self.inner.quota_summaries.write().await = summaries;
+    }
+
+    /// 调用插件刷新单条资源并把返回的 patch 落盘。
+    async fn refresh_record(
+        &self,
+        entry: &PluginEntry,
+        executable: &Path,
+        resource_type: &str,
+        record: &ResourceRecord,
+    ) -> Result<()> {
         let value = self
-            .worker(&entry, &executable)
+            .worker(entry, executable)
             .await
             .invoke(
                 "resource.refresh",
@@ -910,7 +1023,7 @@ impl PluginRegistry {
         let patch: ResourcePatch = serde_json::from_value(value)?;
         self.inner
             .state
-            .apply_patch(plugin_id, resource_type, resource_id, patch)
+            .apply_patch(&entry.manifest.id, resource_type, &record.id, patch)
             .await
     }
 
@@ -1508,6 +1621,11 @@ fn affinity_index(key: &str, len: usize) -> usize {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
     (hasher.finish() as usize) % len
+}
+
+/// 额度摘要缓存键。
+fn quota_key(plugin_id: &str, resource_type: &str) -> String {
+    format!("{plugin_id}/{resource_type}")
 }
 
 fn find_provider<'a>(entry: &'a PluginEntry, provider_id: &str) -> Result<&'a ProviderDefinition> {

@@ -268,8 +268,14 @@ pub async fn available_models(
         plugin_model_count = plugin_models.len(),
         "appending BYOK models to Cursor AvailableModels"
     );
+    let quota_summaries = plugin_quota_summaries(&registry, &plugin_models).await;
     let mut available_models = models.iter().map(available_model).collect::<Vec<_>>();
-    available_models.extend(plugin_models.iter().map(available_plugin_model));
+    available_models.extend(plugin_models.iter().map(|model| {
+        let quota = quota_summaries
+            .get(&format!("{}/{}", model.plugin_id, model.provider_id))
+            .map(String::as_str);
+        available_plugin_model(model, quota)
+    }));
     let local = AvailableModelsAddition {
         model_names: models
             .iter()
@@ -713,9 +719,45 @@ fn model_tooltip(model: &ModelConfig) -> TooltipData {
     }
 }
 
-fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
+/// 各插件模型的单行额度摘要,key 为 `{plugin_id}/{provider_id}`。
+async fn plugin_quota_summaries(
+    registry: &TransportRegistry,
+    models: &[PluginModelDescriptor],
+) -> std::collections::HashMap<String, String> {
+    let mut summaries = std::collections::HashMap::new();
+    let Some(plugins) = registry.plugins() else {
+        return summaries;
+    };
+    for model in models {
+        let key = format!("{}/{}", model.plugin_id, model.provider_id);
+        if summaries.contains_key(&key) {
+            continue;
+        }
+        if let Some(line) = plugins
+            .quota_summary(&model.plugin_id, &model.provider_id)
+            .await
+        {
+            summaries.insert(key, line);
+        }
+    }
+    summaries
+}
+
+/// 插件模型的 hover markdown:备注末尾另起一段附额度行;
+/// 无备注时额度行独立成段,两者皆无保持 None。
+fn plugin_tooltip(description: Option<&str>, quota: Option<&str>) -> Option<String> {
+    match (description, quota) {
+        (Some(description), Some(quota)) if !description.trim().is_empty() => {
+            Some(format!("{}\n\n{quota}", description.trim_end()))
+        }
+        (_, Some(quota)) => Some(quota.to_owned()),
+        _ => description.map(str::to_owned),
+    }
+}
+
+fn available_plugin_model(model: &PluginModelDescriptor, quota: Option<&str>) -> AvailableModel {
     let tooltip = TooltipData {
-        markdown_content: model.description.clone(),
+        markdown_content: plugin_tooltip(model.description.as_deref(), quota),
     };
     // Effort 与 Context 档位取自描述符的生效轴(已并入用户覆盖)。
     let contexts = model
@@ -1021,6 +1063,27 @@ mod tests {
         );
         assert_eq!(mapped.vendor.unwrap().display_name, "Cursor");
         assert!(usable_model(&model).thinking_details.is_some());
+    }
+
+    #[test]
+    fn plugin_tooltip_appends_quota_on_a_new_paragraph() {
+        assert_eq!(
+            plugin_tooltip(Some("Kimi K2"), Some("额度：周额度 70%")),
+            Some("Kimi K2\n\n额度：周额度 70%".to_owned())
+        );
+        assert_eq!(
+            plugin_tooltip(Some("  "), Some("额度：周额度 70%")),
+            Some("额度：周额度 70%".to_owned())
+        );
+        assert_eq!(
+            plugin_tooltip(None, Some("额度：周额度 70%")),
+            Some("额度：周额度 70%".to_owned())
+        );
+        assert_eq!(
+            plugin_tooltip(Some("Kimi K2"), None),
+            Some("Kimi K2".to_owned())
+        );
+        assert_eq!(plugin_tooltip(None, None), None);
     }
 
     #[tokio::test]
