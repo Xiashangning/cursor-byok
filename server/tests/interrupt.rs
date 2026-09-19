@@ -8,8 +8,8 @@ use cursor_server::{
     cursor::protocol::{connect, proto::agent::v1 as pb},
     cursor::TransportCommand,
     model::{
-        CanonicalMessage, ConversationId, ModelSpec, Origin, PreparedRun, PromptSpec, Role,
-        RunAction, RunId, RunKind,
+        CanonicalMessage, CheckpointId, ConversationId, ModelSpec, Origin, PreparedRun, PromptSpec,
+        Role, RunAction, RunId, RunKind,
     },
     provider::{FinishReason, ModelEvent},
     run::{self, CommandResult, CommitCause, RunEngine, RunEvent, RunOutcome, RunPhase},
@@ -52,6 +52,7 @@ async fn finalizing_rejects_late_messages_for_the_next_run() {
             pending_tool_round: None,
         },
         base_checkpoint_id,
+        background_follow_up: false,
     };
     let (port, mut session, handle) = run::channel(prepared.run_id.clone(), 32);
     let cancellation = handle.cancellation();
@@ -119,6 +120,7 @@ async fn break_messages_emits_one_cycle_boundary_before_the_runtime_commit() {
             pending_tool_round: None,
         },
         base_checkpoint_id,
+        background_follow_up: false,
     };
     let (port, mut session, handle) = run::channel(prepared.run_id.clone(), 32);
     let cancellation = handle.cancellation();
@@ -196,6 +198,7 @@ async fn a_replaced_run_cannot_overwrite_its_cancelled_status() {
             pending_tool_round: None,
         },
         base_checkpoint_id,
+        background_follow_up: false,
     };
     let first = prepared("first");
     let second = prepared("second");
@@ -245,6 +248,211 @@ async fn a_replaced_run_cannot_overwrite_its_cancelled_status() {
     assert_eq!(call.0, "cancelled");
     assert!(call.1.is_some());
     assert!(call.2.is_some());
+}
+
+#[tokio::test]
+async fn finalizing_window_duplicate_batch_does_not_reactivate_the_model() {
+    let (_directory, store) = temp_store().await;
+    let conversation_id = ConversationId::new("finalizing-duplicate-conversation");
+    let base_checkpoint_id = store.ensure_conversation(&conversation_id).await.unwrap();
+    let provider = FakeProvider::default();
+    let release = provider.push_gated(text_response_with_usage("call-final", "done", 1, 1));
+    provider.push(text_response_with_usage(
+        "call-unexpected",
+        "unexpected second activation",
+        1,
+        1,
+    ));
+    let mut notification = CanonicalMessage::text(
+        "finalizing-duplicate-message",
+        Role::User,
+        Origin::Runtime,
+        "background notification",
+    );
+    notification.runtime_event_id = Some("background-completed:dup".into());
+    let prepared = PreparedRun {
+        run_id: RunId::new("finalizing-duplicate-run"),
+        cursor_request_id: None,
+        conversation_id,
+        kind: RunKind::Root,
+        model: ModelSpec::new("model"),
+        prompt: PromptSpec {
+            instructions: String::new(),
+            tools: Vec::new(),
+        },
+        initial_messages: vec![notification.clone()],
+        action: RunAction::Start,
+        base_checkpoint_id,
+        background_follow_up: false,
+    };
+    let (port, mut session, handle) = run::channel(prepared.run_id.clone(), 32);
+    let cancellation = handle.cancellation();
+    let engine_store = store.clone();
+    let engine_provider = provider.clone();
+    let engine = tokio::spawn(async move {
+        RunEngine::new(engine_store, Arc::new(engine_provider))
+            .run(prepared, port, cancellation)
+            .await
+    });
+
+    // 初始消息提交后引擎进入模型循环。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while provider.request_count() < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "model cycle did not start"
+        );
+        if let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(20), session.events.recv()).await
+        {
+            if let RunEvent::MessagesCommitted(committed) = event {
+                committed.barrier.complete(Ok(()));
+            }
+        }
+    }
+
+    // 用 SQLite 写锁把引擎钉在 finalize 窗口(assistant 提交)里,
+    // 此时注入的重复批只能由收尾 drain 拾取。
+    let lock = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    release.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let duplicate = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            handle
+                .insert_messages("background-completed:dup".into(), vec![notification])
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    lock.rollback().await.unwrap();
+
+    let mut final_turns = 0;
+    loop {
+        match session.events.recv().await.unwrap() {
+            RunEvent::MessagesCommitted(committed) => {
+                if committed.cause == CommitCause::FinalTurn {
+                    final_turns += 1;
+                }
+                committed.barrier.complete(Ok(()));
+            }
+            RunEvent::Ended(outcome) => {
+                assert_eq!(outcome, RunOutcome::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(engine.await.unwrap(), RunOutcome::Completed);
+    assert_eq!(duplicate.await.unwrap(), CommandResult::Duplicate);
+    assert_eq!(final_turns, 1);
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a duplicate batch in the finalizing window must not reactivate the model"
+    );
+}
+
+#[tokio::test]
+async fn background_follow_up_with_committed_initial_messages_finishes_without_the_model() {
+    let (_directory, store) = temp_store().await;
+    let conversation_id = ConversationId::new("background-backstop-conversation");
+    let base_checkpoint_id = store.ensure_conversation(&conversation_id).await.unwrap();
+    let provider = FakeProvider::default();
+    provider.push(text_response_with_usage("call-summary", "summary", 1, 1));
+    provider.push(text_response_with_usage(
+        "call-unexpected",
+        "unexpected second activation",
+        1,
+        1,
+    ));
+    let mut notification = CanonicalMessage::text(
+        "background-backstop-message",
+        Role::User,
+        Origin::Runtime,
+        "background notification",
+    );
+    notification.runtime_event_id = Some("background-completed:dup".into());
+    let prepared = {
+        let conversation_id = conversation_id.clone();
+        move |run_id: &str, base_checkpoint_id: CheckpointId| PreparedRun {
+            run_id: RunId::new(run_id),
+            cursor_request_id: None,
+            conversation_id: conversation_id.clone(),
+            kind: RunKind::Root,
+            model: ModelSpec::new("model"),
+            prompt: PromptSpec {
+                instructions: String::new(),
+                tools: Vec::new(),
+            },
+            initial_messages: vec![notification.clone()],
+            action: RunAction::Start,
+            base_checkpoint_id,
+            background_follow_up: true,
+        }
+    };
+
+    // 第一个 Run 提交通知与总结。
+    let first_prepared = prepared("backstop-run-1", base_checkpoint_id);
+    let (port, mut session, handle) = run::channel(RunId::new("backstop-run-1"), 32);
+    let cancellation = handle.cancellation();
+    let engine_store = store.clone();
+    let engine_provider = provider.clone();
+    let first = tokio::spawn(async move {
+        RunEngine::new(engine_store, Arc::new(engine_provider))
+            .run(first_prepared, port, cancellation)
+            .await
+    });
+    loop {
+        match session.events.recv().await.unwrap() {
+            RunEvent::MessagesCommitted(committed) => committed.barrier.complete(Ok(())),
+            RunEvent::Ended(outcome) => {
+                assert_eq!(outcome, RunOutcome::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(first.await.unwrap(), RunOutcome::Completed);
+
+    // 并发重投兜底:初始消息全部已提交,零写入直接完成,不再激活模型。
+    let current = store.ensure_conversation(&conversation_id).await.unwrap();
+    let second_prepared = prepared("backstop-run-2", current);
+    let (port, mut session, handle) = run::channel(RunId::new("backstop-run-2"), 32);
+    let cancellation = handle.cancellation();
+    let engine_store = store.clone();
+    let engine_provider = provider.clone();
+    let second = tokio::spawn(async move {
+        RunEngine::new(engine_store, Arc::new(engine_provider))
+            .run(second_prepared, port, cancellation)
+            .await
+    });
+    let mut commits = 0;
+    loop {
+        match session.events.recv().await.unwrap() {
+            RunEvent::MessagesCommitted(committed) => {
+                commits += 1;
+                committed.barrier.complete(Ok(()));
+            }
+            RunEvent::Ended(outcome) => {
+                assert_eq!(outcome, RunOutcome::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(second.await.unwrap(), RunOutcome::Completed);
+    assert_eq!(commits, 0, "a skipped Run must not commit any checkpoint");
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a fully duplicate background follow-up must not activate the model"
+    );
+    assert_eq!(
+        store.ensure_conversation(&conversation_id).await.unwrap(),
+        current,
+        "a skipped Run must leave the conversation checkpoint unchanged"
+    );
 }
 
 #[tokio::test]

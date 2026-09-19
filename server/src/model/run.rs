@@ -57,4 +57,7 @@ pub struct PreparedRun {
     pub initial_messages: Vec<CanonicalMessage>,
     pub action: RunAction,
     pub base_checkpoint_id: CheckpointId,
+    /// 后台任务完成通知触发的 follow-up Run。引擎用它识别「初始消息全部
+    /// 已提交」的并发重投:那种 Run 零写入直接完成,不再激活模型。
+    pub background_follow_up: bool,
 }

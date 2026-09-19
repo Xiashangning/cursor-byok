@@ -694,6 +694,19 @@ fn spawn_run_request(
                 return;
             }
         };
+        if context.background_noop {
+            // 通知与总结都已提交:at-least-once 重投。不建 Run、不写
+            // checkpoint,直接 Success 收尾,避免零新增材料的模型激活。
+            if !generation.superseded.is_cancelled() {
+                let _ = handle
+                    .command(TransportCommand::RunFinished {
+                        generation: generation.id,
+                        finish: RunFinish::Transport(TransportFinish::Success),
+                    })
+                    .await;
+            }
+            return;
+        }
         checkpoint.configure(
             prepared.model.model_id.clone(),
             prepared.model.context_window_tokens,

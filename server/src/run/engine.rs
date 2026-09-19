@@ -149,6 +149,12 @@ impl RunEngine {
                 if let Err(outcome) = wait_for_state_ready(ready, cancellation).await {
                     return (outcome, usage);
                 }
+            } else if prepared.background_follow_up {
+                // 并发竞态兜底:通知已由另一个 Run 提交,本 Run 没有任何
+                // 新材料。零写入直接完成,不进入模型循环;收尾由
+                // ConversationOutput 对无最终 checkpoint 的后台 Run
+                // 静默 Success。
+                return (RunOutcome::Completed, usage);
             }
         }
 
@@ -693,7 +699,7 @@ impl RunEngine {
                     Err(outcome) => return (outcome, usage),
                 };
                 if !closing_insertions.is_empty() {
-                    checkpoint = match super::messages::append_batches(
+                    let inserted = match super::messages::append_batches(
                         &self.store,
                         prepared,
                         client,
@@ -703,11 +709,19 @@ impl RunEngine {
                     )
                     .await
                     {
-                        Ok((next, _)) => next,
+                        Ok((next, inserted)) => {
+                            checkpoint = next;
+                            inserted
+                        }
                         Err(outcome) => return (outcome, usage),
                     };
-                    client.phase.resume_running();
-                    continue 'model;
+                    // 与上方 pending_insertions 分支同一守卫:整批重复
+                    // (已提交消息的at-least-once重投)直接走 FinalTurn 收尾,
+                    // 不再激活模型。
+                    if inserted {
+                        client.phase.resume_running();
+                        continue 'model;
+                    }
                 }
                 let (barrier, ready) = CommitBarrier::before_continue();
                 if emit(

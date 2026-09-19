@@ -1,5 +1,5 @@
 //! Compiles an AgentRunRequest into a PreparedRun.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use uuid::Uuid;
 
@@ -32,7 +32,9 @@ struct ActionProjection {
     input_id: Option<String>,
     starts_turn: bool,
     compacting: bool,
-    background_completion: bool,
+    background_completions: Vec<insert_messages::ProjectedCompletion>,
+    /// 后台完成通知在已提交历史中全部已覆盖:本次投递是无操作重投。
+    background_noop: bool,
 }
 
 pub struct CursorRunContext {
@@ -44,6 +46,7 @@ pub struct CursorRunContext {
     pub checkpoint_prompt: PromptSpec,
     pub compacting: bool,
     pub background_completion: bool,
+    pub background_noop: bool,
 }
 
 pub(crate) struct PrepareDependencies<'a> {
@@ -134,6 +137,21 @@ pub(crate) async fn prepare(
             .and_then(|action| action.action.as_ref()),
         Some(pb::conversation_action::Action::ResumeAction(_))
     );
+    let covered = match request
+        .action
+        .as_ref()
+        .and_then(|action| action.action.as_ref())
+    {
+        // 覆盖判定基于客户端实际持有的 base 历史:通知已提交且其后已有
+        // assistant 总结的完成项,重投时逐条跳过。
+        Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)) => {
+            insert_messages::covered_identities(
+                action,
+                base_messages.as_deref().unwrap_or_default(),
+            )
+        }
+        _ => HashSet::new(),
+    };
     let ActionProjection {
         mode: mode_number,
         mut turn_user,
@@ -142,8 +160,10 @@ pub(crate) async fn prepare(
         input_id,
         starts_turn,
         compacting,
-        background_completion,
-    } = action(request)?;
+        background_completions,
+        background_noop,
+    } = action(request, &covered)?;
+    let background_completion = !background_completions.is_empty();
     let pending_tool_round = if !starts_turn && !compacting {
         match request
             .conversation_state
@@ -328,29 +348,48 @@ pub(crate) async fn prepare(
     };
     let mut initial_messages = if compacting {
         Vec::new()
+    } else if background_completion {
+        let base = base_messages.as_deref().unwrap_or_default();
+        let mut messages = Vec::with_capacity(background_completions.len());
+        let mut texts = Vec::with_capacity(background_completions.len());
+        let mut checkpoint_user = None::<pb::UserMessage>;
+        for projected in background_completions {
+            let existing = store
+                .message(&conversation_id, &format!("runtime:{}", projected.event_id))
+                .await?;
+            let (message, text) = match existing {
+                Some(message) => {
+                    let text = runtime_message_text(&message)?;
+                    (message, text)
+                }
+                None => {
+                    break_messages::compile_background(
+                        projected.event_id.clone(),
+                        &projected.turn_user,
+                        &request_context,
+                        &projected.context,
+                        blob_sync,
+                    )
+                    .await?
+                }
+            };
+            checkpoint_user.get_or_insert(projected.turn_user);
+            texts.push(text);
+            // 通知已在 base 历史中(崩溃/取消窗口的重投):历史里已有,
+            // 无需重新追加,重跑只为补上缺失的总结。
+            if !base.iter().any(|message| {
+                message.runtime_event_id.as_deref() == Some(projected.event_id.as_str())
+            }) {
+                messages.push(message);
+            }
+        }
+        if let Some(mut user) = checkpoint_user {
+            user.text = texts.join("\n\n");
+            turn_user = Some(user);
+        }
+        messages
     } else {
         match (turn_user.clone(), event_id) {
-            (Some(mut user), Some(event_id)) if background_completion => {
-                let (message, text) = match existing_runtime {
-                    Some(message) => {
-                        let text = runtime_message_text(&message)?;
-                        (message, text)
-                    }
-                    None => {
-                        break_messages::compile_background(
-                            event_id,
-                            &user,
-                            &request_context,
-                            &action_context,
-                            blob_sync,
-                        )
-                        .await?
-                    }
-                };
-                user.text = text;
-                turn_user = Some(user);
-                vec![message]
-            }
             (Some(user), Some(event_id)) => {
                 let runtime = match existing_runtime {
                     Some(message) => message,
@@ -419,6 +458,7 @@ pub(crate) async fn prepare(
             initial_messages,
             action,
             base_checkpoint_id,
+            background_follow_up: background_completion,
         },
         CursorRunContext {
             request_id: request_id.into(),
@@ -432,6 +472,7 @@ pub(crate) async fn prepare(
             checkpoint_prompt,
             compacting,
             background_completion,
+            background_noop,
         },
     ))
 }
@@ -700,7 +741,7 @@ pub(crate) fn background_completion_fully_consumed(request: &pb::AgentRunRequest
     insert_messages::fully_consumed(action, request.conversation_state.as_ref())
 }
 
-fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
+fn action(request: &pb::AgentRunRequest, covered: &HashSet<String>) -> Result<ActionProjection> {
     let conversation_mode = request
         .conversation_state
         .as_ref()
@@ -719,7 +760,8 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
             input_id: None,
             starts_turn: false,
             compacting: false,
-            background_completion: false,
+            background_completions: Vec::new(),
+            background_noop: false,
         });
     };
     match action {
@@ -746,7 +788,8 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
                     input_id: None,
                     starts_turn: false,
                     compacting: true,
-                    background_completion: false,
+                    background_completions: Vec::new(),
+                    background_noop: false,
                 });
             }
             let mut context = action
@@ -771,22 +814,32 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
                 input_id: Some(input_id),
                 starts_turn: true,
                 compacting: false,
-                background_completion: false,
+                background_completions: Vec::new(),
+                background_noop: false,
             })
         }
         pb::conversation_action::Action::BackgroundTaskCompletionAction(action) => {
-            let projection =
-                insert_messages::project(action, mode, request.conversation_state.as_ref())?;
-            let event_id = projection.turn_user.message_id.clone();
+            let projection = insert_messages::project(
+                action,
+                mode,
+                request.conversation_state.as_ref(),
+                covered,
+            )?;
+            let (completions, noop) = match projection {
+                Some(projection) => (projection.completions, false),
+                // 全部完成项已被消费或覆盖:无操作重投。
+                None => (Vec::new(), true),
+            };
             Ok(ActionProjection {
                 mode,
-                action_context: projection.context,
-                event_id: Some(event_id),
+                action_context: String::new(),
+                event_id: None,
                 input_id: None,
-                turn_user: Some(projection.turn_user),
+                turn_user: None,
                 starts_turn: true,
                 compacting: false,
-                background_completion: true,
+                background_completions: completions,
+                background_noop: noop,
             })
         }
         pb::conversation_action::Action::ExecutePlanAction(action) => execute_plan(action),
@@ -798,7 +851,8 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
             input_id: None,
             starts_turn: false,
             compacting: true,
-            background_completion: false,
+            background_completions: Vec::new(),
+            background_noop: false,
         }),
         _ => Ok(ActionProjection {
             mode,
@@ -808,7 +862,8 @@ fn action(request: &pb::AgentRunRequest) -> Result<ActionProjection> {
             input_id: None,
             starts_turn: false,
             compacting: false,
-            background_completion: false,
+            background_completions: Vec::new(),
+            background_noop: false,
         }),
     }
 }
@@ -857,7 +912,8 @@ fn execute_plan(action: &pb::ExecutePlanAction) -> Result<ActionProjection> {
         input_id: None,
         starts_turn: true,
         compacting: false,
-        background_completion: false,
+        background_completions: Vec::new(),
+        background_noop: false,
     })
 }
 
@@ -1281,7 +1337,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let projection = action(&request).unwrap();
+        let projection = action(&request, &HashSet::new()).unwrap();
         assert_eq!(projection.mode, pb::AgentMode::Ask as i32);
         assert_eq!(
             projection.input_id.as_deref(),
@@ -1313,7 +1369,7 @@ mod tests {
             ..Default::default()
         };
 
-        let projection = action(&request).unwrap();
+        let projection = action(&request, &HashSet::new()).unwrap();
 
         assert_eq!(projection.mode, pb::AgentMode::Agent as i32);
         assert_eq!(mode_from_proto(projection.mode).unwrap(), Mode::Agent);
@@ -1339,8 +1395,8 @@ mod tests {
             ..Default::default()
         };
 
-        let first = action(&request("message-one")).unwrap();
-        let second = action(&request("message-two")).unwrap();
+        let first = action(&request("message-one"), &HashSet::new()).unwrap();
+        let second = action(&request("message-two"), &HashSet::new()).unwrap();
 
         assert_eq!(first.event_id, None);
         assert_eq!(second.event_id, None);
@@ -1367,8 +1423,8 @@ mod tests {
             ..Default::default()
         };
 
-        let first = action(&request).unwrap();
-        let second = action(&request).unwrap();
+        let first = action(&request, &HashSet::new()).unwrap();
+        let second = action(&request, &HashSet::new()).unwrap();
         assert_eq!(first.mode, pb::AgentMode::Agent as i32);
         assert!(first.starts_turn);
         assert_eq!(first.event_id, second.event_id);

@@ -748,9 +748,17 @@ impl ConversationOutput {
                                     }
                                     return Ok(RunFinish::TurnCompleted);
                                 }
-                                let checkpoints = final_checkpoint.take().ok_or_else(|| {
-                                    Error::Protocol("Completed without final state".into())
-                                })?;
+                                let Some(checkpoints) = final_checkpoint.take() else {
+                                    // 并发重投的后台 follow-up 在引擎入口被兜底
+                                    // 跳过(初始消息全部已提交):零写入、无最终
+                                    // checkpoint,按无操作重投静默 Success。
+                                    if self.context.background_completion {
+                                        return Ok(RunFinish::Transport(TransportFinish::Success));
+                                    }
+                                    return Err(Error::Protocol(
+                                        "Completed without final state".into(),
+                                    ));
+                                };
                                 self.handle.emit(&events::turn_ended(turn_usage))?;
                                 self.checkpoint
                                     .publish(&self.handle, &checkpoints.staged)

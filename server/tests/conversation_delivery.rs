@@ -4,13 +4,15 @@ mod support;
 use std::collections::HashMap;
 
 use cursor_server::{
-    cursor::{protocol::proto::agent::v1 as pb, TransportCommand, TransportHandle},
+    cursor::{
+        protocol::connect, protocol::proto::agent::v1 as pb, TransportCommand, TransportHandle,
+    },
     model::{ContentPart, MessageContent, ProjectedContent, Role},
 };
 use prost::Message;
 use support::{
-    drive, registry, request_context_success, run_request, stream_close, temp_store, text_response,
-    wait_for_provider_requests, FakeProvider,
+    drive, kv_ack, registry, request_context_success, run_request, stream_close, temp_store,
+    text_response, wait_for_provider_requests, FakeProvider,
 };
 
 const FOLLOW_UP: &str = "Perform any necessary follow-up actions in response to the subagent completion above. If no follow-up work is needed, no further action is required. If you mention an agent or subagent in your response, link it with the `[Name](id)` Don't use generic label such as `[agent]`, `[worker]`, or `[subagent]`.";
@@ -197,13 +199,40 @@ async fn retrying_one_background_completion_reuses_its_runtime_message() {
     )
     .await;
 
+    // 总结已提交后的 at-least-once 重投:不再激活模型、不建 Run、静默 Success。
     provider.push(text_response("model-call-2", "followed up again"));
     let second = registry.get_or_create("completion-retry-2").await.unwrap();
-    drive_completion(
-        &second,
-        completion_run("retry-child", "completion-retry-run-2", checkpoint),
-    )
+    let mut output = second.subscribe();
+    second
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(completion_run(
+                "retry-child",
+                "completion-retry-run-2",
+                checkpoint,
+            )),
+        })
+        .await
+        .unwrap();
+    let mut seqno = 1;
+    let out = drive(&second, &mut output, &mut seqno, |exec| {
+        assert_eq!(exec.id, 0);
+        vec![stream_close(0), request_context_success(0)]
+    })
     .await;
+    assert_eq!(out.terminal, serde_json::json!({}));
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "covered redelivery must not activate the model again"
+    );
+    let run_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM runs WHERE conversation_id = 'parent-conversation'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(run_count, 1, "covered redelivery must not create a Run");
 
     let messages = store
         .load_current_messages(&cursor_server::model::ConversationId::new(
@@ -218,6 +247,268 @@ async fn retrying_one_background_completion_reuses_its_runtime_message() {
                 message.runtime_event_id.as_deref()
                     == Some(
                         "background-completed:BACKGROUND_TASK_KIND_SUBAGENT:retry-child:task-call",
+                    )
+            })
+            .count(),
+        1
+    );
+    let tail = messages.last().expect("summary tail");
+    assert!(
+        matches!(&tail.content, MessageContent::Assistant { text, .. } if text.contains("followed up")),
+        "the committed summary must remain the conversation tail"
+    );
+}
+
+#[tokio::test]
+async fn redelivering_after_a_crash_reruns_the_follow_up_exactly_once() {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push_pending();
+    let registry = registry(store.clone(), provider.clone());
+    let first = registry.get_or_create("crash-redelivery-1").await.unwrap();
+    let mut output = first.subscribe();
+    first
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(completion_run(
+                "crash-child",
+                "crash-run-1",
+                pb::ConversationStateStructure::default(),
+            )),
+        })
+        .await
+        .unwrap();
+    let mut seqno = 1;
+    let mut checkpoints = Vec::new();
+    // 崩溃窗口:通知已提交(InitialMessages checkpoint 已发布)但总结未提交。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while provider.request_count() < 1 || checkpoints.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "notification run did not reach the model"
+        );
+        if let Ok(Some(frame)) =
+            tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await
+        {
+            pump_frame(&first, &mut seqno, &frame, &mut checkpoints).await;
+        }
+    }
+    first
+        .command(TransportCommand::Append {
+            seqno,
+            message: Box::new(cancel_action()),
+        })
+        .await
+        .unwrap();
+    seqno += 1;
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
+            .await
+            .unwrap()
+            .expect("RunSSE closed before EndStream");
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        if flags & connect::END_STREAM_FLAG != 0 {
+            let terminal: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(terminal["error"]["code"], "canceled");
+            break;
+        }
+        pump_frame(&first, &mut seqno, &frame, &mut checkpoints).await;
+    }
+    let checkpoint = checkpoints
+        .iter()
+        .rev()
+        .find(|state| state.pending_tool_calls.is_empty())
+        .expect("notification checkpoint")
+        .clone();
+
+    // 通知在客户端历史里但没有总结:覆盖检查不得抑制重跑(崩溃自愈)。
+    provider.push(text_response("model-call-2", "recovered summary"));
+    let second = registry.get_or_create("crash-redelivery-2").await.unwrap();
+    drive_completion(
+        &second,
+        completion_run("crash-child", "crash-run-2", checkpoint),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "crash redelivery must rerun the follow-up exactly once"
+    );
+    let history = serde_json::to_string(&requests[1].history).unwrap();
+    assert!(history.contains("crash-child"));
+    let messages = store
+        .load_current_messages(&cursor_server::model::ConversationId::new(
+            "parent-conversation",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                message.runtime_event_id.as_deref()
+                    == Some(
+                        "background-completed:BACKGROUND_TASK_KIND_SUBAGENT:crash-child:task-call",
+                    )
+            })
+            .count(),
+        1
+    );
+    let tail = messages.last().expect("summary tail");
+    assert!(
+        matches!(&tail.content, MessageContent::Assistant { text, .. } if text.contains("recovered summary")),
+        "the rerun must commit the follow-up summary"
+    );
+    let statuses: Vec<String> = sqlx::query_scalar(
+        "SELECT status FROM runs WHERE conversation_id = 'parent-conversation' ORDER BY created_at_ms",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(statuses, ["cancelled", "completed"]);
+}
+
+#[tokio::test]
+async fn partially_covered_batch_only_follows_up_the_uncovered_completion() {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(text_response("model-call-1", "followed up a"));
+    let registry = registry(store.clone(), provider.clone());
+    let first = registry.get_or_create("partial-coverage-1").await.unwrap();
+    let (checkpoint, _) = drive_completion(
+        &first,
+        completion_run(
+            "child-a",
+            "partial-run-1",
+            pb::ConversationStateStructure::default(),
+        ),
+    )
+    .await;
+
+    // [A, B] 批次里 A 的通知与总结都已提交,只有 B 允许触发新的 follow-up。
+    provider.push(text_response("model-call-2", "followed up b"));
+    let second = registry.get_or_create("partial-coverage-2").await.unwrap();
+    drive_completion(
+        &second,
+        batch_completion_run(
+            &[("child-a", "task-call"), ("child-b", "task-call-b")],
+            "partial-run-2",
+            checkpoint,
+        ),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "only the uncovered completion may activate the model"
+    );
+    let runtime_ids = requests[1]
+        .history
+        .iter()
+        .map(|message| message.message_id.as_str())
+        .filter(|id| id.starts_with("runtime:"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        runtime_ids,
+        [
+            "runtime:background-completed:BACKGROUND_TASK_KIND_SUBAGENT:child-a:task-call",
+            "runtime:background-completed:BACKGROUND_TASK_KIND_SUBAGENT:child-b:task-call-b",
+        ]
+    );
+    let messages = store
+        .load_current_messages(&cursor_server::model::ConversationId::new(
+            "parent-conversation",
+        ))
+        .await
+        .unwrap();
+    for event_id in [
+        "background-completed:BACKGROUND_TASK_KIND_SUBAGENT:child-a:task-call",
+        "background-completed:BACKGROUND_TASK_KIND_SUBAGENT:child-b:task-call-b",
+    ] {
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.runtime_event_id.as_deref() == Some(event_id))
+                .count(),
+            1,
+            "{event_id} must be committed exactly once"
+        );
+    }
+}
+
+#[tokio::test]
+async fn back_to_back_duplicate_delivery_activates_the_model_once() {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    let release = provider.push_gated(text_response("model-call", "followed up"));
+    provider.push(text_response(
+        "model-call-2",
+        "unexpected second activation",
+    ));
+    let registry = registry(store.clone(), provider.clone());
+    let first = registry.get_or_create("dup-delivery-1").await.unwrap();
+    let first_run = tokio::spawn(async move {
+        drive_completion(
+            &first,
+            completion_run(
+                "dup-child",
+                "dup-run-1",
+                pb::ConversationStateStructure::default(),
+            ),
+        )
+        .await
+    });
+    let second = registry.get_or_create("dup-delivery-2").await.unwrap();
+    let mut wait_output = second.subscribe();
+    let mut wait_seqno = 0;
+    wait_for_provider_requests(&provider, &second, &mut wait_output, &mut wait_seqno, 1).await;
+
+    // 同一通知的背靠背重投(客户端 state 尚未包含通知):并入活动 Run,重复批被去重。
+    let second_run = tokio::spawn(async move {
+        drive_forwarded_completion(
+            &second,
+            completion_run(
+                "dup-child",
+                "dup-run-2",
+                pb::ConversationStateStructure::default(),
+            ),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    release.notify_one();
+
+    second_run.await.unwrap();
+    first_run.await.unwrap();
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "duplicate delivery must not reactivate the model"
+    );
+    let run_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM runs WHERE conversation_id = 'parent-conversation'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(run_count, 1);
+    let messages = store
+        .load_current_messages(&cursor_server::model::ConversationId::new(
+            "parent-conversation",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                message.runtime_event_id.as_deref()
+                    == Some(
+                        "background-completed:BACKGROUND_TASK_KIND_SUBAGENT:dup-child:task-call",
                     )
             })
             .count(),
@@ -462,6 +753,103 @@ fn completion_run_with_detail(
                 ..Default::default()
             },
         )),
+    }
+}
+
+fn batch_completion_run(
+    completions: &[(&str, &str)],
+    run_id: &str,
+    conversation_state: pb::ConversationStateStructure,
+) -> pb::AgentClientMessage {
+    let completions = completions
+        .iter()
+        .map(|(child_id, tool_call_id)| pb::BackgroundTaskCompletion {
+            task_id: (*child_id).into(),
+            kind: pb::BackgroundTaskKind::Subagent as i32,
+            status: pb::BackgroundTaskStatus::Success as i32,
+            title: "Inspect protocol".into(),
+            detail: Some(format!("{child_id} result")),
+            reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
+            subagent_id: Some((*child_id).into()),
+            tool_call_id: Some((*tool_call_id).into()),
+            ..Default::default()
+        })
+        .collect();
+    pb::AgentClientMessage {
+        message: Some(pb::agent_client_message::Message::RunRequest(
+            pb::AgentRunRequest {
+                action: Some(pb::ConversationAction {
+                    action: Some(
+                        pb::conversation_action::Action::BackgroundTaskCompletionAction(
+                            pb::BackgroundTaskCompletionAction { completions },
+                        ),
+                    ),
+                    ..Default::default()
+                }),
+                conversation_id: Some("parent-conversation".into()),
+                requested_model: Some(pb::RequestedModel {
+                    model_id: "test-model".into(),
+                    ..Default::default()
+                }),
+                conversation_state: Some(conversation_state),
+                run_id: Some(run_id.into()),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+fn cancel_action() -> pb::AgentClientMessage {
+    pb::AgentClientMessage {
+        message: Some(pb::agent_client_message::Message::ConversationAction(
+            pb::ConversationAction {
+                action: Some(pb::conversation_action::Action::CancelAction(
+                    pb::CancelAction::default(),
+                )),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+/// Handles one non-terminal frame: answers the request-context Exec, acks KV
+/// blob writes, and collects published checkpoints.
+async fn pump_frame(
+    handle: &TransportHandle,
+    seqno: &mut i64,
+    frame: &[u8],
+    checkpoints: &mut Vec<pb::ConversationStateStructure>,
+) {
+    let (_, payload) = connect::decode_frames(frame).unwrap().pop().unwrap();
+    let server = pb::AgentServerMessage::decode(payload).unwrap();
+    match server.message {
+        Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
+            handle
+                .command(TransportCommand::Append {
+                    seqno: *seqno,
+                    message: Box::new(kv_ack(kv.id)),
+                })
+                .await
+                .unwrap();
+            *seqno += 1;
+        }
+        Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => {
+            assert_eq!(exec.id, 0);
+            for reply in [stream_close(0), request_context_success(0)] {
+                handle
+                    .command(TransportCommand::Append {
+                        seqno: *seqno,
+                        message: Box::new(reply),
+                    })
+                    .await
+                    .unwrap();
+                *seqno += 1;
+            }
+        }
+        Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(state)) => {
+            checkpoints.push(state)
+        }
+        _ => {}
     }
 }
 

@@ -231,6 +231,7 @@ mod tests {
             initial_messages: Vec::new(),
             action: RunAction::Start,
             base_checkpoint_id: CheckpointId(1),
+            background_follow_up: false,
         }
     }
 
