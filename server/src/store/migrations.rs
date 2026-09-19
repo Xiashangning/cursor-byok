@@ -497,7 +497,7 @@ mod tests {
             let consumed_completion_table_exists: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM sqlite_master
-                    WHERE type = 'table' AND name = 'consumed_background_completions'
+                    WHERE type = 'table' AND name = 'background_consumed'
                  )",
             )
             .fetch_one(&pool)
@@ -505,7 +505,9 @@ mod tests {
             .unwrap();
 
             assert_eq!(checksum_after, checksum_before);
-            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            // develop 专属迁移使用 1000+ 号段:上游未来新增 0010+ 不会与本
+            // 分支冲突,框架按版本序应用,跳空是预期形态。
+            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 1000, 1001]);
             assert_eq!(checkpoint_table_exists, 1);
             assert_eq!(argument_error_column_exists, 1);
             assert_eq!(consumed_completion_table_exists, 1);
@@ -582,7 +584,7 @@ mod tests {
             let consumed_completion_table_exists: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM sqlite_master
-                    WHERE type = 'table' AND name = 'consumed_background_completions'
+                    WHERE type = 'table' AND name = 'background_consumed'
                  )",
             )
             .fetch_one(&pool)
@@ -590,7 +592,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(checksum_after, checksum_before);
-            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 1000, 1001]);
             assert_eq!(
                 model_options,
                 (

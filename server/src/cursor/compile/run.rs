@@ -137,18 +137,24 @@ pub(crate) async fn prepare(
             .and_then(|action| action.action.as_ref()),
         Some(pb::conversation_action::Action::ResumeAction(_))
     );
-    let covered = match request
+    let suppressed = match request
         .action
         .as_ref()
         .and_then(|action| action.action.as_ref())
     {
-        // 覆盖判定基于客户端实际持有的 base 历史:通知已提交且其后已有
-        // assistant 总结的完成项,重投时逐条跳过。
+        // 抑制判定收敛为一条:台账(await/前台已消费) ∨ 历史覆盖(通知已提交
+        // 且其后已有 assistant 总结)。覆盖判定基于客户端实际持有的 base 历史。
         Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)) => {
-            insert_messages::covered_identities(
+            let mut suppressed = insert_messages::covered_identities(
                 action,
                 base_messages.as_deref().unwrap_or_default(),
-            )
+            );
+            suppressed.extend(
+                store
+                    .consumed_background_identities(&conversation_id)
+                    .await?,
+            );
+            suppressed
         }
         _ => HashSet::new(),
     };
@@ -162,7 +168,7 @@ pub(crate) async fn prepare(
         compacting,
         background_completions,
         background_noop,
-    } = action(request, &covered)?;
+    } = action(request, &suppressed)?;
     let background_completion = !background_completions.is_empty();
     let pending_tool_round = if !starts_turn && !compacting {
         match request
@@ -730,18 +736,7 @@ fn execution_run_id(request_id: &str) -> RunId {
     RunId::new(format!("{request_id}:{}", &execution_id[..8]))
 }
 
-pub(crate) fn background_completion_fully_consumed(request: &pb::AgentRunRequest) -> bool {
-    let Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)) = request
-        .action
-        .as_ref()
-        .and_then(|action| action.action.as_ref())
-    else {
-        return false;
-    };
-    insert_messages::fully_consumed(action, request.conversation_state.as_ref())
-}
-
-fn action(request: &pb::AgentRunRequest, covered: &HashSet<String>) -> Result<ActionProjection> {
+fn action(request: &pb::AgentRunRequest, suppressed: &HashSet<String>) -> Result<ActionProjection> {
     let conversation_mode = request
         .conversation_state
         .as_ref()
@@ -819,12 +814,7 @@ fn action(request: &pb::AgentRunRequest, covered: &HashSet<String>) -> Result<Ac
             })
         }
         pb::conversation_action::Action::BackgroundTaskCompletionAction(action) => {
-            let projection = insert_messages::project(
-                action,
-                mode,
-                request.conversation_state.as_ref(),
-                covered,
-            )?;
+            let projection = insert_messages::project(action, mode, suppressed)?;
             let (completions, noop) = match projection {
                 Some(projection) => (projection.completions, false),
                 // 全部完成项已被消费或覆盖:无操作重投。

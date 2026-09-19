@@ -24,5 +24,5 @@ pub use requests::{resume_action, run_request, user_message_action};
 pub use wait::wait_for_provider_requests;
 pub use wire::{
     acknowledge_kv, kv_ack, read_success, request_context_success, stream_close,
-    subagent_result_error, subagent_result_success,
+    subagent_await_complete, subagent_result_error, subagent_result_success,
 };

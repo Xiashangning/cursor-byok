@@ -164,9 +164,11 @@ impl CheckpointBuilder {
         self.record_background_subagents(presentation);
         let consumed = self.record_consumed_subagent_completions(presentation);
         for (subagent_id, parent_tool_call_id) in consumed {
+            // 台账身份与逐条投影的事件身份一致:重投通知按此抑制。
             self.store
-                .record_consumed_subagent_completion(
+                .record_consumed_background_completion(
                     &self.conversation_id,
+                    pb::BackgroundTaskKind::Subagent.as_str_name(),
                     &subagent_id,
                     &parent_tool_call_id,
                 )

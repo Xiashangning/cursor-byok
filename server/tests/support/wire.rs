@@ -121,6 +121,29 @@ pub fn subagent_result_success(id: u32, agent_id: &str) -> pb::AgentClientMessag
     }
 }
 
+/// A completed `AWAIT` result for `agent_id`.
+pub fn subagent_await_complete(id: u32, agent_id: &str) -> pb::AgentClientMessage {
+    pb::AgentClientMessage {
+        message: Some(pb::agent_client_message::Message::ExecClientMessage(
+            pb::ExecClientMessage {
+                id,
+                message: Some(pb::exec_client_message::Message::SubagentAwaitResult(
+                    pb::SubagentAwaitResult {
+                        result: Some(pb::subagent_await_result::Result::Complete(
+                            pb::SubagentAwaitComplete {
+                                agent_id: agent_id.into(),
+                                final_message: Some("child result".into()),
+                                ..Default::default()
+                            },
+                        )),
+                    },
+                )),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
 /// An errored subagent result.
 pub fn subagent_result_error(id: u32, error: &str) -> pb::AgentClientMessage {
     pb::AgentClientMessage {
