@@ -307,11 +307,18 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
     };
     match output.tool.as_mut() {
         Some(pb::tool_call::Tool::ShellToolCall(tool)) => {
-            tool.description = optional("description");
+            let command = string("command");
+            // 模型未提供 description 时,以完整命令作为卡片标题;
+            // 否则客户端回退到命令首个 token,只显示 "grep"、"python" 等。
+            let description = optional("description").or_else(|| {
+                let command = command.trim();
+                (!command.is_empty()).then(|| command.into())
+            });
+            tool.description = description.clone();
             tool.args = Some(pb::ShellArgs {
-                command: string("command"),
+                command,
                 working_directory: optional("working_directory").unwrap_or_default(),
-                description: optional("description"),
+                description,
                 tool_call_id: call.call_id.clone(),
                 ..Default::default()
             })
@@ -619,6 +626,20 @@ fn now_ms() -> u64 {
 mod tests {
     use super::tool_placeholder;
     use crate::cursor::protocol::proto::agent::v1 as pb;
+    use crate::model::ToolCall;
+    use serde_json::json;
+
+    fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "call-1".into(),
+            model_call_id: "model-1".into(),
+            name: name.into(),
+            arguments_text: arguments.to_string(),
+            arguments,
+            argument_error: None,
+        }
+    }
 
     #[test]
     fn bash_renders_as_a_shell_placeholder() {
@@ -632,5 +653,48 @@ mod tests {
                 "{name} should render as a Shell tool"
             );
         }
+    }
+
+    #[test]
+    fn shell_description_falls_back_to_the_full_command() {
+        let rendered = super::render_tool_call(
+            &call("Shell", json!({"command": "grep -rn foo src/"})),
+            false,
+        )
+        .unwrap();
+        let Some(pb::tool_call::Tool::ShellToolCall(tool)) = rendered.tool else {
+            panic!("expected a Shell tool")
+        };
+        assert_eq!(tool.description.as_deref(), Some("grep -rn foo src/"));
+        assert_eq!(
+            tool.args.unwrap().description.as_deref(),
+            Some("grep -rn foo src/")
+        );
+    }
+
+    #[test]
+    fn shell_description_prefers_the_model_provided_value() {
+        let rendered = super::render_tool_call(
+            &call(
+                "Shell",
+                json!({"command": "grep -rn foo src/", "description": "Search for foo"}),
+            ),
+            false,
+        )
+        .unwrap();
+        let Some(pb::tool_call::Tool::ShellToolCall(tool)) = rendered.tool else {
+            panic!("expected a Shell tool")
+        };
+        assert_eq!(tool.description.as_deref(), Some("Search for foo"));
+    }
+
+    #[test]
+    fn shell_without_command_has_no_description_fallback() {
+        let rendered = super::render_tool_call(&call("Shell", json!({})), false).unwrap();
+        let Some(pb::tool_call::Tool::ShellToolCall(tool)) = rendered.tool else {
+            panic!("expected a Shell tool")
+        };
+        assert_eq!(tool.description, None);
+        assert_eq!(tool.args.unwrap().description, None);
     }
 }

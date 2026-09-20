@@ -302,12 +302,10 @@ async fn finalizing_window_duplicate_batch_does_not_reactivate_the_model() {
             tokio::time::Instant::now() < deadline,
             "model cycle did not start"
         );
-        if let Ok(Some(event)) =
+        if let Ok(Some(RunEvent::MessagesCommitted(committed))) =
             tokio::time::timeout(std::time::Duration::from_millis(20), session.events.recv()).await
         {
-            if let RunEvent::MessagesCommitted(committed) = event {
-                committed.barrier.complete(Ok(()));
-            }
+            committed.barrier.complete(Ok(()));
         }
     }
 

@@ -928,12 +928,7 @@ impl PluginRegistry {
             .resource_type
             .as_deref()?;
         let key = quota_key(plugin_id, resource_type);
-        self.inner
-            .quota_summaries
-            .read()
-            .await
-            .get(&key)
-            .cloned()
+        self.inner.quota_summaries.read().await.get(&key).cloned()
     }
 
     /// 一轮额度刷新:对每个可刷新资源类型,先逐账号调用插件 refresh 落盘,

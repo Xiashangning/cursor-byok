@@ -55,17 +55,15 @@ pub fn quota_line(accounts: &[PluginResourceView]) -> Option<String> {
     let mut buckets = HashMap::<&str, MetricBucket>::new();
     for account in accounts {
         for metric in &account.metrics {
-            let bucket = buckets
-                .entry(metric.id.as_str())
-                .or_insert_with(|| {
-                    order.push(metric.id.as_str());
-                    MetricBucket {
-                        label: zh_text(&metric.label),
-                        unit: metric.unit.clone(),
-                        total: 0.0,
-                        count: 0,
-                    }
-                });
+            let bucket = buckets.entry(metric.id.as_str()).or_insert_with(|| {
+                order.push(metric.id.as_str());
+                MetricBucket {
+                    label: zh_text(&metric.label),
+                    unit: metric.unit.clone(),
+                    total: 0.0,
+                    count: 0,
+                }
+            });
             bucket.total += metric.value;
             bucket.count += 1;
         }
@@ -112,8 +110,14 @@ mod tests {
     #[test]
     fn averages_same_metric_across_accounts() {
         let line = quota_line(&[
-            account(vec![metric("weekly", "周额度", 80.0), metric("five-hour", "5 小时窗口", 90.0)]),
-            account(vec![metric("weekly", "周额度", 60.0), metric("five-hour", "5 小时窗口", 100.0)]),
+            account(vec![
+                metric("weekly", "周额度", 80.0),
+                metric("five-hour", "5 小时窗口", 90.0),
+            ]),
+            account(vec![
+                metric("weekly", "周额度", 60.0),
+                metric("five-hour", "5 小时窗口", 100.0),
+            ]),
         ])
         .unwrap();
         assert_eq!(line, "额度：周额度 70% · 5 小时窗口 95%");
