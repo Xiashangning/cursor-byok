@@ -25,5 +25,8 @@ pub enum TransportCommand {
         generation: u64,
         finish: RunFinish,
     },
+    /// SSE 输出流提前断开;若会话仍有其他订阅者(客户端重连重叠期),
+    /// runtime 忽略此次断开继续运行,否则按 Disconnect 拆除。
+    OutputDetached,
     Disconnect,
 }

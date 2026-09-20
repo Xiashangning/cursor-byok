@@ -145,7 +145,8 @@ impl ConversationRuntime {
                     }
                 };
                 match command {
-                    TransportCommand::Disconnect => {
+                    TransportCommand::OutputDetached if handle.has_subscribers() => continue,
+                    TransportCommand::Disconnect | TransportCommand::OutputDetached => {
                         handle.mark_disconnected();
                         if let Some(generation) = current.as_ref() {
                             generation.superseded.cancel();

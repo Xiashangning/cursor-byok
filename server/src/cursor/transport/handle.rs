@@ -113,6 +113,10 @@ impl TransportHandle {
         self.output.subscribe()
     }
 
+    pub(crate) fn has_subscribers(&self) -> bool {
+        self.output.has_subscribers()
+    }
+
     pub fn emit_frame(&self, frame: Bytes) -> bool {
         self.output.emit(frame)
     }
