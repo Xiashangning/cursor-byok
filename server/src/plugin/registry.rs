@@ -353,11 +353,11 @@ impl PluginRegistry {
                     .map(|patch| serde_json::from_value::<ResourcePatch>(patch.clone()))
                     .transpose()?;
                 if let (Some(patch), Some((resource_type, record))) = (patch, resource) {
-                    if let Err(error) = registry.inner.state
-                        .apply_patch(&plugin_id, resource_type, &record.id, patch).await
-                    {
-                        tracing::warn!(plugin = %plugin_id, %error, "failed to apply plugin resource patch");
-                    }
+                    registry
+                        .inner
+                        .state
+                        .apply_patch(&plugin_id, resource_type, &record.id, patch)
+                        .await?;
                 }
                 match status {
                     "completed" => return,

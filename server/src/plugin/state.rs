@@ -437,6 +437,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_persistence_failures_are_propagated() {
+        let (root, store) = store();
+        store
+            .upsert_resources(
+                "dev.example",
+                "account",
+                vec![ResourceDraft {
+                    key: "acct-1".into(),
+                    private_data: serde_json::json!({"token":"one"}),
+                    state: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let record = store
+            .resources("dev.example", "account")
+            .await
+            .unwrap()
+            .remove(0);
+        let plugin_directory = root.path().join("data/dev.example");
+        std::fs::remove_dir_all(&plugin_directory).unwrap();
+        std::fs::write(&plugin_directory, "blocks directory creation").unwrap();
+
+        let result = store
+            .apply_patch(
+                "dev.example",
+                "account",
+                &record.id,
+                ResourcePatch {
+                    private_data: Some(serde_json::json!({"token":"rotated"})),
+                    state: None,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn replaces_model_catalogs() {
         let (_root, store) = store();
         let model = StoredModel::from_definition(&serde_json::json!({
