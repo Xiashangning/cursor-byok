@@ -10,5 +10,6 @@ mod summary;
 mod turns;
 pub(crate) mod worker;
 
+pub(crate) use builder::BuiltCheckpoint;
 pub use builder::CheckpointBuilder;
 pub use steps::{PendingSteps, StepBuffer};

@@ -8,16 +8,16 @@ use crate::{
     Error, Result,
 };
 
-use super::CheckpointBuilder;
+use super::{BuiltCheckpoint, CheckpointBuilder};
 
 impl CheckpointBuilder {
-    pub async fn compacted(
+    pub(crate) async fn compacted(
         &mut self,
         messages: &[CanonicalMessage],
         mode: i32,
         summary: &str,
         presentation: &PendingSteps,
-    ) -> Result<pb::ConversationStateStructure> {
+    ) -> Result<BuiltCheckpoint> {
         let summarized = self
             .base
             .root_prompt_messages_json
@@ -102,6 +102,6 @@ impl CheckpointBuilder {
                 messages,
             )?);
         }
-        Ok(self.base.clone())
+        Ok(BuiltCheckpoint::without_consumptions(self.base.clone()))
     }
 }

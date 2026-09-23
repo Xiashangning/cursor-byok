@@ -2,15 +2,13 @@
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    cursor::{
-        checkpoint::PendingSteps, protocol::proto::agent::v1 as pb, transport::TransportHandle,
-    },
+    cursor::{checkpoint::PendingSteps, transport::TransportHandle},
     model::{CheckpointId, ToolRoundId},
     store::Store,
     Error, Result,
 };
 
-use super::CheckpointBuilder;
+use super::{BuiltCheckpoint, CheckpointBuilder};
 
 pub(crate) struct CheckpointJob {
     pub kind: CheckpointKind,
@@ -33,13 +31,13 @@ pub(crate) enum CheckpointKind {
     Compaction {
         checkpoint_id: CheckpointId,
         summary: String,
-        result: oneshot::Sender<Result<pb::ConversationStateStructure>>,
+        result: oneshot::Sender<Result<BuiltCheckpoint>>,
     },
 }
 
 pub(crate) struct FinalCheckpoints {
-    pub staged: pb::ConversationStateStructure,
-    pub settled: pb::ConversationStateStructure,
+    pub staged: BuiltCheckpoint,
+    pub settled: BuiltCheckpoint,
 }
 
 pub(crate) struct CheckpointWorker {

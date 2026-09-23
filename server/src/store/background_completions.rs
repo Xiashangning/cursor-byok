@@ -7,26 +7,32 @@ use crate::{model::ConversationId, Result};
 use super::{now_ms, Store};
 
 impl Store {
-    pub(crate) async fn record_consumed_background_completion(
+    pub(crate) async fn record_consumed_background_completions(
         &self,
         conversation_id: &ConversationId,
         kind: &str,
-        task_identity: &str,
-        tool_call_id: &str,
+        completions: &[(String, String)],
     ) -> Result<()> {
+        if completions.is_empty() {
+            return Ok(());
+        }
         let _write = self.writes.lock().await;
-        sqlx::query(
-            "INSERT OR IGNORE INTO background_consumed
-             (conversation_id, kind, task_identity, tool_call_id, consumed_at_ms)
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(conversation_id.as_str())
-        .bind(kind)
-        .bind(task_identity)
-        .bind(tool_call_id)
-        .bind(now_ms())
-        .execute(&self.pool)
-        .await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (task_identity, tool_call_id) in completions {
+            sqlx::query(
+                "INSERT OR IGNORE INTO background_consumed
+                 (conversation_id, kind, task_identity, tool_call_id, consumed_at_ms)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(conversation_id.as_str())
+            .bind(kind)
+            .bind(task_identity)
+            .bind(tool_call_id)
+            .bind(now_ms())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -71,21 +77,19 @@ mod tests {
             .unwrap()
             .is_empty());
         store
-            .record_consumed_background_completion(
+            .record_consumed_background_completions(
                 &conversation_id,
                 "BACKGROUND_TASK_KIND_SUBAGENT",
-                "agent-1",
-                "task-call-1",
+                &[("agent-1".into(), "task-call-1".into())],
             )
             .await
             .unwrap();
         // 主键幂等:重复登记不产生第二行。
         store
-            .record_consumed_background_completion(
+            .record_consumed_background_completions(
                 &conversation_id,
                 "BACKGROUND_TASK_KIND_SUBAGENT",
-                "agent-1",
-                "task-call-1",
+                &[("agent-1".into(), "task-call-1".into())],
             )
             .await
             .unwrap();

@@ -11,7 +11,7 @@ use crate::{
         checkpoint::StepBuffer,
         checkpoint::{
             worker::{CheckpointJob, CheckpointKind, CheckpointWorker, FinalCheckpoints},
-            CheckpointBuilder,
+            BuiltCheckpoint, CheckpointBuilder,
         },
         compile::{
             compile_injection, compile_user_message_action, CursorRunContext, RuntimeAction,
@@ -166,7 +166,7 @@ impl ConversationOutput {
         let mut interrupted_rounds = HashSet::<ToolRoundId>::new();
         let mut interrupted_tool_calls = HashSet::<String>::new();
         let mut final_checkpoint = None::<FinalCheckpoints>;
-        let mut compaction_checkpoint = None::<pb::ConversationStateStructure>;
+        let mut compaction_checkpoint = None::<BuiltCheckpoint>;
         let mut turn_usage = None::<Usage>;
         let mut context_tokens = None::<u64>;
         let mut ready = VecDeque::new();
@@ -586,7 +586,7 @@ impl ConversationOutput {
                                 .map_err(|_| Error::Protocol("checkpoint worker stopped".into()))?
                             {
                                 Ok(checkpoint) => {
-                                    context_tokens = checkpoint_context_tokens(&checkpoint);
+                                    context_tokens = checkpoint_context_tokens(&checkpoint.state);
                                     compaction_checkpoint = Some(checkpoint);
                                     state.barrier.complete(Ok(()));
                                 }
@@ -768,7 +768,7 @@ impl ConversationOutput {
                                     .await?;
                                 self.handle.emit(&pb::AgentServerMessage {
                                     ttft_breakdown: None,
-                                    message: Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(checkpoints.settled)),
+                                    message: Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(checkpoints.settled.state.clone())),
                                 })?;
                                 Ok(RunFinish::TurnCompleted)
                             }
