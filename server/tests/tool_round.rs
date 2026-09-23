@@ -840,7 +840,7 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
         .get_or_create("repeated-compaction-request")
         .await
         .unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
@@ -922,7 +922,7 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
     ]);
     let registry = registry(store.clone(), provider.clone());
     let handle = registry.get_or_create("tool-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
@@ -1051,7 +1051,7 @@ async fn duplicate_tool_call_id_across_rounds_does_not_wedge_the_run() {
     ]);
     let registry = registry(store.clone(), provider.clone());
     let handle = registry.get_or_create("tool-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,

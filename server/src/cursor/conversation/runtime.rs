@@ -756,7 +756,22 @@ fn spawn_run_request(
                 }
             }
         }
-        let pending = registry.take_pending(&prepared.conversation_id).await;
+        if generation.superseded.is_cancelled() {
+            return;
+        }
+
+        let run_id = prepared.run_id.clone();
+        let conversation_id = prepared.conversation_id.clone();
+        let (port, core, run_handle) = crate::run::channel(run_id.clone(), 256);
+        *generation.run.lock() = Some(run_handle.clone());
+        if generation.superseded.is_cancelled() {
+            run_handle.cancel();
+            *generation.run.lock() = None;
+            return;
+        }
+        let pending = registry
+            .activate(conversation_id.clone(), run_id.clone(), run_handle.clone())
+            .await;
         if !pending.is_empty() {
             let mut messages = pending
                 .into_iter()
@@ -773,21 +788,11 @@ fn spawn_run_request(
             }
         }
         if generation.superseded.is_cancelled() {
-            return;
-        }
-
-        let run_id = prepared.run_id.clone();
-        let conversation_id = prepared.conversation_id.clone();
-        let (port, core, run_handle) = crate::run::channel(run_id.clone(), 256);
-        *generation.run.lock() = Some(run_handle.clone());
-        if generation.superseded.is_cancelled() {
             run_handle.cancel();
+            registry.release(&conversation_id, &run_id).await;
             *generation.run.lock() = None;
             return;
         }
-        registry
-            .activate(conversation_id.clone(), run_id.clone(), run_handle.clone())
-            .await;
         let cancellation = run_handle.cancellation();
         let engine = RunEngine::new(dependencies.store.clone(), dependencies.provider.clone());
         let core_run = tokio::spawn(async move { engine.run(prepared, port, cancellation).await });

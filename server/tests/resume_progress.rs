@@ -18,7 +18,7 @@ async fn resume_action_context_and_continuation_reach_the_next_model_call() {
     let registry = registry(store, provider.clone());
 
     let first = registry.get_or_create("initial-request").await.unwrap();
-    let mut first_output = first.subscribe();
+    let mut first_output = first.subscribe().unwrap();
     first
         .command(TransportCommand::Append {
             seqno: 0,
@@ -45,7 +45,7 @@ async fn resume_action_context_and_continuation_reach_the_next_model_call() {
     assert!(state.pending_tool_calls.is_empty());
 
     let resumed = registry.get_or_create("resume-request").await.unwrap();
-    let mut resumed_output = resumed.subscribe();
+    let mut resumed_output = resumed.subscribe().unwrap();
     resumed
         .command(TransportCommand::Append {
             seqno: 0,

@@ -33,7 +33,7 @@ pub struct PumpOutput {
 /// are appended in order. Replies to other frames are handled internally.
 pub async fn drive(
     handle: &TransportHandle,
-    output: &mut tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    output: &mut tokio::sync::mpsc::Receiver<Bytes>,
     seqno: &mut i64,
     mut on_exec: impl FnMut(&pb::ExecServerMessage) -> Vec<pb::AgentClientMessage>,
 ) -> PumpOutput {

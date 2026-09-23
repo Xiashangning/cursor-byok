@@ -43,7 +43,7 @@ async fn dropping_an_output_subscription_does_not_remove_the_transport() {
         .get_or_create("subscription-request")
         .await
         .unwrap();
-    let subscription = handle.subscribe();
+    let subscription = handle.subscribe().unwrap();
     drop(subscription);
 
     tokio::time::sleep(Duration::from_millis(25)).await;

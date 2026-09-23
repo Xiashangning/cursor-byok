@@ -541,7 +541,7 @@ async fn run(
     request: pb::AgentClientMessage,
 ) -> Output {
     let handle = registry.get_or_create(request_id).await.unwrap();
-    let mut receiver = handle.subscribe();
+    let mut receiver = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,

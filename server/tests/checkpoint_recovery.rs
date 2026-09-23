@@ -225,7 +225,7 @@ async fn eligible_pending_checkpoint_resumes_tools_before_the_next_model_call() 
     let registry = registry(store.clone(), provider.clone());
 
     let first = registry.get_or_create("first-run").await.unwrap();
-    let mut first_output = first.subscribe();
+    let mut first_output = first.subscribe().unwrap();
     first
         .command(TransportCommand::Append {
             seqno: 0,
@@ -275,7 +275,7 @@ async fn eligible_pending_checkpoint_resumes_tools_before_the_next_model_call() 
     first.disconnect().await;
 
     let resumed = registry.get_or_create("resumed-run").await.unwrap();
-    let mut resumed_output = resumed.subscribe();
+    let mut resumed_output = resumed.subscribe().unwrap();
     let mut resumed_checkpoints = Vec::new();
     let mut resumed_set_blob_ids = HashSet::new();
     resumed
@@ -453,7 +453,7 @@ async fn recovery_rejects_a_kv_get_payload_whose_hash_does_not_match_the_blob_id
     let (_directory, store) = temp_store().await;
     let registry = registry(store, FakeProvider::default());
     let handle = registry.get_or_create("bad-blob-run").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     let expected = BlobId::digest(b"expected");
     handle
         .command(TransportCommand::Append {
@@ -522,7 +522,7 @@ async fn recovery_rejects_a_kv_get_payload_whose_hash_does_not_match_the_blob_id
 }
 
 async fn next_message(
-    output: &mut tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>,
+    output: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
 ) -> pb::AgentServerMessage {
     let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
         .await

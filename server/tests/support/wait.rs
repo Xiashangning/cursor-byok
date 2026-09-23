@@ -15,7 +15,7 @@ use cursor_server::cursor::protocol::connect;
 pub async fn wait_for_provider_requests(
     provider: &FakeProvider,
     handle: &TransportHandle,
-    output: &mut tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    output: &mut tokio::sync::mpsc::Receiver<Bytes>,
     seqno: &mut i64,
     count: usize,
 ) {

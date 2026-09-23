@@ -34,7 +34,7 @@ async fn local_markdown_rules_land_in_the_request_context_message() {
         rules_root,
     );
     let handle = registry.get_or_create("rules-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,

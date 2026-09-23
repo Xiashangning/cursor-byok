@@ -109,7 +109,7 @@ impl TransportHandle {
         let _ = self.commands.send(TransportCommand::Disconnect).await;
     }
 
-    pub fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<Bytes> {
+    pub fn subscribe(&self) -> Option<super::OutputReceiver> {
         self.output.subscribe()
     }
 
@@ -118,7 +118,17 @@ impl TransportHandle {
     }
 
     pub fn emit_frame(&self, frame: Bytes) -> bool {
-        self.output.emit(frame)
+        let status = self.output.emit_status(frame);
+        if status.last_subscriber_evicted {
+            let command = TransportCommand::OutputDetached;
+            if let Err(mpsc::error::TrySendError::Full(command)) = self.commands.try_send(command) {
+                let commands = self.commands.clone();
+                tokio::spawn(async move {
+                    let _ = commands.send(command).await;
+                });
+            }
+        }
+        status.accepted
     }
 
     pub fn emit(&self, message: &pb::AgentServerMessage) -> Result<()> {

@@ -24,7 +24,7 @@ async fn abort_command_cancels_the_run_and_closes_output() {
     let (_directory, store) = temp_store().await;
     let registry = registry(store, FakeProvider::default());
     let handle = registry.get_or_create("abort-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
 
     handle.command(TransportCommand::Disconnect).await.unwrap();
 
@@ -63,7 +63,7 @@ async fn provider_failure_retries_from_the_current_checkpoint_without_hiding_par
     provider.push(text_response("attempt-1", "completed"));
     let registry = registry(store.clone(), provider.clone());
     let handle = registry.get_or_create("retry-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
@@ -145,7 +145,7 @@ async fn provider_failure_keeps_the_initial_checkpoint_then_returns_structured_e
     ]);
     let registry = registry(store.clone(), provider.clone());
     let handle = registry.get_or_create("failed-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
@@ -228,7 +228,7 @@ async fn rejected_provider_request_is_reported_after_one_attempt() {
     provider.push(text_response("retried", "retried"));
     let registry = registry(store, provider.clone());
     let handle = registry.get_or_create("failed-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
@@ -275,7 +275,7 @@ async fn unknown_tool_response_id_is_ignored_and_the_run_continues() {
         .get_or_create("protocol-failed-request")
         .await
         .unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
@@ -354,7 +354,7 @@ async fn newer_run_request_on_one_bidi_stream_replaces_the_active_run() {
         .get_or_create("protocol-failed-request")
         .await
         .unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
@@ -501,7 +501,7 @@ async fn assert_run_starts_without_parent_dependency(
     if let Some(parent) = parent {
         handle.set_parent(parent).unwrap();
     }
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     let mut message = protocol_client_run("continue", "independent-user");
     let Some(pb::agent_client_message::Message::RunRequest(request)) = message.message.as_mut()
     else {

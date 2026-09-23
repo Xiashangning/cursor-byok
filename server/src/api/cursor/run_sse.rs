@@ -12,18 +12,20 @@ use crate::{
     cursor::{
         protocol::connect::{self, END_STREAM_FLAG},
         services::observability::CursorTraceRecorder,
-        transport::{TransportHandle, TransportRegistry},
+        transport::{OutputReceiver, TransportHandle, TransportRegistry},
     },
     Result,
 };
 
 pub async fn stream(registry: &TransportRegistry, request_id: &str) -> Result<Response<Body>> {
     let handle = registry.get_or_create(request_id).await?;
-    let receiver = handle.subscribe();
     let trace = handle.trace().cloned();
     if let Some(trace) = &trace {
         trace.response_started(StatusCode::OK.as_u16());
     }
+    let Some(receiver) = handle.subscribe() else {
+        return replay_overflow_response(handle, trace);
+    };
     let body_stream = local_body_stream(receiver, handle, trace);
     let mut response = Response::new(Body::from_stream(body_stream));
     *response.status_mut() = StatusCode::OK;
@@ -40,8 +42,46 @@ pub async fn stream(registry: &TransportRegistry, request_id: &str) -> Result<Re
     Ok(response)
 }
 
+/// 输出历史超出重放容量后,新订阅者拿不到完整输出。返回带错误的终止帧,
+/// 让客户端明确看到失败而不是把静默断流误当成正常运行结束;随后按客户端
+/// 断开处理(无其他订阅者时由 runtime 拆除会话,不再空跑)。
+fn replay_overflow_response(
+    handle: TransportHandle,
+    trace: Option<CursorTraceRecorder>,
+) -> Result<Response<Body>> {
+    let frame = connect::encode_error_end_stream(&connect::ConnectStreamError {
+        code: connect::ConnectCode::Unavailable,
+        message:
+            "run output exceeded the replay capacity and can no longer be streamed to this client"
+                .into(),
+        details: Vec::new(),
+    })?;
+    let mut trace = TraceStreamSink::new(trace, "byok_server");
+    let body_stream = async_stream::stream! {
+        trace.chunk(&frame);
+        trace.finish(end_stream_error(&frame));
+        yield Ok::<Bytes, Infallible>(frame);
+        let _ = handle
+            .command(crate::cursor::conversation::TransportCommand::OutputDetached)
+            .await;
+    };
+    let mut response = Response::new(Body::from_stream(body_stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .insert("connect-protocol-version", HeaderValue::from_static("1"));
+    Ok(response)
+}
+
 fn local_body_stream(
-    receiver: mpsc::UnboundedReceiver<Bytes>,
+    receiver: OutputReceiver,
     handle: TransportHandle,
     trace: Option<CursorTraceRecorder>,
 ) -> impl tokio_stream::Stream<Item = std::result::Result<Bytes, Infallible>> {
@@ -60,9 +100,29 @@ fn local_body_stream(
                 return;
             }
         }
+        if guard.receiver.overflowed() {
+            let frame = slow_subscriber_error_frame();
+            trace.chunk(&frame);
+            trace.finish(end_stream_error(&frame));
+            yield Ok::<Bytes, Infallible>(frame);
+            let _ = guard
+                .handle
+                .command(crate::cursor::conversation::TransportCommand::OutputDetached)
+                .await;
+        } else {
+            trace.finish(None);
+        }
         guard.complete();
-        trace.finish(None);
     }
+}
+
+fn slow_subscriber_error_frame() -> Bytes {
+    connect::encode_error_end_stream(&connect::ConnectStreamError {
+        code: connect::ConnectCode::Unavailable,
+        message: "client consumed run output too slowly".into(),
+        details: Vec::new(),
+    })
+    .expect("static slow-subscriber error must encode")
 }
 
 fn is_end_stream_frame(frame: &Bytes) -> bool {
@@ -97,12 +157,12 @@ fn end_stream_error(frame: &Bytes) -> Option<String> {
 
 struct LocalRunGuard {
     handle: TransportHandle,
-    receiver: mpsc::UnboundedReceiver<Bytes>,
+    receiver: OutputReceiver,
     completed: bool,
 }
 
 impl LocalRunGuard {
-    fn new(handle: TransportHandle, receiver: mpsc::UnboundedReceiver<Bytes>) -> Self {
+    fn new(handle: TransportHandle, receiver: OutputReceiver) -> Self {
         Self {
             handle,
             receiver,
@@ -233,5 +293,61 @@ impl Drop for UpstreamRunGuard {
     fn drop(&mut self) {
         self.registry
             .finish_upstream(self.request_id.clone(), self.generation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::*;
+    use crate::{
+        cursor::{
+            conversation::TransportCommand, services::observability::CursorTraceService,
+            transport::OutputHub,
+        },
+        store::Store,
+    };
+
+    #[tokio::test]
+    async fn slow_subscriber_receives_an_error_and_detaches_the_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("slow-subscriber.db").display()
+        ))
+        .await
+        .unwrap();
+        let trace = CursorTraceService::new(store).recorder("slow-subscriber");
+        let (commands, mut command_receiver) = mpsc::channel(4);
+        let output = Arc::new(OutputHub::default());
+        let handle = TransportHandle::new("slow-subscriber".into(), commands, output, trace);
+        let receiver = handle.subscribe().unwrap();
+
+        for _ in 0..2_000 {
+            assert!(handle.emit_frame(Bytes::from_static(b"\0")));
+        }
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), command_receiver.recv())
+                .await
+                .unwrap(),
+            Some(TransportCommand::OutputDetached)
+        ));
+
+        let stream = local_body_stream(receiver, handle, None);
+        tokio::pin!(stream);
+        let mut terminal_error = None;
+        while let Some(frame) = stream.next().await {
+            let frame = frame.unwrap();
+            if is_end_stream_frame(&frame) {
+                terminal_error = end_stream_error(&frame);
+            }
+        }
+
+        assert_eq!(
+            terminal_error.as_deref(),
+            Some("unavailable: client consumed run output too slowly")
+        );
     }
 }

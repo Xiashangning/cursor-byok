@@ -33,10 +33,15 @@ pub(crate) struct ConversationDependencies {
 }
 
 struct RegistryInner {
-    current: Mutex<HashMap<ConversationId, ActiveRun>>,
-    pending: Mutex<HashMap<ConversationId, PendingMessages>>,
+    state: Mutex<RegistryState>,
     changed: Notify,
     pub dependencies: ConversationDependencies,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    current: HashMap<ConversationId, ActiveRun>,
+    pending: HashMap<ConversationId, PendingMessages>,
 }
 
 #[derive(Clone)]
@@ -56,8 +61,7 @@ impl ConversationRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
-                current: Mutex::new(HashMap::new()),
-                pending: Mutex::new(HashMap::new()),
+                state: Mutex::new(RegistryState::default()),
                 changed: Notify::new(),
                 dependencies: ConversationDependencies {
                     store,
@@ -83,22 +87,33 @@ impl ConversationRegistry {
         super::ConversationRuntime::spawn(self.clone(), handle, receiver);
     }
 
+    /// Publishes the replacement run and claims every queued injection under one lock.
+    /// Deliveries therefore observe either the pending queue or the new active run,
+    /// never the gap between draining and activation.
     pub(crate) async fn activate(
         &self,
         conversation_id: ConversationId,
         run_id: RunId,
         handle: RunHandle,
-    ) {
-        let previous = self.inner.current.lock().await.insert(
-            conversation_id,
+    ) -> Vec<CompiledMessages> {
+        let mut state = self.inner.state.lock().await;
+        let previous = state.current.insert(
+            conversation_id.clone(),
             ActiveRun {
                 run_id: run_id.clone(),
                 handle,
             },
         );
+        let pending = state
+            .pending
+            .remove(&conversation_id)
+            .map(|mut pending| pending.drain().collect())
+            .unwrap_or_default();
+        drop(state);
         if let Some(previous) = previous.filter(|previous| previous.run_id != run_id) {
             previous.handle.cancel();
         }
+        pending
     }
 
     pub async fn deliver(
@@ -109,65 +124,74 @@ impl ConversationRegistry {
         if compiled.delivery == MessageDelivery::Ignore {
             return CommandResult::Applied;
         }
-        let active = self
-            .inner
-            .current
-            .lock()
-            .await
-            .get(conversation_id)
-            .cloned();
-        let Some(active) = active else {
-            self.inner
-                .pending
-                .lock()
-                .await
-                .entry(conversation_id.clone())
-                .or_default()
-                .push(compiled);
-            return CommandResult::RunEnded;
-        };
-        if compiled
-            .target_run_id
-            .as_ref()
-            .is_some_and(|target| target != &active.run_id)
-        {
-            return CommandResult::StaleTarget;
-        }
-        let pending = compiled.clone();
-        let result = match compiled.delivery {
-            MessageDelivery::Ignore => CommandResult::Applied,
-            MessageDelivery::InsertMessages => {
+        loop {
+            let active = {
+                let mut state = self.inner.state.lock().await;
+                let Some(active) = state.current.get(conversation_id).cloned() else {
+                    state
+                        .pending
+                        .entry(conversation_id.clone())
+                        .or_default()
+                        .push(compiled);
+                    return CommandResult::RunEnded;
+                };
+                if compiled
+                    .target_run_id
+                    .as_ref()
+                    .is_some_and(|target| target != &active.run_id)
+                {
+                    return CommandResult::StaleTarget;
+                }
                 active
-                    .handle
-                    .insert_messages(compiled.event_id, compiled.messages)
-                    .await
+            };
+            let pending = compiled.clone();
+            let result = match compiled.delivery {
+                MessageDelivery::Ignore => CommandResult::Applied,
+                MessageDelivery::InsertMessages => {
+                    active
+                        .handle
+                        .insert_messages(compiled.event_id.clone(), compiled.messages.clone())
+                        .await
+                }
+                MessageDelivery::BreakMessages => {
+                    active
+                        .handle
+                        .break_messages(compiled.event_id.clone(), compiled.messages.clone())
+                        .await
+                }
+            };
+            if !matches!(result, CommandResult::RunClosing | CommandResult::RunEnded) {
+                return result;
             }
-            MessageDelivery::BreakMessages => {
-                active
-                    .handle
-                    .break_messages(compiled.event_id, compiled.messages)
-                    .await
+
+            let mut state = self.inner.state.lock().await;
+            let owner_unchanged = state
+                .current
+                .get(conversation_id)
+                .is_some_and(|current| current.run_id == active.run_id);
+            if owner_unchanged || !state.current.contains_key(conversation_id) {
+                state
+                    .pending
+                    .entry(conversation_id.clone())
+                    .or_default()
+                    .push(pending);
+                return result;
             }
-        };
-        if matches!(result, CommandResult::RunClosing | CommandResult::RunEnded) {
-            self.inner
-                .pending
-                .lock()
-                .await
-                .entry(conversation_id.clone())
-                .or_default()
-                .push(pending);
+            drop(state);
+            // An untargeted delivery that lost ownership to a replacement run is
+            // retried against that run. A targeted delivery is rejected on the
+            // next loop iteration rather than being stranded in pending state.
         }
-        result
     }
 
     pub(crate) async fn release(&self, conversation_id: &ConversationId, run_id: &RunId) {
-        let mut current = self.inner.current.lock().await;
-        if current
+        let mut state = self.inner.state.lock().await;
+        if state
+            .current
             .get(conversation_id)
             .is_some_and(|run| &run.run_id == run_id)
         {
-            current.remove(conversation_id);
+            state.current.remove(conversation_id);
             self.inner.changed.notify_waiters();
         }
     }
@@ -179,9 +203,10 @@ impl ConversationRegistry {
             changed.as_mut().enable();
             if !self
                 .inner
-                .current
+                .state
                 .lock()
                 .await
+                .current
                 .contains_key(conversation_id)
             {
                 return;
@@ -190,23 +215,106 @@ impl ConversationRegistry {
         }
     }
 
-    pub(crate) async fn take_pending(
-        &self,
-        conversation_id: &ConversationId,
-    ) -> Vec<CompiledMessages> {
-        self.inner
-            .pending
-            .lock()
-            .await
-            .remove(conversation_id)
-            .map(|mut pending| pending.drain().collect())
-            .unwrap_or_default()
-    }
-
     pub async fn shutdown(&self) {
-        let current = std::mem::take(&mut *self.inner.current.lock().await);
+        let current = std::mem::take(&mut self.inner.state.lock().await.current);
         for active in current.into_values() {
             active.handle.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        cursor::prompting::PromptAssets, model::ModelInvocation, provider::ProviderStream,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct EmptyProvider;
+
+    impl Provider for EmptyProvider {
+        fn stream(
+            &self,
+            _invocation: ModelInvocation,
+            _cancellation: CancellationToken,
+        ) -> ProviderStream {
+            Box::pin(futures_util::stream::empty())
+        }
+    }
+
+    async fn registry() -> ConversationRegistry {
+        ConversationRegistry::new(
+            Store::connect("sqlite::memory:").await.unwrap(),
+            Arc::new(EmptyProvider),
+            PromptCompiler::new(PromptAssets::embedded().unwrap()),
+            WebCache::default(),
+            None,
+            None,
+        )
+    }
+
+    fn injection(event_id: &str) -> CompiledMessages {
+        CompiledMessages {
+            event_id: event_id.into(),
+            target_run_id: None,
+            messages: Vec::new(),
+            delivery: MessageDelivery::InsertMessages,
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_delivery_is_claimed_by_current_or_next_activation() {
+        let registry = registry().await;
+        let conversation_id = ConversationId::from("conversation");
+        assert_eq!(
+            registry
+                .deliver(&conversation_id, injection("before"))
+                .await,
+            CommandResult::RunEnded
+        );
+
+        let (port, _session, first_handle) = crate::run::channel(RunId::from("run-1"), 1);
+        drop(port);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let activating = {
+            let registry = registry.clone();
+            let conversation_id = conversation_id.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                registry
+                    .activate(conversation_id, RunId::from("run-1"), first_handle)
+                    .await
+            })
+        };
+        let delivering = {
+            let registry = registry.clone();
+            let conversation_id = conversation_id.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                registry
+                    .deliver(&conversation_id, injection("racing"))
+                    .await
+            })
+        };
+        barrier.wait().await;
+        let mut claimed = activating.await.unwrap();
+        assert_eq!(delivering.await.unwrap(), CommandResult::RunEnded);
+
+        let (port, _session, second_handle) = crate::run::channel(RunId::from("run-2"), 1);
+        drop(port);
+        claimed.extend(
+            registry
+                .activate(conversation_id, RunId::from("run-2"), second_handle)
+                .await,
+        );
+        let mut ids = claimed
+            .into_iter()
+            .map(|message| message.event_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, ["before", "racing"]);
     }
 }
