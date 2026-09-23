@@ -13,7 +13,17 @@ use crate::store::{
     ProxySettingsInput, StatisticsStorage, StatisticsStorageScope, TabSettings,
 };
 
-use super::{ControlService, ObservabilitySettings};
+use super::{AccessTokenView, ControlService, ObservabilitySettings};
+
+pub async fn get_access_token(State(service): State<ControlService>) -> Json<AccessTokenView> {
+    Json(service.access_token_view())
+}
+
+pub async fn regenerate_access_token(
+    State(service): State<ControlService>,
+) -> Result<Json<AccessTokenView>> {
+    Ok(Json(service.regenerate_access_token().await?))
+}
 
 pub async fn get(State(service): State<ControlService>) -> Result<Json<ObservabilitySettings>> {
     Ok(Json(service.observability().await?))

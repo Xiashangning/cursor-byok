@@ -51,6 +51,8 @@ pub struct Config {
     pub provider_stream_idle_timeout: Duration,
     pub console: Option<ConsoleSource>,
     pub use_persisted_ports: bool,
+    /// CURSOR_ACCESS_TOKEN 设置的访问令牌;未设置时由控制层生成并持久化。
+    pub access_token: Option<String>,
     /// 面向用户的应用版本;桌面壳会覆盖为自身版本,用于插件 minAppVersion 门控。
     pub app_version: String,
 }
@@ -63,10 +65,11 @@ pub enum ConsoleSource {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let listen_addr = env::var("CURSOR_LISTEN_ADDR")
+        let listen_addr: SocketAddr = env::var("CURSOR_LISTEN_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:3000".into())
             .parse()
             .map_err(|error| Error::Config(format!("invalid CURSOR_LISTEN_ADDR: {error}")))?;
+        let access_token = env::var("CURSOR_ACCESS_TOKEN").ok();
         let request_timeout = match env::var("CURSOR_PROVIDER_TIMEOUT_SECONDS") {
             Ok(value) => Duration::from_secs(value.parse().map_err(|error| {
                 Error::Config(format!("invalid CURSOR_PROVIDER_TIMEOUT_SECONDS: {error}"))
@@ -104,6 +107,7 @@ impl Config {
             provider_stream_idle_timeout: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT,
             console,
             use_persisted_ports: false,
+            access_token,
             app_version: env!("CARGO_PKG_VERSION").into(),
         })
     }
@@ -118,6 +122,7 @@ impl Config {
             provider_stream_idle_timeout: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT,
             console: None,
             use_persisted_ports: true,
+            access_token: None,
             app_version: env!("CARGO_PKG_VERSION").into(),
         })
     }
@@ -149,6 +154,14 @@ fn database_url_for_dir(data_dir: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_loopback_bindings_are_allowed() {
+        // 非回环绑定由访问令牌保护,不再在配置层拦截。
+        for address in ["127.0.0.1:3000", "[::1]:3000", "0.0.0.0:3000"] {
+            assert!(address.parse::<SocketAddr>().is_ok(), "{address}");
+        }
+    }
 
     #[test]
     fn provider_timeout_defaults_match_runtime_boundaries() {

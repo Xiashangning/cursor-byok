@@ -46,6 +46,15 @@ impl App {
         )?;
         plugins.start_quota_refresh();
         let clients = crate::network::NetworkClients::new(store.clone());
+        let access_token =
+            control::AccessToken::resolve(&store, config.access_token.clone()).await?;
+        if !config.listen_addr.ip().is_loopback() {
+            tracing::info!(
+                %config.listen_addr,
+                token = %access_token.current(),
+                "non-loopback bind; remote clients must present this access token"
+            );
+        }
         let provider = std::sync::Arc::new(ProviderRouter::new(
             store.clone(),
             plugins.clone(),
@@ -67,6 +76,7 @@ impl App {
             plugin_runtime,
             plugins,
             clients.clone(),
+            access_token,
         )?;
         let harness = control.cursor_harness().clone();
         let mut router = api::router(registry.clone(), clients)?;
@@ -137,11 +147,15 @@ impl App {
         let registry = self.registry;
         let harness = self.harness;
         let graceful = shutdown.clone();
-        let server = axum::serve(listener, self.router)
-            .with_graceful_shutdown(async move {
-                graceful.cancelled().await;
-            })
-            .into_future();
+        let server = axum::serve(
+            listener,
+            self.router
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            graceful.cancelled().await;
+        })
+        .into_future();
         tokio::pin!(server);
 
         tokio::select! {

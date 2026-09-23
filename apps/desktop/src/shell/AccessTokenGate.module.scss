@@ -1,0 +1,30 @@
+@use "../styles/typography" as type;
+
+.mask {
+  position: fixed;
+  z-index: 13000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--window-header-height) 24px 24px;
+  background: rgb(0 0 0 / 52%);
+}
+
+.card {
+  width: min(400px, calc(100vw - 48px));
+}
+
+.form {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+
+  strong {
+    font-size: type.$font-size-base;
+  }
+
+  small {
+    color: var(--vscode-descriptionForeground);
+    font-size: type.$font-size-xs;
+  }
+}

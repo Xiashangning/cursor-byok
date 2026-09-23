@@ -99,6 +99,8 @@ export function CursorSettingsPage() {
         type: draft.model.type,
         base_url: draft.model.base_url.trim(),
         api_key: draft.model.api_key.trim(),
+        // 编辑已有模型时密钥在编辑器里是脱敏后的空值,交给服务端从存储回填
+        model_hash: editing?.model_hash ?? null,
         custom_headers_enabled: draft.model.custom_headers_enabled,
         custom_headers,
       });
@@ -113,7 +115,7 @@ export function CursorSettingsPage() {
   };
   const persist = async (): Promise<Model | null> => {
     if (!draft) return null;
-    const input = draftInput(draft);
+    const input = draftInput(draft, editing === null);
     if (editing) return appStore.updateCursorModel(editing.model_hash, input);
     return (await appStore.createModels([input]))?.[0] ?? null;
   };
@@ -226,11 +228,10 @@ export function CursorSettingsPage() {
       displayName = `${baseName} ${suffix}`;
       suffix += 1;
     }
-    const created = await appStore.createModels([{
-      ...modelInput(model),
-      sort_order: models.length + 1,
+    const created = await appStore.duplicateCursorModel(model.model_hash, {
       display_name: displayName,
-    }]);
+      sort_order: models.length + 1,
+    });
     if (created) message(t("模型已复制"));
   };
   const openGroupSettings = (group: CursorModelGroup) => {
@@ -352,7 +353,7 @@ export function CursorSettingsPage() {
     </ConfirmDialog>
     <Modal fullHeight open={draft !== null || pluginEditing !== null} title={editing || pluginEditing ? t("编辑模型") : t("添加模型")} banner={draft && (editorTesting || editorTestState) ? <CursorModelTestResult state={editorTestState} testing={editorTesting} /> : undefined} busy={cursorBusy || savingAndTesting || pluginSaving} onClose={() => { if (editing && editorTesting) void cancelModelTest(editing.model_hash); setDraft(null); setEditing(null); setPluginEditing(null); }} onSubmit={() => { if (draft) void save(); else pluginEditorRef.current?.save(); }} submitLabel={t("保存")} secondaryAction={draft ? <button type="button" className={controls.secondary} disabled={cursorBusy || savingAndTesting} onClick={() => void (editorTesting && editing ? cancelModelTest(editing.model_hash) : saveAndTest())}>{savingAndTesting ? t("处理中…") : editorTesting ? t("取消测试") : t("保存并测试")}</button> : undefined}>
       {draft && <>
-        <CursorModelEditor draft={draft} modelOptions={modelOptions} discovering={discovering} onChange={setDraft} onDiscover={discover} />
+        <CursorModelEditor draft={draft} modelOptions={modelOptions} discovering={discovering} editingExisting={editing !== null} onChange={setDraft} onDiscover={discover} />
       </>}
       {pluginEditing && <PluginModelEditor ref={pluginEditorRef} model={pluginEditing} busy={pluginSaving} onSave={(input) => void savePluginOverride(input)} />}
     </Modal>
@@ -388,7 +389,7 @@ function sharedValue(values: string[]): string | null {
   return rest.every((value) => value === first) ? first : null;
 }
 
-function draftInput(draft: CursorModelDraft): ModelInput {
+function draftInput(draft: CursorModelDraft, requireApiKey: boolean): ModelInput {
   const model = {
     ...draft.model,
     display_name: draft.model.display_name.trim(),
@@ -400,7 +401,7 @@ function draftInput(draft: CursorModelDraft): ModelInput {
     custom_headers: parseHeaders(draft.customHeadersText),
     anthropic_extra_params: parseObject(draft.anthropicExtraParamsText, t("Anthropic 额外参数")),
   };
-  if (!model.display_name || !model.base_url || !model.api_key || !model.tooltip_data || !model.model_id) throw new Error(t("服务器地址或完整请求 URL、API Key、模型名称、显示名称和备注不能为空"));
+  if (!model.display_name || !model.base_url || (requireApiKey && !model.api_key) || !model.tooltip_data || !model.model_id) throw new Error(t("服务器地址或完整请求 URL、API Key、模型名称、显示名称和备注不能为空"));
   for (const [label, value] of [[t("最大输出 Token"), model.type === "openai" ? model.max_completion_tokens : model.anthropic_max_tokens], [t("思考预算 Token"), model.thinking_budget_tokens]] as const) {
     if (value !== null && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(t("{label} 必须是大于 0 的整数", { label }));
   }

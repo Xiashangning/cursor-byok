@@ -5,6 +5,7 @@ import { MessageProvider } from "./shared/ui/MessageProvider";
 import { useMessage } from "./shared/ui/message";
 import { AppFrame } from "./shell/AppFrame";
 import { AppLayout } from "./shell/AppLayout";
+import { AccessTokenGate, consumeAccessTokenParam } from "./shell/AccessTokenGate";
 import { CallsPage } from "./features/calls/CallsPage";
 import { CallDetailsPage } from "./features/calls/CallDetailsPage";
 import { CursorSettingsPage } from "./features/models/CursorSettingsPage";
@@ -17,6 +18,11 @@ import { updateStore } from "./shared/store/updateStore";
 const AUTO_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 
 export function App() {
+  const bootstrapped = useRef(false);
+  if (!bootstrapped.current) {
+    bootstrapped.current = true;
+    consumeAccessTokenParam();
+  }
   return (
     <TooltipProvider>
       <HashRouter>
@@ -34,6 +40,7 @@ export function App() {
           </Route>
         </Routes>
       </HashRouter>
+      <AccessTokenGate />
       <AppMessages />
     </TooltipProvider>
   );

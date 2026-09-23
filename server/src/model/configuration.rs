@@ -162,6 +162,55 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Control API responses expose configuration shape without returning credentials.
+    /// 已保存的密钥与敏感头值替换为 REDACTED_SECRET 占位符(保留头名),非敏感头原样
+    /// 返回以支持编辑器往返;更新时占位符视为「未修改」由服务端回填,空串视为「清除」。
+    pub fn redact_secrets(mut self) -> Self {
+        if !self.api_key.is_empty() {
+            self.api_key = REDACTED_SECRET.into();
+        }
+        if let Some(headers) = self.custom_headers.as_object_mut() {
+            for (name, value) in headers.iter_mut() {
+                if is_sensitive_header(name)
+                    && value.as_str().is_some_and(|value| !value.is_empty())
+                {
+                    *value = serde_json::Value::String(REDACTED_SECRET.into());
+                }
+            }
+        }
+        self
+    }
+
+    /// 还原为可再次提交的输入;哈希与时间戳不属于输入。
+    pub fn into_input(self) -> ModelConfigInput {
+        ModelConfigInput {
+            sort_order: self.sort_order,
+            display_name: self.display_name,
+            group_name: self.group_name,
+            model_type: self.model_type,
+            base_url: self.base_url,
+            use_full_url: self.use_full_url,
+            api_key: self.api_key,
+            tooltip_data: self.tooltip_data,
+            model_id: self.model_id,
+            reasoning_effort: self.reasoning_effort,
+            effort_options: self.effort_options,
+            context_options: self.context_options,
+            openai_endpoint: self.openai_endpoint,
+            openai_extra_params_enabled: self.openai_extra_params_enabled,
+            openai_extra_params: self.openai_extra_params,
+            custom_headers_enabled: self.custom_headers_enabled,
+            custom_headers: self.custom_headers,
+            anthropic_extra_params_enabled: self.anthropic_extra_params_enabled,
+            anthropic_extra_params: self.anthropic_extra_params,
+            context_window_tokens: self.context_window_tokens,
+            max_completion_tokens: self.max_completion_tokens,
+            anthropic_max_tokens: self.anthropic_max_tokens,
+            anthropic_thinking_effort: self.anthropic_thinking_effort,
+            thinking_budget_tokens: self.thinking_budget_tokens,
+        }
+    }
+
     pub fn provider_type(&self) -> ProviderType {
         match self.model_type {
             ModelType::Anthropic => ProviderType::Anthropic,
@@ -609,6 +658,10 @@ pub fn is_sensitive_header(name: &str) -> bool {
         "authorization" | "proxy-authorization" | "x-api-key" | "api-key" | "cookie" | "set-cookie"
     )
 }
+
+/// 脱敏占位符:控制 API 用它替换已保存的密钥与敏感头值。编辑器原样往返
+/// 即「未修改」(服务端回填),传回空串即「清除」;它不代表任何真实密钥内容。
+pub const REDACTED_SECRET: &str = "••••••••";
 
 fn normalize_openai_endpoint(value: &str) -> Result<String> {
     match value.trim() {

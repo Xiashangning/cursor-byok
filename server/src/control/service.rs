@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
+    control::auth::{AccessToken, AccessTokenSource},
     local_app::CursorHarness,
     model::{
         ContentPart, CursorRunTraceArtifact, CursorRunTraceSummary, LlmCallRequest,
@@ -37,6 +38,7 @@ pub struct ControlService {
     plugin_runtime: PluginRuntime,
     plugins: PluginRegistry,
     clients: crate::network::NetworkClients,
+    access_token: AccessToken,
     model_tests: Arc<Mutex<BTreeMap<String, CancellationToken>>>,
 }
 
@@ -45,12 +47,22 @@ pub struct DiscoveredModels {
     pub models: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct AccessTokenView {
+    pub token: String,
+    pub source: AccessTokenSource,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ModelDiscoveryInput {
     #[serde(rename = "type")]
     pub model_type: ModelType,
     pub base_url: String,
     pub api_key: String,
+    /// 编辑已有模型时带上哈希:编辑器往返的是脱敏配置(REDACTED_SECRET 占位符),
+    /// 占位符密钥/敏感头由服务端回填。
+    #[serde(default)]
+    pub model_hash: Option<String>,
     #[serde(default)]
     pub custom_headers_enabled: bool,
     #[serde(default = "empty_json_object")]
@@ -122,6 +134,7 @@ impl ControlService {
         plugin_runtime: PluginRuntime,
         plugins: PluginRegistry,
         clients: crate::network::NetworkClients,
+        access_token: AccessToken,
     ) -> Result<Self> {
         Ok(Self {
             cursor_harness: CursorHarness::new(store.clone())?,
@@ -130,8 +143,28 @@ impl ControlService {
             plugin_runtime,
             plugins,
             clients,
+            access_token,
             model_tests: Arc::new(Mutex::new(BTreeMap::new())),
         })
+    }
+
+    pub fn access_token(&self) -> &AccessToken {
+        &self.access_token
+    }
+
+    pub async fn regenerate_access_token(&self) -> Result<AccessTokenView> {
+        let token = self.access_token.regenerate(&self.store).await?;
+        Ok(AccessTokenView {
+            token,
+            source: self.access_token.source(),
+        })
+    }
+
+    pub fn access_token_view(&self) -> AccessTokenView {
+        AccessTokenView {
+            token: self.access_token.current(),
+            source: self.access_token.source(),
+        }
     }
 
     pub fn cursor_harness(&self) -> &CursorHarness {
@@ -321,7 +354,34 @@ impl ControlService {
         model_hash: &str,
         input: &ModelConfigInput,
     ) -> Result<ModelConfig> {
-        self.store.update_model(model_hash, input).await
+        let mut input = input.clone();
+        let existing = self
+            .store
+            .model(model_hash)
+            .await?
+            .ok_or_else(|| Error::RunNotFound(format!("model {model_hash}")))?;
+        if input.api_key == crate::model::REDACTED_SECRET {
+            input.api_key = existing.api_key;
+        }
+        restore_redacted_headers(&mut input.custom_headers, &existing.custom_headers);
+        self.store.update_model(model_hash, &input).await
+    }
+
+    pub async fn duplicate_model(
+        &self,
+        model_hash: &str,
+        display_name: String,
+        sort_order: i64,
+    ) -> Result<ModelConfig> {
+        let existing = self
+            .store
+            .model(model_hash)
+            .await?
+            .ok_or_else(|| Error::RunNotFound(format!("model {model_hash}")))?;
+        let mut input = existing.into_input();
+        input.display_name = display_name;
+        input.sort_order = sort_order;
+        self.store.create_model(&input).await
     }
 
     pub async fn test_model(
@@ -489,6 +549,7 @@ impl ControlService {
     }
 
     pub async fn discover_models(&self, input: &ModelDiscoveryInput) -> Result<DiscoveredModels> {
+        let (api_key, custom_headers) = self.discovery_credentials(input).await?;
         let client = self.clients.default_client().await?;
         let base_url = crate::model::normalize_request_url(&input.base_url)?;
         discover_models_from_endpoint(
@@ -498,14 +559,51 @@ impl ControlService {
                 ModelType::Anthropic => ProviderType::Anthropic,
             },
             &base_url,
-            &input.api_key,
+            &api_key,
             if input.custom_headers_enabled {
-                &input.custom_headers
+                &custom_headers
             } else {
                 empty_json_object_ref()
             },
         )
         .await
+    }
+
+    /// 编辑已有模型时,编辑器里往返的是脱敏配置(REDACTED_SECRET 占位符),
+    /// 发现模型前从存储回填;占位符语义与更新模型一致(空串即「清除」,不回填)。
+    /// 一旦回填了存储的密钥,目标 URL 必须仍是该模型自己配置的地址,
+    /// 否则等于把密钥发给调用方指定的任意服务器。
+    async fn discovery_credentials(
+        &self,
+        input: &ModelDiscoveryInput,
+    ) -> Result<(String, serde_json::Value)> {
+        let Some(model_hash) = input.model_hash.as_deref() else {
+            return Ok((input.api_key.clone(), input.custom_headers.clone()));
+        };
+        let stored = self
+            .store
+            .model(model_hash)
+            .await?
+            .ok_or_else(|| Error::RunNotFound(format!("model {model_hash}")))?;
+        let redacted_key = input.api_key == crate::model::REDACTED_SECRET;
+        let api_key = if redacted_key {
+            stored.api_key.clone()
+        } else {
+            input.api_key.clone()
+        };
+        let mut custom_headers = input.custom_headers.clone();
+        let backfilled_headers =
+            restore_redacted_headers(&mut custom_headers, &stored.custom_headers);
+        if (redacted_key && !api_key.is_empty()) || backfilled_headers > 0 {
+            let requested = crate::model::normalize_request_url(&input.base_url)?;
+            let configured = crate::model::normalize_request_url(&stored.base_url)?;
+            if requested.trim_end_matches('/') != configured.trim_end_matches('/') {
+                return Err(Error::Config(
+                    "model discovery with stored credentials requires the model's configured base URL; re-enter the API key to discover from a different URL".into(),
+                ));
+            }
+        }
+        Ok((api_key, custom_headers))
     }
 
     pub async fn calls(&self, limit: i64) -> Result<Vec<CallSummary>> {
@@ -668,6 +766,32 @@ impl ControlService {
     pub async fn set_commit_settings(&self, settings: CommitSettings) -> Result<CommitSettings> {
         self.store.set_commit_settings(settings).await
     }
+}
+
+/// 控制 API 会把已保存的敏感头值替换为 REDACTED_SECRET 占位符;更新时占位符
+/// 视为「未修改」,从现有配置回填(头名按 HTTP 语义大小写不敏感),空串视为
+/// 「清除」。非敏感头原样往返,用户在编辑器里的增删直接生效。返回回填的头数量。
+fn restore_redacted_headers(next: &mut serde_json::Value, previous: &serde_json::Value) -> usize {
+    let (Some(next), Some(previous)) = (next.as_object_mut(), previous.as_object()) else {
+        return 0;
+    };
+    let mut restored = 0;
+    for (name, value) in next.iter_mut() {
+        if !crate::model::is_sensitive_header(name)
+            || value.as_str() != Some(crate::model::REDACTED_SECRET)
+        {
+            continue;
+        }
+        if let Some(previous_value) = previous
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value)
+        {
+            *value = previous_value.clone();
+            restored += 1;
+        }
+    }
+    restored
 }
 
 fn official_call(trace: CursorRunTraceSummary) -> CallSummary {
@@ -1023,6 +1147,7 @@ mod tests {
     };
 
     use super::{model_discovery_url, model_discovery_urls, ControlService};
+    use crate::control::{AccessToken, AccessTokenSource};
 
     #[test]
     fn model_discovery_url_appends_to_path() {
@@ -1050,6 +1175,10 @@ mod tests {
             (
                 "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
                 "https://open.bigmodel.cn/api/coding/paas/v4/models",
+            ),
+            (
+                "https://example.com:8443/arbitrary/v1/chat/completions",
+                "https://example.com:8443/arbitrary/v1/models",
             ),
         ];
         for (base, expected) in cases {
@@ -1216,6 +1345,7 @@ mod tests {
             plugin_runtime,
             plugins,
             clients,
+            AccessToken::new("test".into(), AccessTokenSource::Generated),
         )
         .unwrap();
 
@@ -1268,6 +1398,7 @@ mod tests {
             plugin_runtime,
             plugins,
             clients,
+            AccessToken::new("test".into(), AccessTokenSource::Generated),
         )
         .unwrap();
         let running_service = service.clone();
@@ -1294,14 +1425,180 @@ mod tests {
         assert_eq!(super::estimate_output_tokens(""), 0);
     }
 
-    #[test]
-    fn model_discovery_url_keeps_provider_path_prefix() {
-        assert_eq!(
-            super::model_discovery_url("https://example.com:8443/arbitrary/v1/chat/completions")
-                .unwrap()
-                .as_str(),
-            "https://example.com:8443/arbitrary/v1/models"
-        );
+    fn service_for(store: crate::store::Store) -> ControlService {
+        let plugin_runtime = PluginRuntime::managed().unwrap();
+        let plugins =
+            PluginRegistry::managed(store.clone(), plugin_runtime.clone(), "test".into()).unwrap();
+        let clients = crate::network::NetworkClients::new(store.clone());
+        ControlService::new(
+            store,
+            Arc::new(TestProvider {
+                invocation: Arc::new(Mutex::new(None)),
+            }),
+            plugin_runtime,
+            plugins,
+            clients,
+            AccessToken::new("test".into(), AccessTokenSource::Generated),
+        )
+        .unwrap()
+    }
+
+    async fn model_with_headers(store: &crate::store::Store) -> crate::model::ModelConfig {
+        let input = ModelConfigInput {
+            model_id: "header-model".into(),
+            display_name: "Header Model".into(),
+            group_name: None,
+            model_type: ModelType::OpenAi,
+            base_url: "https://example.com/v1/responses".into(),
+            use_full_url: true,
+            api_key: "secret".into(),
+            tooltip_data: "Header Model".into(),
+            sort_order: 0,
+            reasoning_effort: None,
+            effort_options: Vec::new(),
+            context_options: Vec::new(),
+            openai_endpoint: "/v1/responses".into(),
+            openai_extra_params_enabled: false,
+            openai_extra_params: serde_json::json!({}),
+            custom_headers_enabled: true,
+            custom_headers: serde_json::json!({
+                "Authorization": "Bearer token",
+                "X-Tenant": "tenant-a"
+            }),
+            anthropic_extra_params_enabled: false,
+            anthropic_extra_params: serde_json::json!({}),
+            context_window_tokens: None,
+            max_completion_tokens: None,
+            anthropic_max_tokens: None,
+            anthropic_thinking_effort: None,
+            thinking_budget_tokens: None,
+        };
+        store.create_model(&input).await.unwrap()
+    }
+
+    /// 编辑器往返:脱敏后的输入(占位符 api_key、占位符敏感头)不得改变已存密钥。
+    #[tokio::test]
+    async fn redacted_round_trip_preserves_api_key_and_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("update.db").display()
+        ))
+        .await
+        .unwrap();
+        let service = service_for(store.clone());
+        let created = model_with_headers(&store).await;
+        let mut input = created.clone().redact_secrets().into_input();
+
+        let updated = service
+            .update_model(&created.model_hash, &input)
+            .await
+            .unwrap();
+        assert_eq!(updated.api_key, "secret");
+        assert_eq!(updated.custom_headers["Authorization"], "Bearer token");
+        assert_eq!(updated.custom_headers["X-Tenant"], "tenant-a");
+
+        // 轮换 API Key 时同样保留自定义头。
+        input.api_key = "rotated".into();
+        let rotated = service
+            .update_model(&updated.model_hash, &input)
+            .await
+            .unwrap();
+        assert_eq!(rotated.api_key, "rotated");
+        assert_eq!(rotated.custom_headers["Authorization"], "Bearer token");
+        assert_eq!(rotated.custom_headers["X-Tenant"], "tenant-a");
+    }
+
+    /// 显式编辑直接生效:改值、删键、清空全部。
+    #[tokio::test]
+    async fn explicit_header_edits_apply_directly() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("headers.db").display()
+        ))
+        .await
+        .unwrap();
+        let service = service_for(store.clone());
+        let created = model_with_headers(&store).await;
+        let mut input = created.clone().redact_secrets().into_input();
+        input.custom_headers = serde_json::json!({
+            "Authorization": "Bearer new",
+            "X-Tenant": "tenant-b"
+        });
+
+        let updated = service
+            .update_model(&created.model_hash, &input)
+            .await
+            .unwrap();
+        assert_eq!(updated.custom_headers["Authorization"], "Bearer new");
+        assert_eq!(updated.custom_headers["X-Tenant"], "tenant-b");
+
+        input.custom_headers = serde_json::json!({"X-Tenant": "tenant-b"});
+        let deleted = service
+            .update_model(&updated.model_hash, &input)
+            .await
+            .unwrap();
+        assert!(deleted.custom_headers.get("Authorization").is_none());
+        assert_eq!(deleted.custom_headers["X-Tenant"], "tenant-b");
+    }
+
+    /// 显式清空语义:空串敏感头直接清除,不再回填;api_key 模型层要求非空,
+    /// 清空会被校验拒绝(而不是静默回填)。
+    #[tokio::test]
+    async fn empty_secrets_clear_headers_but_api_key_stays_required() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("clear.db").display()
+        ))
+        .await
+        .unwrap();
+        let service = service_for(store.clone());
+        let created = model_with_headers(&store).await;
+        let mut input = created.clone().redact_secrets().into_input();
+
+        input.custom_headers = serde_json::json!({
+            "Authorization": "",
+            "X-Tenant": "tenant-a"
+        });
+        let updated = service
+            .update_model(&created.model_hash, &input)
+            .await
+            .unwrap();
+        assert_eq!(updated.custom_headers["Authorization"], "");
+        assert_eq!(updated.custom_headers["X-Tenant"], "tenant-a");
+        assert_eq!(updated.api_key, "secret");
+
+        input.api_key = String::new();
+        let rejected = service.update_model(&created.model_hash, &input).await;
+        assert!(matches!(rejected, Err(crate::Error::Config(_))));
+    }
+
+    /// 复制模型从存储中的未脱敏配置克隆,不经编辑器往返。
+    #[tokio::test]
+    async fn duplicate_clones_secrets_from_the_stored_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("duplicate.db").display()
+        ))
+        .await
+        .unwrap();
+        let service = service_for(store.clone());
+        let created = model_with_headers(&store).await;
+
+        let copy = service
+            .duplicate_model(&created.model_hash, "Header Model 副本".into(), 2)
+            .await
+            .unwrap();
+
+        assert_ne!(copy.model_hash, created.model_hash);
+        assert_eq!(copy.display_name, "Header Model 副本");
+        assert_eq!(copy.sort_order, 2);
+        assert_eq!(copy.api_key, "secret");
+        assert_eq!(copy.custom_headers["Authorization"], "Bearer token");
+        assert_eq!(copy.custom_headers["X-Tenant"], "tenant-a");
     }
 
     #[tokio::test]
@@ -1354,6 +1651,7 @@ mod tests {
             plugin_runtime,
             plugins,
             clients,
+            AccessToken::new("test".into(), AccessTokenSource::Generated),
         )
         .unwrap();
         let result = service
@@ -1361,6 +1659,7 @@ mod tests {
                 model_type: ModelType::OpenAi,
                 base_url: format!("http://{address}/custom/responses"),
                 api_key: "secret".into(),
+                model_hash: None,
                 custom_headers_enabled: true,
                 custom_headers: serde_json::json!({
                     "uSeR-aGeNt": "inherited-user-agent",
@@ -1382,6 +1681,180 @@ mod tests {
             headers.get(axum::http::header::AUTHORIZATION).unwrap(),
             "Bearer secret"
         );
+        server.abort();
+    }
+
+    /// 回填存储密钥时,目标 URL 必须仍是模型自己配置的地址,
+    /// 否则存储的密钥会被发往调用方指定的任意服务器。
+    #[tokio::test]
+    async fn discovery_with_stored_credentials_requires_the_configured_base_url() {
+        type CapturedRequest = axum::http::HeaderMap;
+
+        async fn models(
+            axum::extract::State(sender): axum::extract::State<
+                tokio::sync::mpsc::UnboundedSender<CapturedRequest>,
+            >,
+            request: axum::extract::Request,
+        ) -> axum::Json<serde_json::Value> {
+            sender.send(request.headers().clone()).unwrap();
+            axum::Json(serde_json::json!({ "data": [{ "id": "model-a" }] }))
+        }
+
+        let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new()
+            .route("/custom/models", axum::routing::get(models))
+            .with_state(sender);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("discovery-gate.db").display()
+        ))
+        .await
+        .unwrap();
+        let service = service_for(store.clone());
+        let mut input = model_with_headers(&store).await.into_input();
+        input.base_url = format!("http://{address}/custom/responses");
+        let created = store.create_model(&input).await.unwrap();
+
+        let discover = |base_url: String, api_key: String| super::ModelDiscoveryInput {
+            model_type: ModelType::OpenAi,
+            base_url,
+            api_key,
+            model_hash: Some(created.model_hash.clone()),
+            custom_headers_enabled: false,
+            custom_headers: serde_json::json!({}),
+        };
+
+        // 改了 base_url、密钥保留占位符(等回填)→ 拒绝。
+        let rejected = service
+            .discover_models(&discover(
+                "https://attacker.example.com/v1/responses".into(),
+                crate::model::REDACTED_SECRET.into(),
+            ))
+            .await;
+        assert!(matches!(rejected, Err(crate::Error::Config(_))));
+
+        // 空白与尾随斜杠差异不算改地址,回填的存储密钥正常发出。
+        let allowed = service
+            .discover_models(&discover(
+                format!(" http://{address}/custom/responses/ "),
+                crate::model::REDACTED_SECRET.into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.models, vec!["model-a"]);
+        let headers = requests.recv().await.unwrap();
+        assert_eq!(
+            headers.get(axum::http::header::AUTHORIZATION).unwrap(),
+            "Bearer secret"
+        );
+
+        // 显式提供新密钥时不涉及存储密钥,允许任意地址。
+        let allowed = service
+            .discover_models(&discover(format!("http://{address}"), "fresh-key".into()))
+            .await;
+        // 未回填则不设限;该地址的 /v1/models 不存在,失败是 404 而非门禁拒绝。
+        assert!(
+            !matches!(allowed, Err(crate::Error::Config(_))),
+            "{allowed:?}"
+        );
+        server.abort();
+    }
+
+    /// 编辑器往返:脱敏后的占位符在发现模型时由服务端从存储回填。
+    #[tokio::test]
+    async fn discovery_falls_back_to_stored_credentials_when_redacted() {
+        type CapturedRequest = (axum::http::Uri, axum::http::HeaderMap);
+
+        async fn models(
+            axum::extract::State(sender): axum::extract::State<
+                tokio::sync::mpsc::UnboundedSender<CapturedRequest>,
+            >,
+            request: axum::extract::Request,
+        ) -> axum::Json<serde_json::Value> {
+            let (parts, _) = request.into_parts();
+            sender.send((parts.uri, parts.headers)).unwrap();
+            axum::Json(serde_json::json!({ "data": [{ "id": "model-a" }] }))
+        }
+
+        let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new()
+            .route("/custom/models", axum::routing::get(models))
+            .with_state(sender);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("redacted-discovery.db").display()
+        ))
+        .await
+        .unwrap();
+        let service = service_for(store.clone());
+        let base_url = format!("http://{address}/custom/responses");
+        let created = store
+            .create_model(&ModelConfigInput {
+                model_id: "model-a".into(),
+                display_name: "Model A".into(),
+                group_name: None,
+                model_type: ModelType::OpenAi,
+                base_url: base_url.clone(),
+                use_full_url: true,
+                api_key: "stored-key".into(),
+                tooltip_data: "Model A".into(),
+                sort_order: 0,
+                reasoning_effort: None,
+                effort_options: Vec::new(),
+                context_options: Vec::new(),
+                openai_endpoint: "/v1/responses".into(),
+                openai_extra_params_enabled: false,
+                openai_extra_params: serde_json::json!({}),
+                custom_headers_enabled: true,
+                custom_headers: serde_json::json!({
+                    "X-Api-Key": "stored-header-key",
+                    "X-Tenant": "tenant-a"
+                }),
+                anthropic_extra_params_enabled: false,
+                anthropic_extra_params: serde_json::json!({}),
+                context_window_tokens: None,
+                max_completion_tokens: None,
+                anthropic_max_tokens: None,
+                anthropic_thinking_effort: None,
+                thinking_budget_tokens: None,
+            })
+            .await
+            .unwrap();
+
+        let result = service
+            .discover_models(&super::ModelDiscoveryInput {
+                model_type: ModelType::OpenAi,
+                base_url,
+                api_key: crate::model::REDACTED_SECRET.into(),
+                model_hash: Some(created.model_hash.clone()),
+                custom_headers_enabled: true,
+                custom_headers: serde_json::json!({
+                    "X-Api-Key": crate::model::REDACTED_SECRET,
+                    "X-Tenant": "tenant-a"
+                }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.models, vec!["model-a"]);
+        let (uri, headers) = requests.recv().await.unwrap();
+        assert_eq!(uri.path(), "/custom/models");
+        assert_eq!(
+            headers.get(axum::http::header::AUTHORIZATION).unwrap(),
+            "Bearer stored-key"
+        );
+        assert_eq!(headers.get("x-api-key").unwrap(), "stored-header-key");
+        assert_eq!(headers.get("x-tenant").unwrap(), "tenant-a");
         server.abort();
     }
 }

@@ -38,6 +38,8 @@ RUN apt-get update && \
 COPY --from=server /tmp/cursor-server /usr/local/bin/cursor-server
 COPY --from=web /src/apps/desktop/dist/ /app/console/
 
+# 控制 API 对非回环来源要求 Bearer 访问令牌:首次启动自动生成、打印到日志并
+# 持久化到数据目录(设置页可查看/重新生成);生产部署建议用 CURSOR_ACCESS_TOKEN 固定。
 ENV CURSOR_LISTEN_ADDR=0.0.0.0:3000 \
     CURSOR_DATABASE_URL=sqlite:///data/cursor-server.db \
     CURSOR_CONSOLE_DIR=/app/console \

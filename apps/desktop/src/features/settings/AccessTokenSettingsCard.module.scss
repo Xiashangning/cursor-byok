@@ -1,0 +1,21 @@
+@use "../../styles/typography" as type;
+
+.content {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.token {
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.hint {
+  color: var(--vscode-descriptionForeground);
+  font-size: type.$font-size-xs;
+}

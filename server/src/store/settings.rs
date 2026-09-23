@@ -15,6 +15,7 @@ const COMMIT_SETTINGS_KEY: &str = "commit_settings";
 const CURSOR_TAKEOVER_ENABLED_KEY: &str = "cursor_takeover_enabled";
 const DISABLED_PLUGIN_MODELS_KEY: &str = "disabled_plugin_models";
 const DISABLED_PLUGIN_ACCOUNTS_KEY: &str = "disabled_plugin_accounts";
+const ACCESS_TOKEN_KEY: &str = "access_token";
 const PLUGIN_MODEL_OVERRIDES_KEY: &str = "plugin_model_overrides";
 
 /// Embedded default system prompts for commit message generation.
@@ -511,6 +512,32 @@ impl Store {
         )
         .bind(DISABLED_PLUGIN_ACCOUNTS_KEY)
         .bind(value_json)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 控制 API 的访问令牌;未设置过则为 None,由控制层在启动时生成并写回。
+    pub async fn access_token(&self) -> Result<Option<String>> {
+        let value = sqlx::query_scalar::<_, String>(
+            "SELECT value_json FROM service_settings WHERE setting_key = ?",
+        )
+        .bind(ACCESS_TOKEN_KEY)
+        .fetch_optional(&self.pool)
+        .await?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    pub async fn set_access_token(&self, token: &str) -> Result<()> {
+        let _write = self.writes.lock().await;
+        sqlx::query(
+            "INSERT INTO service_settings(setting_key, value_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(ACCESS_TOKEN_KEY)
+        .bind(serde_json::to_string(token)?)
         .bind(now_ms())
         .execute(&self.pool)
         .await?;

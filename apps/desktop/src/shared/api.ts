@@ -1,5 +1,6 @@
 import type { Locale } from "../i18n/runtime";
 import { invoke } from "@tauri-apps/api/core";
+import { appStore } from "./store/appStore";
 
 export type ModelType = "openai" | "anthropic";
 
@@ -64,6 +65,8 @@ export interface ModelDiscoveryInput {
   type: ModelType;
   base_url: string;
   api_key: string;
+  /** 编辑已有模型时传入:脱敏后的占位符密钥与敏感头由服务端从存储回填,空串表示清除。 */
+  model_hash: string | null;
   custom_headers_enabled: boolean;
   custom_headers: Record<string, string>;
 }
@@ -510,16 +513,33 @@ const packagedDesktop = "__TAURI_INTERNALS__" in window
   || window.location.hostname === "tauri.localhost";
 const API_ROOT = "/__byok-api__/api";
 
+export interface AccessTokenInfo {
+  token: string;
+  source: "environment" | "generated";
+}
+
+const ACCESS_TOKEN_STORAGE_KEY = "byok.accessToken";
+
+export function setStoredAccessToken(token: string): void {
+  localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, token);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const accessToken = localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY);
   let response: Response;
   try {
     response = await fetch(`${API_ROOT}${path}`, {
       ...init,
-      headers: init?.body ? { "content-type": "application/json", ...init.headers } : init?.headers,
+      headers: {
+        ...(init?.body ? { "content-type": "application/json" } : {}),
+        ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        ...init?.headers,
+      },
     });
   } catch (cause) {
     throw new Error(t("无法连接本地管理服务"), { cause });
   }
+  if (response.status === 401) appStore.setAccessTokenRequired(true);
   if (!response.ok) {
     const body = await response.text();
     let message = body;
@@ -541,6 +561,7 @@ export const api = {
   reorderModels: (modelHashes: string[]) => request<Model[]>("/models/order", { method: "PUT", body: JSON.stringify({ model_hashes: modelHashes }) }),
   discoverModels: (input: ModelDiscoveryInput) => request<{ models: string[] }>("/models/discover", { method: "POST", body: JSON.stringify(input) }),
   updateModel: (hash: string, model: ModelInput) => request<Model>(`/models/${hash}`, { method: "PUT", body: JSON.stringify(model) }),
+  duplicateModel: (hash: string, input: { display_name: string; sort_order: number }) => request<Model>(`/models/${encodeURIComponent(hash)}/duplicate`, { method: "POST", body: JSON.stringify(input) }),
   deleteModel: (hash: string) => request<void>(`/models/${hash}`, { method: "DELETE" }),
   testModel: (hash: string, testId: string, signal?: AbortSignal) => request<ModelConnectivityResult>(`/models/${encodeURIComponent(hash)}/test/${encodeURIComponent(testId)}`, { method: "POST", signal }),
   cancelModelTest: (hash: string, testId: string) => request<void>(`/models/${encodeURIComponent(hash)}/test/${encodeURIComponent(testId)}`, { method: "DELETE" }),
@@ -608,4 +629,6 @@ export const api = {
   setDesktopSettings: (settings: DesktopSettings) => request<DesktopSettings>("/settings/desktop", { method: "PUT", body: JSON.stringify(settings) }),
   commitSettings: (locale: Locale) => request<CommitSettingsView>("/settings/commit", { headers: { "accept-language": locale } }),
   setCommitSettings: (settings: CommitSettings) => request<CommitSettingsView>("/settings/commit", { method: "PUT", body: JSON.stringify(settings) }),
+  accessToken: () => request<AccessTokenInfo>("/settings/access-token"),
+  regenerateAccessToken: () => request<AccessTokenInfo>("/settings/access-token/regenerate", { method: "POST" }),
 };
