@@ -112,20 +112,37 @@ impl Store {
         let _write = self.writes.lock().await;
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if detailed {
-            sqlx::query("INSERT INTO llm_call_requests(call_id, headers_json, body_json, byte_count) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM llm_calls WHERE call_id = ?)")
-                .bind(call_id)
-                .bind(headers_json)
-                .bind(&body_json)
-                .bind(body_json.len() as i64)
-                .bind(call_id)
-                .execute(&mut *transaction)
-                .await?;
-        }
-        sqlx::query("UPDATE llm_calls SET request_bytes = ? WHERE call_id = ?")
+            sqlx::query(
+                "INSERT INTO llm_call_requests(call_id, headers_json, body_json, byte_count)
+                 SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM llm_calls WHERE call_id = ?)
+                 ON CONFLICT(call_id) DO UPDATE SET
+                    headers_json = excluded.headers_json,
+                    body_json = excluded.body_json,
+                    byte_count = excluded.byte_count",
+            )
+            .bind(call_id)
+            .bind(headers_json)
+            .bind(&body_json)
             .bind(body_json.len() as i64)
             .bind(call_id)
             .execute(&mut *transaction)
             .await?;
+            sqlx::query("DELETE FROM llm_call_response_chunks WHERE call_id = ?")
+                .bind(call_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        sqlx::query(
+            "UPDATE llm_calls SET request_bytes = ?, response_headers_at_ms = NULL,
+             first_event_at_ms = NULL, first_text_at_ms = NULL,
+             first_valid_response_at_ms = NULL, ttfb_ms = NULL, ttft_ms = NULL,
+             ttfr_ms = NULL, response_bytes = 0, stream_event_count = 0,
+             http_status = NULL WHERE call_id = ?",
+        )
+        .bind(body_json.len() as i64)
+        .bind(call_id)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(())
     }

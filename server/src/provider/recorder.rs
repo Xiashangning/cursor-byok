@@ -78,6 +78,7 @@ struct Inner {
 struct AttemptState {
     call_id: String,
     started: Instant,
+    request_recorded: bool,
     next_chunk: AtomicI64,
     chunks: ChunkBuffer,
     first_text_recorded: AtomicBool,
@@ -89,6 +90,7 @@ impl AttemptState {
         Self {
             call_id,
             started: Instant::now(),
+            request_recorded: false,
             next_chunk: AtomicI64::new(0),
             chunks: ChunkBuffer::default(),
             first_text_recorded: AtomicBool::new(false),
@@ -144,11 +146,21 @@ impl CallRecorder {
         headers: serde_json::Value,
         body: &serde_json::Value,
     ) -> Result<()> {
-        let attempt = self.inner.attempt.lock().await;
+        let mut attempt = self.inner.attempt.lock().await;
+        if attempt.request_recorded {
+            attempt.started = Instant::now();
+            attempt.next_chunk.store(0, Ordering::Relaxed);
+            attempt.chunks = ChunkBuffer::default();
+            attempt.first_text_recorded.store(false, Ordering::Release);
+            attempt
+                .first_valid_response_recorded
+                .store(false, Ordering::Release);
+        }
         self.inner
             .store
             .record_llm_request(&attempt.call_id, &headers, body, self.inner.detailed)
             .await?;
+        attempt.request_recorded = true;
         Ok(())
     }
 

@@ -1024,6 +1024,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detailed_failover_rewrites_the_attempt_without_primary_key_errors() {
+        let (_directory, store, recorder) = recorder(true, "detailed-failover").await;
+        let first = host_with_recorder(store.clone(), recorder.clone()).await;
+        let mut first_params = network_params();
+        first_params["body"] = "{\"attempt\":1}".into();
+        assert!(first
+            .request("invocation", &first_params)
+            .await
+            .unwrap()
+            .2
+            .is_some());
+        recorder.response_headers(429).await.unwrap();
+        recorder.response_chunk(b"first-attempt").await.unwrap();
+
+        let second = host_with_recorder(store.clone(), recorder.clone()).await;
+        let mut second_params = network_params();
+        second_params["body"] = "{\"attempt\":2}".into();
+        assert!(second
+            .request("invocation", &second_params)
+            .await
+            .unwrap()
+            .2
+            .is_some());
+        recorder.response_headers(200).await.unwrap();
+        recorder.response_chunk(b"second-attempt").await.unwrap();
+        recorder.completed(FinishReason::Stop).await.unwrap();
+
+        let request = store
+            .llm_call_request("detailed-failover")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.body, serde_json::json!({"attempt": 2}));
+        let chunks = store.llm_call_chunks("detailed-failover").await.unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].data, "second-attempt");
+        assert_eq!(
+            store
+                .llm_call("detailed-failover")
+                .await
+                .unwrap()
+                .unwrap()
+                .http_status,
+            Some(200)
+        );
+    }
+
+    #[tokio::test]
     async fn standard_plugin_network_recording_keeps_metrics_without_payloads() {
         let (_directory, store, recorder) = recorder(false, "standard-plugin").await;
         let host = host_with_recorder(store.clone(), recorder.clone()).await;
