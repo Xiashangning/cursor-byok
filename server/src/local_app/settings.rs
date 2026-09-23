@@ -54,7 +54,9 @@ pub(super) fn write(settings: &BTreeMap<String, Value>) -> Result<()> {
     let data = serde_json::to_vec_pretty(settings)?;
     let temp = path.with_extension("json.tmp");
     fs::write(&temp, [data.as_slice(), b"\n"].concat())?;
-    fs::rename(temp, path)?;
+    crate::fs::replace_file(&temp, &path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })?;
     Ok(())
 }
 

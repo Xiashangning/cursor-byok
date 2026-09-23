@@ -190,14 +190,7 @@ fn write_once(
         .map_err(|error| ("sync temporary file", error))?;
     drop(file);
     let _ = set_file_permissions(temporary);
-    // Windows 的 rename 不覆盖已存在文件,先删除旧文件。
-    #[cfg(windows)]
-    match std::fs::remove_file(target) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(("remove previous file", error)),
-    }
-    std::fs::rename(temporary, target).map_err(|error| ("replace target file", error))?;
+    crate::fs::replace_file(temporary, target).map_err(|error| ("replace target file", error))?;
     let _ = set_file_permissions(target);
     Ok(())
 }

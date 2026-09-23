@@ -5,6 +5,7 @@ pub mod config;
 pub mod control;
 pub mod cursor;
 pub mod error;
+pub(crate) mod fs;
 pub mod local_app;
 pub mod model;
 pub mod network;
