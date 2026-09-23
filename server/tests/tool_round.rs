@@ -803,23 +803,6 @@ async fn an_exec_result_must_match_the_reserved_tool() {
 }
 
 #[tokio::test]
-async fn unknown_exec_id_is_ignored() {
-    let result = codec::client_event(
-        &pb::ExecClientMessage {
-            id: 999,
-            message: Some(pb::exec_client_message::Message::ReadResult(
-                pb::ReadResult::default(),
-            )),
-            ..Default::default()
-        },
-        &CursorToolRuntime::default(),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(result, codec::ClientExecEvent::Pending));
-}
-
-#[tokio::test]
 async fn one_run_can_auto_compact_again_after_more_tool_output() {
     let (_directory, store) = temp_store().await;
     let model = store

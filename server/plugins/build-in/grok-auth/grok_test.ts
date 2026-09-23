@@ -1,10 +1,6 @@
-import type {
-  JsonValue,
-  NetworkEventStream,
-  NetworkResponse,
-  PluginContext,
-} from "cursor-byok:plugin";
-import type { LlmRequest, ModelEvent } from "cursor-byok:provider";
+import type { JsonValue } from "cursor-byok:plugin";
+import type { ModelEvent } from "cursor-byok:provider";
+import { assert, assertEquals, context, jwt, request, sse } from "../test_helpers.ts";
 import type { ResourceSnapshot } from "cursor-byok:resource";
 import { grokDeviceOAuth } from "./oauth.ts";
 import { FALLBACK_MODELS, grokModels, parseGrokModels } from "./models.ts";
@@ -19,44 +15,6 @@ import {
   RESOURCE_TYPE,
 } from "./resources.ts";
 
-function assert(condition: unknown, message = "assertion failed"): asserts condition {
-  if (!condition) throw new Error(message);
-}
-
-function assertEquals(actual: unknown, expected: unknown): void {
-  const left = JSON.stringify(actual);
-  const right = JSON.stringify(expected);
-  if (left !== right) throw new Error(`expected ${right}, received ${left}`);
-}
-
-function jwt(payload: Record<string, unknown>): string {
-  const encoded = btoa(JSON.stringify(payload)).replace(/=/g, "").replace(/\+/g, "-").replace(
-    /\//g,
-    "_",
-  );
-  return `header.${encoded}.signature`;
-}
-
-type RequestInit = { body?: string; headers?: Record<string, string> };
-type FetchHandler = (url: string, init?: RequestInit) => NetworkResponse;
-type StreamHandler = (url: string, init?: RequestInit) => NetworkEventStream;
-
-function context(handlers: { fetch?: FetchHandler; stream?: StreamHandler }): PluginContext {
-  return {
-    network: {
-      fetch: (url, init) => {
-        if (!handlers.fetch) throw new Error("fetch was not expected");
-        return Promise.resolve(handlers.fetch(url, init));
-      },
-      stream: (url, init) => {
-        if (!handlers.stream) throw new Error("stream was not expected");
-        return Promise.resolve(handlers.stream(url, init));
-      },
-    },
-    signal: new AbortController().signal,
-  };
-}
-
 function snapshot(privateData: JsonValue): ResourceSnapshot {
   return {
     id: "resource-1",
@@ -64,22 +22,6 @@ function snapshot(privateData: JsonValue): ResourceSnapshot {
     key: "grok:user-1",
     privateData,
     state: { status: "ready" },
-  };
-}
-
-async function* sse(lines: string[]): AsyncGenerator<string> {
-  for (const line of lines) yield line;
-}
-
-function request(): LlmRequest {
-  return {
-    instructions: "You are a coding assistant.",
-    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
-    tools: [],
-    reasoning: { enabled: true, effort: "medium" },
-    latency: "fast",
-    maxOutputTokens: 32_000,
-    cacheKey: "conversation-1",
   };
 }
 
@@ -96,7 +38,10 @@ Deno.test("account identity uses the JWT subject and drafts keep tokens private-
   });
   assertEquals(draft.key, "grok:user-1");
   const view = presentAccount(snapshot(draft.privateData));
-  assert(!JSON.stringify(view).includes(token), "resource view exposed an access token");
+  assert(
+    !JSON.stringify(view).includes(token),
+    "resource view exposed an access token",
+  );
   assertEquals(view.displayName, "person@x.ai");
 });
 
@@ -106,7 +51,11 @@ Deno.test("credential import accepts Grok credential JSON files", () => {
       name: "accounts.json",
       content: JSON.stringify({
         accounts: [
-          { access_token: "token-1", refresh_token: "refresh-1", email: "a@x.ai" },
+          {
+            access_token: "token-1",
+            refresh_token: "refresh-1",
+            email: "a@x.ai",
+          },
           { access_token: "token-2", disabled: true },
         ],
       }),
@@ -145,7 +94,9 @@ Deno.test("credit usage percent is inverted to remaining and drives cooling", ()
 });
 
 Deno.test("missing usage with a billing period counts as unused", () => {
-  const quota = parseGrokUsage({ config: { currentPeriod: { end: 1_900_000_000 } } });
+  const quota = parseGrokUsage({
+    config: { currentPeriod: { end: 1_900_000_000 } },
+  });
   assertEquals(quota.remainingPercent, 100);
   assertEquals(quota.limitReached, false);
 });
@@ -153,7 +104,11 @@ Deno.test("missing usage with a billing period counts as unused", () => {
 Deno.test("model discovery parses both language-models and standard list shapes", () => {
   const richModels = parseGrokModels({
     models: [
-      { id: "grok-4", input_modalities: ["text", "image"], context_window: 256_000 },
+      {
+        id: "grok-4",
+        input_modalities: ["text", "image"],
+        context_window: 256_000,
+      },
       { id: "grok-3-mini", input_modalities: ["text"] },
       { id: "grok-4" },
     ],
@@ -196,7 +151,10 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
       requestNumber += 1;
       if (requestNumber === 1) {
         assertEquals(url, "https://auth.x.ai/oauth2/device/code");
-        assert(init?.body?.includes("scope="), "device code request must carry the scope");
+        assert(
+          init?.body?.includes("scope="),
+          "device code request must carry the scope",
+        );
         return {
           status: 200,
           headers: {},
@@ -222,7 +180,10 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
       return {
         status: 200,
         headers: {},
-        body: JSON.stringify({ access_token: accessToken, refresh_token: "refresh-secret" }),
+        body: JSON.stringify({
+          access_token: accessToken,
+          refresh_token: "refresh-secret",
+        }),
       };
     },
   });
@@ -235,7 +196,10 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
   assertEquals(pending.status, "pending");
 
   const polled = await grokDeviceOAuth.poll(begun.session, flowContext);
-  assert(polled.status === "completed", `expected completed, received ${polled.status}`);
+  assert(
+    polled.status === "completed",
+    `expected completed, received ${polled.status}`,
+  );
   assertEquals(polled.resources[0].key, "grok:user-oauth");
   assertEquals(requestNumber, 3);
 });
@@ -280,7 +244,10 @@ Deno.test("invoke streams normalized events from the xAI Chat Completions API", 
   assertEquals(body.model, "grok-4");
   assertEquals(body.stream, true);
   assertEquals(body.prompt_cache_key, "conversation-1");
-  assert(!("reasoning_effort" in body), "xAI endpoint rejects reasoning_effort");
+  assert(
+    !("reasoning_effort" in body),
+    "xAI endpoint rejects reasoning_effort",
+  );
   assert(!("service_tier" in body), "xAI endpoint rejects service_tier");
   assertEquals(requestHeaders["authorization"], `Bearer ${token}`);
   assertEquals(events, [
@@ -374,6 +341,12 @@ Deno.test("invoke maps quota failures to a cooling resource error", async () => 
       }),
     }),
   );
-  assert(result.status === "resource-error", `expected resource-error, received ${result.status}`);
-  assert(result.patch.state?.status === "cooling", "quota failure should cool the resource");
+  assert(
+    result.status === "resource-error",
+    `expected resource-error, received ${result.status}`,
+  );
+  assert(
+    result.patch.state?.status === "cooling",
+    "quota failure should cool the resource",
+  );
 });

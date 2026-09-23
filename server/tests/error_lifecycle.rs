@@ -463,26 +463,20 @@ async fn newer_run_request_on_one_bidi_stream_replaces_the_active_run() {
 }
 
 #[tokio::test]
-async fn parent_request_does_not_need_to_resolve_to_an_active_run() {
-    assert_run_starts_without_parent_dependency(
-        "finished-parent-request",
-        Some(TransportParent {
-            request_id: "already-finished-parent".into(),
-            tool_call_id: "original-tool-call".into(),
-        }),
-        None,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn subagent_type_does_not_require_parent_metadata() {
-    assert_run_starts_without_parent_dependency(
-        "parentless-subagent-request",
-        None,
-        Some("generalPurpose"),
-    )
-    .await;
+async fn runs_start_without_active_parent_dependencies() {
+    for (request_id, parent, subagent_type_name) in [
+        (
+            "finished-parent-request",
+            Some(TransportParent {
+                request_id: "already-finished-parent".into(),
+                tool_call_id: "original-tool-call".into(),
+            }),
+            None,
+        ),
+        ("parentless-subagent-request", None, Some("generalPurpose")),
+    ] {
+        assert_run_starts_without_parent_dependency(request_id, parent, subagent_type_name).await;
+    }
 }
 
 async fn assert_run_starts_without_parent_dependency(

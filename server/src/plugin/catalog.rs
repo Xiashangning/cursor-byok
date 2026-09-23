@@ -343,6 +343,18 @@ mod tests {
             definition_loader: PluginDefinitionLoader::for_test(sdk.path()).unwrap(),
             app_version: env!("CARGO_PKG_VERSION").into(),
         };
-        assert!(!catalog.manifests().is_empty());
+        let ids: Vec<_> = catalog
+            .manifests()
+            .into_iter()
+            .map(|(manifest, _)| manifest.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "dev.cursorbyok.examples.codex-auth",
+                "dev.cursorbyok.examples.grok-auth",
+                "dev.cursorbyok.examples.kimi-auth",
+            ]
+        );
     }
 }

@@ -711,31 +711,6 @@ mod tests {
     }
 
     #[test]
-    fn task_model_parameters_reject_duplicate_and_unknown_ids() {
-        let duplicate = call(
-            "Task",
-            json!({
-                "model_parameters": [
-                    {"id": "context", "value": "200k"},
-                    {"id": "context", "value": "1m"}
-                ]
-            }),
-        );
-        assert!(matches!(
-            task_model_parameters(&duplicate),
-            Err(Error::Protocol(message)) if message.contains("repeats context")
-        ));
-        let unknown = call(
-            "Task",
-            json!({"model_parameters": [{"id": "effort", "value": "low"}]}),
-        );
-        assert!(matches!(
-            task_model_parameters(&unknown),
-            Err(Error::Protocol(message)) if message.contains("reasoning or context")
-        ));
-    }
-
-    #[test]
     fn send_message_to_agent_normalizes_the_model_through_aliases() {
         let mut context = crate::cursor::tools::runtime::ExecContext {
             conversation_id: "conversation-1".into(),

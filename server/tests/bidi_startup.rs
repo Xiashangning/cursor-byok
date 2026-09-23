@@ -99,24 +99,33 @@ fn run_request(model_id: String) -> pb::agent_client_message::Message {
     })
 }
 
+#[derive(Clone, Copy)]
+enum StartupModel {
+    Direct,
+    ConfiguredAlias,
+    ModelDetailsAlias,
+}
+
 #[tokio::test]
 async fn heartbeat_overtaking_initial_upload_does_not_abort_subagent() {
-    exercise_startup(0).await;
+    exercise_startup(StartupModel::Direct, true).await;
 }
 
 #[tokio::test]
 async fn configured_hosted_alias_runs_byok_and_completes() {
-    exercise_startup(1).await;
+    exercise_startup(StartupModel::ConfiguredAlias, false).await;
 }
 
 #[tokio::test]
 async fn model_details_alias_runs_byok_and_completes() {
-    exercise_startup(2).await;
+    exercise_startup(StartupModel::ModelDetailsAlias, false).await;
 }
 
-async fn exercise_startup(use_alias: u8) {
+async fn exercise_startup(model: StartupModel, hold_upload: bool) {
     let (_directory, registry, provider, router, model_id) = setup().await;
-    let selected = if use_alias > 0 {
+    let selected = if matches!(model, StartupModel::Direct) {
+        model_id.clone()
+    } else {
         registry
             .store()
             .set_cursor_model_aliases(std::collections::BTreeMap::from([(
@@ -126,8 +135,6 @@ async fn exercise_startup(use_alias: u8) {
             .await
             .unwrap();
         "cursor-grok-4.6-high-fast".to_string()
-    } else {
-        model_id.clone()
     };
     provider.push(vec![
         ModelEvent::Start {
@@ -139,9 +146,8 @@ async fn exercise_startup(use_alias: u8) {
         ModelEvent::Done(FinishReason::Stop),
     ]);
 
-    // Hold the body mid-upload, without a large or timing-dependent fixture.
     let mut request = run_request(selected.clone());
-    if use_alias == 1 {
+    if matches!(model, StartupModel::ConfiguredAlias) {
         let pb::agent_client_message::Message::RunRequest(run) = &mut request else {
             unreachable!()
         };
@@ -156,7 +162,7 @@ async fn exercise_startup(use_alias: u8) {
             },
         ];
     }
-    if use_alias == 2 {
+    if matches!(model, StartupModel::ModelDetailsAlias) {
         let pb::agent_client_message::Message::RunRequest(run) = &mut request else {
             unreachable!()
         };
@@ -167,41 +173,56 @@ async fn exercise_startup(use_alias: u8) {
         });
     }
     let wire = append_body(0, request);
-    let (release, uploaded) = tokio::sync::oneshot::channel();
-    let (reading, started) = tokio::sync::oneshot::channel();
-    let body = Body::from_stream(async_stream::stream! {
-        yield Ok::<_, Infallible>(wire.slice(..5));
-        reading.send(()).unwrap();
-        uploaded.await.unwrap();
-        yield Ok::<_, Infallible>(wire.slice(5..));
-    });
-    let initial = tokio::spawn(router.clone().oneshot(post(APPEND, body)));
-    started.await.unwrap();
-    let heartbeat = append_body(
-        1,
-        pb::agent_client_message::Message::ClientHeartbeat(Default::default()),
-    );
-    let mut early = Box::pin(router.clone().oneshot(post(APPEND, heartbeat)));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut early)
-            .await
-            .is_err(),
-        "a later append must wait for the initial model selection"
-    );
-    assert!(
-        registry.local(REQUEST_ID).await.is_none(),
-        "must not invent a local route"
-    );
-    release.send(()).unwrap();
-    assert_eq!(initial.await.unwrap().unwrap().status(), StatusCode::OK);
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), early)
-            .await
-            .unwrap()
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
+    let seqno = if hold_upload {
+        // Hold the body mid-upload, without a large or timing-dependent fixture.
+        let (release, uploaded) = tokio::sync::oneshot::channel();
+        let (reading, started) = tokio::sync::oneshot::channel();
+        let body = Body::from_stream(async_stream::stream! {
+            yield Ok::<_, Infallible>(wire.slice(..5));
+            reading.send(()).unwrap();
+            uploaded.await.unwrap();
+            yield Ok::<_, Infallible>(wire.slice(5..));
+        });
+        let initial = tokio::spawn(router.clone().oneshot(post(APPEND, body)));
+        started.await.unwrap();
+        let heartbeat = append_body(
+            1,
+            pb::agent_client_message::Message::ClientHeartbeat(Default::default()),
+        );
+        let mut early = Box::pin(router.clone().oneshot(post(APPEND, heartbeat)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut early)
+                .await
+                .is_err(),
+            "a later append must wait for the initial model selection"
+        );
+        assert!(
+            registry.local(REQUEST_ID).await.is_none(),
+            "must not invent a local route"
+        );
+        release.send(()).unwrap();
+        assert_eq!(initial.await.unwrap().unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), early)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        2
+    } else {
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(post(APPEND, Body::from(wire)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        1
+    };
 
     let response = router
         .clone()
@@ -216,7 +237,7 @@ async fn exercise_startup(use_alias: u8) {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let mut output = response.into_body().into_data_stream();
-    let mut seqno = 2;
+    let mut seqno = seqno;
     let mut ended = false;
     let mut text = String::new();
     loop {
@@ -270,7 +291,7 @@ async fn exercise_startup(use_alias: u8) {
     assert_eq!(text, "child completed");
     assert_eq!(provider.requests().len(), 1);
     assert_eq!(provider.requests()[0].model.model_id, model_id);
-    if use_alias == 1 {
+    if matches!(model, StartupModel::ConfiguredAlias) {
         let requests = provider.requests();
         assert_eq!(requests[0].model.reasoning.effort.as_deref(), Some("high"));
         assert_eq!(requests[0].model.context_window_tokens, Some(1_000_000));

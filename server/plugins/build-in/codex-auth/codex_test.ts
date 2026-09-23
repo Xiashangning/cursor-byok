@@ -1,10 +1,6 @@
-import type {
-  JsonValue,
-  NetworkEventStream,
-  NetworkResponse,
-  PluginContext,
-} from "cursor-byok:plugin";
-import type { LlmRequest, ModelEvent } from "cursor-byok:provider";
+import type { JsonValue } from "cursor-byok:plugin";
+import type { ModelEvent } from "cursor-byok:provider";
+import { assert, assertEquals, context, jwt, request, sse } from "../test_helpers.ts";
 import type { ResourceSnapshot } from "cursor-byok:resource";
 import { codexDeviceOAuth } from "./oauth.ts";
 import { parseOfficialModels } from "./models.ts";
@@ -22,44 +18,6 @@ import {
   RESOURCE_TYPE,
 } from "./resources.ts";
 
-function assert(condition: unknown, message = "assertion failed"): asserts condition {
-  if (!condition) throw new Error(message);
-}
-
-function assertEquals(actual: unknown, expected: unknown): void {
-  const left = JSON.stringify(actual);
-  const right = JSON.stringify(expected);
-  if (left !== right) throw new Error(`expected ${right}, received ${left}`);
-}
-
-function jwt(payload: Record<string, unknown>): string {
-  const encoded = btoa(JSON.stringify(payload)).replace(/=/g, "").replace(/\+/g, "-").replace(
-    /\//g,
-    "_",
-  );
-  return `header.${encoded}.signature`;
-}
-
-type RequestInit = { body?: string; headers?: Record<string, string> };
-type FetchHandler = (url: string, init?: RequestInit) => NetworkResponse;
-type StreamHandler = (url: string, init?: RequestInit) => NetworkEventStream;
-
-function context(handlers: { fetch?: FetchHandler; stream?: StreamHandler }): PluginContext {
-  return {
-    network: {
-      fetch: (url, init) => {
-        if (!handlers.fetch) throw new Error("fetch was not expected");
-        return Promise.resolve(handlers.fetch(url, init));
-      },
-      stream: (url, init) => {
-        if (!handlers.stream) throw new Error("stream was not expected");
-        return Promise.resolve(handlers.stream(url, init));
-      },
-    },
-    signal: new AbortController().signal,
-  };
-}
-
 function snapshot(privateData: JsonValue): ResourceSnapshot {
   return {
     id: "resource-1",
@@ -67,22 +25,6 @@ function snapshot(privateData: JsonValue): ResourceSnapshot {
     key: "codex:acct-1",
     privateData,
     state: { status: "ready" },
-  };
-}
-
-async function* sse(lines: string[]): AsyncGenerator<string> {
-  for (const line of lines) yield line;
-}
-
-function request(): LlmRequest {
-  return {
-    instructions: "You are a coding assistant.",
-    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
-    tools: [],
-    reasoning: { enabled: true, effort: "medium" },
-    latency: "fast",
-    maxOutputTokens: 128_000,
-    cacheKey: "conversation-1",
   };
 }
 
@@ -103,7 +45,10 @@ Deno.test("account identity prioritizes ChatGPT account ID and drafts keep token
   });
   assertEquals(draft.key, "codex:acct-1");
   const view = presentAccount(snapshot(draft.privateData));
-  assert(!JSON.stringify(view).includes(token), "resource view exposed an access token");
+  assert(
+    !JSON.stringify(view).includes(token),
+    "resource view exposed an access token",
+  );
   assertEquals(view.displayName, "person@example.com");
 });
 
@@ -158,7 +103,10 @@ Deno.test("reset card action lists safe card metadata and optional expiry", asyn
     null,
     context({
       fetch: (url, init) => {
-        assertEquals(url, "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits");
+        assertEquals(
+          url,
+          "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+        );
         assertEquals(init?.headers?.["ChatGPT-Account-Id"], "acct-1");
         return {
           status: 200,
@@ -207,13 +155,19 @@ Deno.test("reset card action consumes a selected card and refreshes quota state"
       fetch: (url, init) => {
         requestNumber += 1;
         if (requestNumber === 1 || requestNumber === 4) {
-          assertEquals(url, "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits");
+          assertEquals(
+            url,
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+          );
           return {
             status: 200,
             headers: {},
             body: JSON.stringify(
               requestNumber === 1
-                ? { available_count: 1, credits: [{ id: "credit-1", status: "available" }] }
+                ? {
+                  available_count: 1,
+                  credits: [{ id: "credit-1", status: "available" }],
+                }
                 : { available_count: 0, credits: [] },
             ),
           };
@@ -227,23 +181,30 @@ Deno.test("reset card action consumes a selected card and refreshes quota state"
             credit_id: "credit-1",
             redeem_request_id: JSON.parse(init?.body ?? "{}").redeem_request_id,
           });
-          return { status: 200, headers: {}, body: JSON.stringify({ code: "reset" }) };
+          return {
+            status: 200,
+            headers: {},
+            body: JSON.stringify({ code: "reset" }),
+          };
         }
         assertEquals(url, "https://chatgpt.com/backend-api/wham/usage");
         return {
           status: 200,
           headers: {},
-          body: JSON.stringify({ rate_limit_reset_credits: { available_count: 0 } }),
+          body: JSON.stringify({
+            rate_limit_reset_credits: { available_count: 0 },
+          }),
         };
       },
     }),
   );
   assertEquals(requestNumber, 4);
   assertEquals(result.cards, []);
-  const quota = (result.patch?.privateData as Record<string, unknown>).quota as Record<
-    string,
-    unknown
-  >;
+  const quota = (result.patch?.privateData as Record<string, unknown>)
+    .quota as Record<
+      string,
+      unknown
+    >;
   assertEquals(quota.resetCreditsAvailable, 0);
   assertEquals(quota.weekly, null);
   assertEquals(quota.fiveHour, null);
@@ -297,7 +258,10 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
     fetch: (url, init) => {
       requestNumber += 1;
       if (requestNumber === 1) {
-        assertEquals(url, "https://auth.openai.com/api/accounts/deviceauth/usercode");
+        assertEquals(
+          url,
+          "https://auth.openai.com/api/accounts/deviceauth/usercode",
+        );
         return {
           status: 200,
           headers: {},
@@ -310,7 +274,10 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
         };
       }
       if (requestNumber === 2) {
-        assertEquals(url, "https://auth.openai.com/api/accounts/deviceauth/token");
+        assertEquals(
+          url,
+          "https://auth.openai.com/api/accounts/deviceauth/token",
+        );
         return {
           status: 200,
           headers: {},
@@ -326,7 +293,10 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
       return {
         status: 200,
         headers: {},
-        body: JSON.stringify({ access_token: accessToken, refresh_token: "refresh-secret" }),
+        body: JSON.stringify({
+          access_token: accessToken,
+          refresh_token: "refresh-secret",
+        }),
       };
     },
   });
@@ -336,13 +306,18 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
   assertEquals(begun.pollIntervalMs, 5000);
 
   const polled = await codexDeviceOAuth.poll(begun.session, flowContext);
-  assert(polled.status === "completed", `expected completed, received ${polled.status}`);
+  assert(
+    polled.status === "completed",
+    `expected completed, received ${polled.status}`,
+  );
   assertEquals(polled.resources[0].key, "codex:acct-oauth");
   assertEquals(requestNumber, 3);
 });
 
 Deno.test("invoke streams normalized events from the Codex Responses API", async () => {
-  const token = jwt({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" } });
+  const token = jwt({
+    "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" },
+  });
   const draft = await credentialDraft({
     accessToken: token,
     refreshToken: null,
@@ -359,7 +334,7 @@ Deno.test("invoke streams normalized events from the Codex Responses API", async
         privateData: { reasoningEfforts: ["medium"] },
       },
       resource: snapshot(draft.privateData),
-      request: request(),
+      request: request(128_000),
     },
     { emit: (event) => events.push(event) },
     context({
@@ -386,7 +361,10 @@ Deno.test("invoke streams normalized events from the Codex Responses API", async
   assertEquals(body.reasoning, { summary: "auto", effort: "medium" });
   assertEquals(body.instructions, "You are a coding assistant.");
   assertEquals(body.include, ["reasoning.encrypted_content"]);
-  assert(!("max_output_tokens" in body), "Codex endpoint rejects max_output_tokens");
+  assert(
+    !("max_output_tokens" in body),
+    "Codex endpoint rejects max_output_tokens",
+  );
   assertEquals(body.service_tier, "priority");
   assertEquals(body.prompt_cache_key, "conversation-1");
   // 缓存亲和头与 prompt_cache_key 同源。
@@ -414,7 +392,7 @@ Deno.test("invoke streams normalized events from the Codex Responses API", async
 });
 
 Deno.test("reasoning replay projects response items to valid input items", () => {
-  const replayRequest = request();
+  const replayRequest = request(128_000);
   replayRequest.messages = [{
     role: "assistant",
     text: "",
@@ -451,7 +429,9 @@ Deno.test("reasoning replay projects response items to valid input items", () =>
 });
 
 Deno.test("invoke streams incremental tool calls and replays reasoning items", async () => {
-  const token = jwt({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" } });
+  const token = jwt({
+    "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" },
+  });
   const draft = await credentialDraft({
     accessToken: token,
     refreshToken: null,
@@ -462,7 +442,7 @@ Deno.test("invoke streams incremental tool calls and replays reasoning items", a
     {
       model: { id: "gpt-test", displayName: "GPT Test" },
       resource: snapshot(draft.privateData),
-      request: request(),
+      request: request(128_000),
     },
     { emit: (event) => events.push(event) },
     context({
@@ -498,7 +478,9 @@ Deno.test("invoke streams incremental tool calls and replays reasoning items", a
 Deno.test("invoke maps quota failures to a cooling resource error", async () => {
   assert(!isQuotaError("429 rate_limit_reached"));
   assert(isQuotaError("429 usage_limit_reached: 5-hour limit"));
-  const token = jwt({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" } });
+  const token = jwt({
+    "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" },
+  });
   const draft = await credentialDraft({
     accessToken: token,
     refreshToken: null,
@@ -508,21 +490,30 @@ Deno.test("invoke maps quota failures to a cooling resource error", async () => 
     {
       model: { id: "gpt-test", displayName: "GPT Test" },
       resource: snapshot(draft.privateData),
-      request: request(),
+      request: request(128_000),
     },
     { emit: () => {} },
     context({
       stream: () => ({
         status: 429,
         headers: {},
-        lines: sse(['{"detail":"usage_limit_reached","reset_after_seconds":600}']),
+        lines: sse([
+          '{"detail":"usage_limit_reached","reset_after_seconds":600}',
+        ]),
       }),
     }),
   );
-  assert(result.status === "resource-error", `expected resource-error, received ${result.status}`);
-  assert(result.patch.state?.status === "cooling", "quota failure should cool the resource");
   assert(
-    result.patch.state.retryAtMs !== undefined && result.patch.state.retryAtMs > Date.now(),
+    result.status === "resource-error",
+    `expected resource-error, received ${result.status}`,
+  );
+  assert(
+    result.patch.state?.status === "cooling",
+    "quota failure should cool the resource",
+  );
+  assert(
+    result.patch.state.retryAtMs !== undefined &&
+      result.patch.state.retryAtMs > Date.now(),
     "cooling should carry the parsed reset time",
   );
 });

@@ -165,80 +165,63 @@ async fn custom_prompt_and_model_from_commit_settings_are_used() {
 }
 
 #[tokio::test]
-async fn empty_diffs_are_rejected_when_generating() {
-    let (_directory, store) = temp_store().await;
-    let created = store
-        .create_model(&model_input("qwen/qwen3-flash"))
-        .await
-        .unwrap();
-    store
-        .set_commit_settings(CommitSettings {
-            model_id: created.model_hash,
-            prompt: String::new(),
-            prompt_locale: CommitPromptLocale::ZhCn,
-        })
-        .await
-        .unwrap();
-    let provider = FakeProvider::default();
-    let router = commit_router(store, provider).await;
-
-    let response = post_commit_message(router, ai::WriteGitCommitMessageRequest::default()).await;
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = to_bytes(response.into_body(), 4096).await.unwrap();
-    let text = std::str::from_utf8(&body).unwrap();
-    assert!(text.contains("diffs are required"));
-}
-
-#[tokio::test]
-async fn tool_call_events_are_rejected() {
-    let (_directory, store) = temp_store().await;
-    let created = store
-        .create_model(&model_input("qwen/qwen3-flash"))
-        .await
-        .unwrap();
-    store
-        .set_commit_settings(CommitSettings {
-            model_id: created.model_hash,
-            prompt: String::new(),
-            prompt_locale: CommitPromptLocale::ZhCn,
-        })
-        .await
-        .unwrap();
-    let provider = FakeProvider::default();
-    provider.push(vec![ModelEvent::ToolCallStart {
-        index: 0,
-        call_id: "call-1".into(),
-        name: "shell".into(),
-    }]);
-    let router = commit_router(store, provider).await;
-
-    let response = post_commit_message(router, diff_request("diff --git a/x.rs")).await;
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = to_bytes(response.into_body(), 4096).await.unwrap();
-    let text = std::str::from_utf8(&body).unwrap();
-    assert!(text.contains("must not invoke tools"));
-}
-
-#[tokio::test]
-async fn unconfigured_model_is_rejected() {
-    let (_directory, store) = temp_store().await;
-    store
-        .set_commit_settings(CommitSettings {
-            model_id: "missing-hash".into(),
-            prompt: String::new(),
-            prompt_locale: CommitPromptLocale::ZhCn,
-        })
-        .await
-        .unwrap();
-    let provider = FakeProvider::default();
-    let router = commit_router(store, provider).await;
-
-    let response = post_commit_message(router, diff_request("diff --git a/x.rs")).await;
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = to_bytes(response.into_body(), 4096).await.unwrap();
-    let text = std::str::from_utf8(&body).unwrap();
-    assert!(text.contains("missing-hash"));
+async fn commit_message_errors_map_to_status_and_payload() {
+    for (case, configured_model, events, request, status, expected) in [
+        (
+            "empty diffs",
+            true,
+            vec![],
+            ai::WriteGitCommitMessageRequest::default(),
+            StatusCode::BAD_REQUEST,
+            "diffs are required",
+        ),
+        (
+            "tool call",
+            true,
+            vec![ModelEvent::ToolCallStart {
+                index: 0,
+                call_id: "call-1".into(),
+                name: "shell".into(),
+            }],
+            diff_request("diff --git a/x.rs"),
+            StatusCode::BAD_GATEWAY,
+            "must not invoke tools",
+        ),
+        (
+            "missing model",
+            false,
+            vec![],
+            diff_request("diff --git a/x.rs"),
+            StatusCode::BAD_GATEWAY,
+            "missing-hash",
+        ),
+    ] {
+        let (_directory, store) = temp_store().await;
+        let model_id = if configured_model {
+            store
+                .create_model(&model_input("qwen/qwen3-flash"))
+                .await
+                .unwrap()
+                .model_hash
+        } else {
+            "missing-hash".into()
+        };
+        store
+            .set_commit_settings(CommitSettings {
+                model_id,
+                prompt: String::new(),
+                prompt_locale: CommitPromptLocale::ZhCn,
+            })
+            .await
+            .unwrap();
+        let provider = FakeProvider::default();
+        if !events.is_empty() {
+            provider.push(events);
+        }
+        let response = post_commit_message(commit_router(store, provider).await, request).await;
+        assert_eq!(response.status(), status, "{case}");
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains(expected), "{case}: {text}");
+    }
 }

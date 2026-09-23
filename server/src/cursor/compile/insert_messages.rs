@@ -379,28 +379,33 @@ mod tests {
     }
 
     #[test]
-    fn suppressed_completions_are_filtered_from_a_partial_batch() {
+    fn suppressed_or_covered_completions_are_filtered_from_partial_batches() {
         let action = action(vec![
             completion("agent-1", "task-call-1"),
             completion("agent-2", "task-call-2"),
         ]);
-        // 「台账消费 ∨ 历史覆盖」在 prepare 处并入同一个抑制集合。
         let suppressed = HashSet::from([format_identity(
             pb::BackgroundTaskKind::Subagent,
             "agent-1",
             "task-call-1",
         )]);
+        let covered = covered_identities(
+            &action,
+            &[notification("agent-1", "task-call-1"), assistant("a")],
+        );
 
-        let projection = project(&action, pb::AgentMode::Agent as i32, &suppressed)
-            .unwrap()
-            .expect("agent-2 remains");
+        for (name, suppressed) in [("suppressed", suppressed), ("covered", covered)] {
+            let projection = project(&action, pb::AgentMode::Agent as i32, &suppressed)
+                .unwrap()
+                .expect("agent-2 remains");
 
-        assert_eq!(projection.completions.len(), 1);
-        let projected = &projection.completions[0];
-        assert!(!projected.context.contains("agent-1"));
-        assert!(projected.context.contains("agent-2"));
-        assert!(!projected.event_id.contains("agent-1"));
-        assert!(projected.event_id.contains("agent-2"));
+            assert_eq!(projection.completions.len(), 1, "case: {name}");
+            let projected = &projection.completions[0];
+            assert!(!projected.context.contains("agent-1"), "case: {name}");
+            assert!(projected.context.contains("agent-2"), "case: {name}");
+            assert!(!projected.event_id.contains("agent-1"), "case: {name}");
+            assert!(projected.event_id.contains("agent-2"), "case: {name}");
+        }
     }
 
     #[test]
@@ -434,25 +439,6 @@ mod tests {
             projection.is_none(),
             "a covered completion must not reproject"
         );
-    }
-
-    #[test]
-    fn covered_completions_are_filtered_from_a_partial_batch() {
-        let action = action(vec![
-            completion("agent-1", "task-call-1"),
-            completion("agent-2", "task-call-2"),
-        ]);
-        let covered = covered_identities(
-            &action,
-            &[notification("agent-1", "task-call-1"), assistant("a")],
-        );
-
-        let projection = project(&action, pb::AgentMode::Agent as i32, &covered)
-            .unwrap()
-            .expect("agent-2 remains");
-
-        assert_eq!(projection.completions.len(), 1);
-        assert!(projection.completions[0].event_id.contains("agent-2"));
     }
 
     #[test]

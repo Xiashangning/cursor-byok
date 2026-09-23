@@ -1,10 +1,6 @@
-import type {
-  JsonValue,
-  NetworkEventStream,
-  NetworkResponse,
-  PluginContext,
-} from "cursor-byok:plugin";
-import type { LlmRequest, ModelEvent } from "cursor-byok:provider";
+import type { JsonValue } from "cursor-byok:plugin";
+import type { ModelEvent } from "cursor-byok:provider";
+import { assert, assertEquals, context, jwt, request, sse } from "../test_helpers.ts";
 import type { ResourceSnapshot } from "cursor-byok:resource";
 import { kimiDeviceOAuth } from "./oauth.ts";
 import { FALLBACK_MODELS, kimiModels, parseKimiModels } from "./models.ts";
@@ -22,47 +18,6 @@ import {
   tokenExpiring,
 } from "./resources.ts";
 
-function assert(condition: unknown, message = "assertion failed"): asserts condition {
-  if (!condition) throw new Error(message);
-}
-
-function assertEquals(actual: unknown, expected: unknown): void {
-  const left = JSON.stringify(actual);
-  const right = JSON.stringify(expected);
-  if (left !== right) throw new Error(`expected ${right}, received ${left}`);
-}
-
-function jwt(payload: Record<string, unknown>): string {
-  const encoded = btoa(JSON.stringify(payload)).replace(/=/g, "").replace(/\+/g, "-").replace(
-    /\//g,
-    "_",
-  );
-  return `header.${encoded}.signature`;
-}
-
-type RequestInit = { body?: string; headers?: Record<string, string> };
-type FetchHandler = (
-  url: string,
-  init?: RequestInit,
-) => NetworkResponse | Promise<NetworkResponse>;
-type StreamHandler = (url: string, init?: RequestInit) => NetworkEventStream;
-
-function context(handlers: { fetch?: FetchHandler; stream?: StreamHandler }): PluginContext {
-  return {
-    network: {
-      fetch: (url, init) => {
-        if (!handlers.fetch) throw new Error("fetch was not expected");
-        return Promise.resolve(handlers.fetch(url, init));
-      },
-      stream: (url, init) => {
-        if (!handlers.stream) throw new Error("stream was not expected");
-        return Promise.resolve(handlers.stream(url, init));
-      },
-    },
-    signal: new AbortController().signal,
-  };
-}
-
 function snapshot(privateData: JsonValue, id = "resource-1"): ResourceSnapshot {
   return {
     id,
@@ -70,22 +25,6 @@ function snapshot(privateData: JsonValue, id = "resource-1"): ResourceSnapshot {
     key: "kimi:user-1",
     privateData,
     state: { status: "ready" },
-  };
-}
-
-async function* sse(lines: string[]): AsyncGenerator<string> {
-  for (const line of lines) yield line;
-}
-
-function request(): LlmRequest {
-  return {
-    instructions: "You are a coding assistant.",
-    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
-    tools: [],
-    reasoning: { enabled: true, effort: "medium" },
-    latency: "fast",
-    maxOutputTokens: 32_000,
-    cacheKey: "conversation-1",
   };
 }
 
@@ -102,7 +41,10 @@ Deno.test("account identity uses the JWT subject and drafts keep tokens private-
   });
   assertEquals(draft.key, "kimi:user-1");
   const view = presentAccount(snapshot(draft.privateData));
-  assert(!JSON.stringify(view).includes(token), "resource view exposed an access token");
+  assert(
+    !JSON.stringify(view).includes(token),
+    "resource view exposed an access token",
+  );
   assertEquals(view.displayName, "person@kimi.com");
 });
 
@@ -112,7 +54,11 @@ Deno.test("credential import accepts Kimi credential JSON files", () => {
       name: "accounts.json",
       content: JSON.stringify({
         accounts: [
-          { access_token: "token-1", refresh_token: "refresh-1", email: "a@kimi.com" },
+          {
+            access_token: "token-1",
+            refresh_token: "refresh-1",
+            email: "a@kimi.com",
+          },
           { access_token: "token-2", disabled: true },
         ],
       }),
@@ -130,15 +76,25 @@ Deno.test("credential import accepts Kimi credential JSON files", () => {
 Deno.test("model discovery parses the Kimi Code model list shape", () => {
   const models = parseKimiModels({
     data: [
-      { id: "kimi-for-coding", display_name: "K2.7 Coding", context_length: 262_144 },
+      {
+        id: "kimi-for-coding",
+        display_name: "K2.7 Coding",
+        context_length: 262_144,
+      },
       { id: "k2-thinking", supports_reasoning: true, supports_image_in: true },
       { id: "kimi-for-coding" },
     ],
   });
-  assertEquals(models.map((model) => model.id), ["kimi-for-coding", "k2-thinking"]);
+  assertEquals(models.map((model) => model.id), [
+    "kimi-for-coding",
+    "k2-thinking",
+  ]);
   assertEquals(models[0].displayName, "K2.7 Coding");
   assertEquals(models[0].capabilities, { images: false });
-  assertEquals(models[0].privateData, { thinking: false, contextWindowTokens: 262_144 });
+  assertEquals(models[0].privateData, {
+    thinking: false,
+    contextWindowTokens: 262_144,
+  });
   assertEquals(models[1].capabilities, { images: true });
   assertEquals(models[1].privateData, { thinking: true });
 });
@@ -176,18 +132,30 @@ Deno.test("refresh marks expired credentials invalid and healthy ones ready", as
   });
   const healthy = await refreshAccount(
     snapshot(draft.privateData),
-    context({ fetch: () => ({ status: 200, headers: {}, body: '{"data":[]}' }) }),
+    context({
+      fetch: () => ({ status: 200, headers: {}, body: '{"data":[]}' }),
+    }),
   );
   assertEquals(healthy.state, { status: "ready" });
 });
 
 Deno.test("usage parsing reads the weekly quota and the 300-minute window from string numbers", () => {
   const quota = parseKimiUsage({
-    usage: { limit: "2048", used: "1024", remaining: "1024", resetTime: "2026-09-07T00:00:00Z" },
+    usage: {
+      limit: "2048",
+      used: "1024",
+      remaining: "1024",
+      resetTime: "2026-09-07T00:00:00Z",
+    },
     limits: [
       {
         window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" },
-        detail: { limit: "200", used: "150", remaining: "50", resetTime: 1_800_000_000 },
+        detail: {
+          limit: "200",
+          used: "150",
+          remaining: "50",
+          resetTime: 1_800_000_000,
+        },
       },
       {
         window: { duration: 1440, timeUnit: "TIME_UNIT_MINUTE" },
@@ -208,13 +176,18 @@ Deno.test("usage parsing reads the weekly quota and the 300-minute window from s
 });
 
 Deno.test("usage parsing tolerates missing limits and malformed numbers", () => {
-  const weeklyOnly = parseKimiUsage({ usage: { limit: "2048", remaining: "2048" } });
+  const weeklyOnly = parseKimiUsage({
+    usage: { limit: "2048", remaining: "2048" },
+  });
   assertEquals(weeklyOnly.weekly?.remainingPercent, 100);
   assertEquals(weeklyOnly.weekly?.resetAtMs, null);
   assertEquals(weeklyOnly.fiveHour, null);
   const malformed = parseKimiUsage({
     usage: { limit: "lots", remaining: "some" },
-    limits: [{ window: { duration: 300 }, detail: { limit: "0", remaining: "0" } }],
+    limits: [{
+      window: { duration: 300 },
+      detail: { limit: "0", remaining: "0" },
+    }],
   });
   assertEquals(malformed.weekly?.remainingPercent, null);
   assertEquals(malformed.fiveHour?.remainingPercent, null);
@@ -277,7 +250,12 @@ Deno.test("refresh stores the parsed quota and cools the account when it is exha
           status: 200,
           headers: {},
           body: JSON.stringify({
-            usage: { limit: "2048", used: "2048", remaining: "0", resetTime: weeklyReset },
+            usage: {
+              limit: "2048",
+              used: "2048",
+              remaining: "0",
+              resetTime: weeklyReset,
+            },
             limits: [{
               window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" },
               detail: { limit: "200", used: "150", remaining: "50" },
@@ -292,9 +270,15 @@ Deno.test("refresh stores the parsed quota and cools the account when it is exha
     retryAtMs: weeklyReset,
     message: "Kimi quota is exhausted",
   });
-  const saved = (patch.privateData as Record<string, unknown>).quota as Record<string, unknown>;
+  const saved = (patch.privateData as Record<string, unknown>).quota as Record<
+    string,
+    unknown
+  >;
   assertEquals((saved.weekly as Record<string, unknown>).remainingPercent, 0);
-  assertEquals((saved.fiveHour as Record<string, unknown>).remainingPercent, 25);
+  assertEquals(
+    (saved.fiveHour as Record<string, unknown>).remainingPercent,
+    25,
+  );
 });
 
 Deno.test("refresh stays ready when the usage lookup fails", async () => {
@@ -339,10 +323,17 @@ Deno.test("invoke maps a 429 response to a cooling resource error", async () => 
       }),
     }),
   );
-  assert(result.status === "resource-error", `expected resource-error, received ${result.status}`);
-  assert(result.patch.state?.status === "cooling", "429 should cool the resource");
   assert(
-    result.patch.state.retryAtMs !== undefined && result.patch.state.retryAtMs > Date.now(),
+    result.status === "resource-error",
+    `expected resource-error, received ${result.status}`,
+  );
+  assert(
+    result.patch.state?.status === "cooling",
+    "429 should cool the resource",
+  );
+  assert(
+    result.patch.state.retryAtMs !== undefined &&
+      result.patch.state.retryAtMs > Date.now(),
     "cooling should carry a future retry time",
   );
 });
@@ -354,8 +345,14 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
     fetch: (url, init) => {
       requestNumber += 1;
       if (requestNumber === 1) {
-        assertEquals(url, "https://auth.kimi.com/api/oauth/device_authorization");
-        assert(init?.body?.includes("client_id="), "device code request must carry the client id");
+        assertEquals(
+          url,
+          "https://auth.kimi.com/api/oauth/device_authorization",
+        );
+        assert(
+          init?.body?.includes("client_id="),
+          "device code request must carry the client id",
+        );
         return {
           status: 200,
           headers: {},
@@ -381,21 +378,30 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
       return {
         status: 200,
         headers: {},
-        body: JSON.stringify({ access_token: accessToken, refresh_token: "refresh-secret" }),
+        body: JSON.stringify({
+          access_token: accessToken,
+          refresh_token: "refresh-secret",
+        }),
       };
     },
   });
 
   const begun = await kimiDeviceOAuth.begin(flowContext);
   assertEquals(begun.userCode, "ABCD-EFGH");
-  assertEquals(begun.verificationUrlComplete, "https://www.kimi.com/device?code=ABCD-EFGH");
+  assertEquals(
+    begun.verificationUrlComplete,
+    "https://www.kimi.com/device?code=ABCD-EFGH",
+  );
   assertEquals(begun.pollIntervalMs, 5000);
 
   const pending = await kimiDeviceOAuth.poll(begun.session, flowContext);
   assertEquals(pending.status, "pending");
 
   const polled = await kimiDeviceOAuth.poll(begun.session, flowContext);
-  assert(polled.status === "completed", `expected completed, received ${polled.status}`);
+  assert(
+    polled.status === "completed",
+    `expected completed, received ${polled.status}`,
+  );
   assertEquals(polled.resources[0].key, "kimi:user-oauth");
   assertEquals(requestNumber, 3);
 });
@@ -439,10 +445,20 @@ Deno.test("invoke streams normalized events from the Kimi Code Responses API", a
   const body = JSON.parse(requestBody) as Record<string, unknown>;
   assertEquals(body.model, "kimi-for-coding");
   assertEquals(body.stream, true);
-  assert(!("reasoning" in body), "Kimi Code endpoint receives no reasoning field");
-  assert(!("service_tier" in body), "Kimi Code endpoint receives no service_tier");
+  assert(
+    !("reasoning" in body),
+    "Kimi Code endpoint receives no reasoning field",
+  );
+  assert(
+    !("service_tier" in body),
+    "Kimi Code endpoint receives no service_tier",
+  );
   assertEquals(body.input, [
-    { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "hi" }],
+    },
   ]);
   assertEquals(body.include, ["reasoning.encrypted_content"]);
   assertEquals(body.max_output_tokens, 32_000);
@@ -551,8 +567,14 @@ Deno.test("invoke maps authorization failures to an invalid resource error", asy
       }),
     }),
   );
-  assert(result.status === "resource-error", `expected resource-error, received ${result.status}`);
-  assert(result.patch.state?.status === "invalid", "auth failure should invalidate the resource");
+  assert(
+    result.status === "resource-error",
+    `expected resource-error, received ${result.status}`,
+  );
+  assert(
+    result.patch.state?.status === "invalid",
+    "auth failure should invalidate the resource",
+  );
 });
 
 Deno.test("refreshAccessToken rotates tokens through the refresh grant", async () => {
@@ -571,17 +593,26 @@ Deno.test("refreshAccessToken rotates tokens through the refresh grant", async (
         return {
           status: 200,
           headers: {},
-          body: JSON.stringify({ access_token: "token-new", refresh_token: "refresh-new" }),
+          body: JSON.stringify({
+            access_token: "token-new",
+            refresh_token: "refresh-new",
+          }),
         };
       },
     }),
   );
-  assert(requestedBody.includes("grant_type=refresh_token"), "must use the refresh_token grant");
+  assert(
+    requestedBody.includes("grant_type=refresh_token"),
+    "must use the refresh_token grant",
+  );
   assert(
     requestedBody.includes("client_id=17e5f671-d194-4dfb-9706-5516cb48c098"),
     "must send the official Kimi Code client id",
   );
-  assert(requestedBody.includes("refresh_token=refresh-old"), "must send the stored refresh token");
+  assert(
+    requestedBody.includes("refresh_token=refresh-old"),
+    "must send the stored refresh token",
+  );
   assertEquals(refreshed?.accessToken, "token-new");
   assertEquals(refreshed?.refreshToken, "refresh-new");
 });
@@ -605,20 +636,40 @@ Deno.test("tokenExpiring tracks the JWT exp claim with a refresh skew", async ()
   const now = 1_800_000_000_000;
   const data = async (payload: Record<string, unknown>) =>
     accountData(snapshot(
-      (await credentialDraft({ accessToken: jwt(payload), refreshToken: null, displayName: null }))
+      (await credentialDraft({
+        accessToken: jwt(payload),
+        refreshToken: null,
+        displayName: null,
+      }))
         .privateData,
     ));
-  assert(!tokenExpiring(await data({ sub: "user-1" }), now), "missing exp never expires");
-  assert(tokenExpiring(await data({ sub: "user-1", exp: now / 1000 - 10 }), now));
   assert(
-    tokenExpiring(await data({ sub: "user-1", exp: (now + 30_000) / 1000 }), now),
+    !tokenExpiring(await data({ sub: "user-1" }), now),
+    "missing exp never expires",
+  );
+  assert(
+    tokenExpiring(await data({ sub: "user-1", exp: now / 1000 - 10 }), now),
+  );
+  assert(
+    tokenExpiring(
+      await data({ sub: "user-1", exp: (now + 30_000) / 1000 }),
+      now,
+    ),
     "within the 60s skew counts as expiring",
   );
-  assert(!tokenExpiring(await data({ sub: "user-1", exp: (now + 120_000) / 1000 }), now));
+  assert(
+    !tokenExpiring(
+      await data({ sub: "user-1", exp: (now + 120_000) / 1000 }),
+      now,
+    ),
+  );
 });
 
 Deno.test("invoke refreshes an expiring token before calling and persists it", async () => {
-  const expired = jwt({ sub: "user-1", exp: Math.floor(Date.now() / 1000) - 60 });
+  const expired = jwt({
+    sub: "user-1",
+    exp: Math.floor(Date.now() / 1000) - 60,
+  });
   const draft = await credentialDraft({
     accessToken: expired,
     refreshToken: "refresh-old",
@@ -638,7 +689,10 @@ Deno.test("invoke refreshes an expiring token before calling and persists it", a
         return {
           status: 200,
           headers: {},
-          body: JSON.stringify({ access_token: "token-new", refresh_token: "refresh-new" }),
+          body: JSON.stringify({
+            access_token: "token-new",
+            refresh_token: "refresh-new",
+          }),
         };
       },
       stream: (_url, init) => {
@@ -657,7 +711,10 @@ Deno.test("invoke refreshes an expiring token before calling and persists it", a
     }),
   );
   assertEquals(streamCalls, 1);
-  assert(result.status === "completed", `expected completed, received ${result.status}`);
+  assert(
+    result.status === "completed",
+    `expected completed, received ${result.status}`,
+  );
   const data = result.patch?.privateData as Record<string, unknown>;
   assertEquals(data.accessToken, "token-new");
   assertEquals(data.refreshToken, "refresh-new");
@@ -682,13 +739,20 @@ Deno.test("invoke refreshes once and retries after an authorization failure", as
       fetch: () => ({
         status: 200,
         headers: {},
-        body: JSON.stringify({ access_token: "token-new", refresh_token: "refresh-new" }),
+        body: JSON.stringify({
+          access_token: "token-new",
+          refresh_token: "refresh-new",
+        }),
       }),
       stream: (_url, init) => {
         streamCalls++;
         if (streamCalls === 1) {
           assertEquals(init?.headers?.authorization, `Bearer ${token}`);
-          return { status: 401, headers: {}, lines: sse(['{"error":"expired"}']) };
+          return {
+            status: 401,
+            headers: {},
+            lines: sse(['{"error":"expired"}']),
+          };
         }
         assertEquals(init?.headers?.authorization, "Bearer token-new");
         return {
@@ -704,7 +768,10 @@ Deno.test("invoke refreshes once and retries after an authorization failure", as
     }),
   );
   assertEquals(streamCalls, 2);
-  assert(result.status === "completed", `expected completed, received ${result.status}`);
+  assert(
+    result.status === "completed",
+    `expected completed, received ${result.status}`,
+  );
   const data = result.patch?.privateData as Record<string, unknown>;
   assertEquals(data.accessToken, "token-new");
 });
@@ -724,10 +791,17 @@ Deno.test("invoke marks the account invalid when the refresh grant is rejected",
     { emit: () => {} },
     context({
       fetch: () => ({ status: 401, headers: {}, body: "{}" }),
-      stream: () => ({ status: 401, headers: {}, lines: sse(['{"error":"expired"}']) }),
+      stream: () => ({
+        status: 401,
+        headers: {},
+        lines: sse(['{"error":"expired"}']),
+      }),
     }),
   );
-  assert(result.status === "resource-error", `expected resource-error, received ${result.status}`);
+  assert(
+    result.status === "resource-error",
+    `expected resource-error, received ${result.status}`,
+  );
   assertEquals(result.patch.state, {
     status: "invalid",
     message: "Kimi authorization expired; sign in again",
@@ -735,7 +809,10 @@ Deno.test("invoke marks the account invalid when the refresh grant is rejected",
 });
 
 Deno.test("concurrent invokes of the same account share a single refresh", async () => {
-  const expired = jwt({ sub: "user-1", exp: Math.floor(Date.now() / 1000) - 60 });
+  const expired = jwt({
+    sub: "user-1",
+    exp: Math.floor(Date.now() / 1000) - 60,
+  });
   const draft = await credentialDraft({
     accessToken: expired,
     refreshToken: "refresh-shared",
@@ -752,7 +829,10 @@ Deno.test("concurrent invokes of the same account share a single refresh", async
       return gate.then(() => ({
         status: 200,
         headers: {},
-        body: JSON.stringify({ access_token: "token-new", refresh_token: "refresh-new" }),
+        body: JSON.stringify({
+          access_token: "token-new",
+          refresh_token: "refresh-new",
+        }),
       }));
     },
     stream: () => ({
@@ -770,8 +850,16 @@ Deno.test("concurrent invokes of the same account share a single refresh", async
     resource: snapshot(draft.privateData, "resource-shared"),
     request: request(),
   });
-  const first = kimiProvider.invoke(invokeInput(), { emit: () => {} }, sharedContext);
-  const second = kimiProvider.invoke(invokeInput(), { emit: () => {} }, sharedContext);
+  const first = kimiProvider.invoke(
+    invokeInput(),
+    { emit: () => {} },
+    sharedContext,
+  );
+  const second = kimiProvider.invoke(
+    invokeInput(),
+    { emit: () => {} },
+    sharedContext,
+  );
   await new Promise((resolve) => setTimeout(resolve, 10));
   release();
   const results = await Promise.all([first, second]);
@@ -785,7 +873,10 @@ Deno.test("concurrent invokes of the same account share a single refresh", async
 });
 
 Deno.test("refresh recovers an expired account through the refresh grant", async () => {
-  const expired = jwt({ sub: "user-1", exp: Math.floor(Date.now() / 1000) - 60 });
+  const expired = jwt({
+    sub: "user-1",
+    exp: Math.floor(Date.now() / 1000) - 60,
+  });
   const draft = await credentialDraft({
     accessToken: expired,
     refreshToken: "refresh-old",
@@ -810,15 +901,18 @@ Deno.test("refresh recovers an expired account through the refresh grant", async
         return {
           status: 200,
           headers: {},
-          body: JSON.stringify({ access_token: "token-new", refresh_token: "refresh-new" }),
+          body: JSON.stringify({
+            access_token: "token-new",
+            refresh_token: "refresh-new",
+          }),
         };
       },
     }),
   );
   assertEquals(
-    requests.filter((request) => request.url.endsWith("/models")).map((request) =>
-      request.authorization
-    ),
+    requests.filter((request) => request.url.endsWith("/models")).map((
+      request,
+    ) => request.authorization),
     [`Bearer ${expired}`, "Bearer token-new"],
   );
   const data = patch.privateData as Record<string, unknown>;

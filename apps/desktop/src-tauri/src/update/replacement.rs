@@ -268,29 +268,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_pending_file_restores_original_after_backup() {
-        let directory = tempfile::tempdir().unwrap();
-        let target = directory.path().join("target.exe");
-        let pending = pending_path(&target);
-        let backup = backup_path(&target);
-        fs::write(&target, b"old").unwrap();
-
-        assert!(activate_pending(&pending, &target, &backup).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"old");
-        assert!(!backup.exists());
-    }
-
-    #[test]
-    fn missing_source_preserves_original_file() {
+    fn missing_update_files_preserve_original_and_rollback_after_backup() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("missing.exe");
         let target = directory.path().join("target.exe");
+        let pending = pending_path(&target);
         let backup = backup_path(&target);
         fs::write(&target, b"old").unwrap();
 
         assert!(install_staged(&source, &target, &backup).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old");
         assert!(!backup.exists());
-        assert!(!pending_path(&target).exists());
+        assert!(!pending.exists());
+
+        assert!(activate_pending(&pending, &target, &backup).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert!(!backup.exists());
     }
 }

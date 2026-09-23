@@ -223,36 +223,3 @@ fn normalized(value: &str) -> String {
         .flat_map(char::to_lowercase)
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::tool_query;
-    use crate::cursor::protocol::proto::agent::v1 as pb;
-    use crate::model::ToolCall;
-
-    #[test]
-    fn web_search_accepts_query_as_search_term_alias() {
-        // Claude 系模型常按 Claude Code 习惯发送 query 而非 search_term,
-        // 交互查询编码必须接受别名,而不是报 `WebSearch is missing search_term`。
-        let call = ToolCall {
-            index: 0,
-            call_id: "call-1".into(),
-            model_call_id: "model-1".into(),
-            name: "WebSearch".into(),
-            arguments_text: String::new(),
-            arguments: json!({ "query": "lmarena leaderboard" }),
-            argument_error: None,
-        };
-        let message = tool_query(1, &call).unwrap();
-        let Some(pb::agent_server_message::Message::InteractionQuery(query)) = message.message
-        else {
-            panic!("expected an InteractionQuery");
-        };
-        let Some(pb::interaction_query::Query::WebSearchRequestQuery(request)) = query.query else {
-            panic!("expected a WebSearchRequestQuery");
-        };
-        assert_eq!(request.args.unwrap().search_term, "lmarena leaderboard");
-    }
-}

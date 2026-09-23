@@ -568,44 +568,56 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_search_returns_locations_and_bounded_snippets() {
-        let (source, _cache, engine) = fixture();
-        let response = engine
-            .search(SearchRequest {
-                query: "authenticate request".into(),
-                repo: source.path().into(),
-                top_k: 1,
-                max_snippet_lines: Some(1),
-                content: vec![ContentType::Code],
-            })
-            .unwrap();
-        assert_eq!(response.results[0].file_path, "src/auth.rs");
-        assert_eq!(
-            response.results[0].content.as_deref(),
-            Some("pub fn authenticate_request() {")
-        );
+    fn hybrid_search_returns_locations_and_bounded_snippets_before_and_after_reload() {
+        let (source, cache, engine) = fixture();
+        let request = SearchRequest {
+            query: "authenticate request".into(),
+            repo: source.path().into(),
+            top_k: 1,
+            max_snippet_lines: Some(1),
+            content: vec![ContentType::Code],
+        };
+        let check = |engine: &SearchEngine| {
+            let response = engine.search(request.clone()).unwrap();
+            assert_eq!(response.results[0].file_path, "src/auth.rs");
+            assert_eq!(
+                response.results[0].content.as_deref(),
+                Some("pub fn authenticate_request() {")
+            );
+        };
+        check(&engine);
+        engine.prepare(source.path(), &[ContentType::Code]).unwrap();
+        drop(engine);
+        let reloaded =
+            SearchEngine::with_embedder(SembleConfig::new(cache.path()), Arc::new(KeywordEmbedder));
+        check(&reloaded);
     }
 
     #[test]
-    fn bm25_recovers_lexical_matches_when_semantic_scores_are_tied() {
-        let (source, _cache, engine) = fixture();
+    fn bm25_recovers_lexical_matches_before_and_after_reload() {
+        let (source, cache, engine) = fixture();
         fs::write(
             source.path().join("src/tracing.rs"),
             "pub fn write_record() {\n    let description = \"quasar chronicle telemetry durable\";\n}\n",
         )
         .unwrap();
-
-        let response = engine
-            .search(SearchRequest {
-                query: "quasar chronicle telemetry durable".into(),
-                repo: source.path().into(),
-                top_k: 1,
-                max_snippet_lines: Some(0),
-                content: vec![ContentType::Code],
-            })
-            .unwrap();
-
-        assert_eq!(response.results[0].file_path, "src/tracing.rs");
+        let request = SearchRequest {
+            query: "quasar chronicle telemetry durable".into(),
+            repo: source.path().into(),
+            top_k: 1,
+            max_snippet_lines: Some(0),
+            content: vec![ContentType::Code],
+        };
+        let check = |engine: &SearchEngine| {
+            let response = engine.search(request.clone()).unwrap();
+            assert_eq!(response.results[0].file_path, "src/tracing.rs");
+        };
+        check(&engine);
+        engine.prepare(source.path(), &[ContentType::Code]).unwrap();
+        drop(engine);
+        let reloaded =
+            SearchEngine::with_embedder(SembleConfig::new(cache.path()), Arc::new(KeywordEmbedder));
+        check(&reloaded);
     }
 
     #[test]
@@ -651,54 +663,6 @@ mod tests {
         assert_eq!(stats.chunk_count, 2);
         assert!(stats.source_bytes > 0);
         assert_eq!(stats.dimensions, 3);
-    }
-
-    #[test]
-    fn disk_loaded_indexes_read_result_snippets_from_source() {
-        let (source, cache, engine) = fixture();
-        engine.prepare(source.path(), &[ContentType::Code]).unwrap();
-        drop(engine);
-        let reloaded =
-            SearchEngine::with_embedder(SembleConfig::new(cache.path()), Arc::new(KeywordEmbedder));
-        let response = reloaded
-            .search(SearchRequest {
-                query: "authenticate request".into(),
-                repo: source.path().into(),
-                top_k: 1,
-                max_snippet_lines: Some(1),
-                content: vec![ContentType::Code],
-            })
-            .unwrap();
-        assert_eq!(
-            response.results[0].content.as_deref(),
-            Some("pub fn authenticate_request() {")
-        );
-    }
-
-    #[test]
-    fn disk_loaded_indexes_retain_bm25_search() {
-        let (source, cache, engine) = fixture();
-        fs::write(
-            source.path().join("src/tracing.rs"),
-            "pub fn write_record() {\n    let description = \"quasar chronicle telemetry durable\";\n}\n",
-        )
-        .unwrap();
-        engine.prepare(source.path(), &[ContentType::Code]).unwrap();
-        drop(engine);
-        let reloaded =
-            SearchEngine::with_embedder(SembleConfig::new(cache.path()), Arc::new(KeywordEmbedder));
-
-        let response = reloaded
-            .search(SearchRequest {
-                query: "quasar chronicle telemetry durable".into(),
-                repo: source.path().into(),
-                top_k: 1,
-                max_snippet_lines: Some(0),
-                content: vec![ContentType::Code],
-            })
-            .unwrap();
-
-        assert_eq!(response.results[0].file_path, "src/tracing.rs");
     }
 
     #[test]

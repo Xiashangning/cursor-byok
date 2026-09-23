@@ -838,26 +838,45 @@ mod tests {
     }
 
     #[test]
-    fn grep_content_gate_survives_a_nearly_exhausted_byte_budget() {
-        // 16 matches leave 16 bytes of the 32 KiB content budget, which is less
-        // than the truncation notice for the 17th match.
-        let mut matches = vec!["a".repeat(2047); 16];
-        matches.push("b".repeat(100));
-        let mut tool = grep_tool(matches);
-        let mut content = String::new();
-        tool_completion("Grep", &mut tool, &mut content);
-    }
-
-    #[test]
-    fn grep_content_gate_terminates_on_an_oscillating_remaining_budget() {
-        // The same path, tuned so the remaining budget lands on a `limit` where
-        // the truncation notice length oscillates.
-        let mut matches = vec!["a".repeat(2043); 15];
-        matches.push("a".repeat(2045));
-        matches.push("b".repeat(200));
-        let mut tool = grep_tool(matches);
-        let mut content = String::new();
-        tool_completion("Grep", &mut tool, &mut content);
+    fn grep_content_gate_truncates_nearly_exhausted_and_oscillating_budgets() {
+        for matches in [
+            {
+                // 16 matches leave too little room for the truncation notice.
+                let mut matches = vec!["a".repeat(2047); 16];
+                matches.push("b".repeat(100));
+                matches
+            },
+            {
+                // The remaining budget oscillates with the notice length.
+                let mut matches = vec!["a".repeat(2043); 15];
+                matches.push("a".repeat(2045));
+                matches.push("b".repeat(200));
+                matches
+            },
+        ] {
+            let mut tool = grep_tool(matches);
+            let mut content = String::new();
+            tool_completion("Grep", &mut tool, &mut content);
+            let pb::tool_call::Tool::GrepToolCall(tool) = tool else {
+                panic!("expected Grep tool");
+            };
+            let Some(pb::grep_result::Result::Success(success)) = tool.result.unwrap().result
+            else {
+                panic!("expected Grep success");
+            };
+            let Some(pb::grep_union_result::Result::Content(result)) =
+                success.active_editor_result.unwrap().result
+            else {
+                panic!("expected Grep content");
+            };
+            assert!(result.client_truncated);
+            assert!(grep_content_bytes(&result.matches) <= GREP_CONTENT_LIMIT);
+            assert!(result
+                .matches
+                .iter()
+                .flat_map(|file| &file.matches)
+                .any(is_grep_notice));
+        }
     }
 
     #[test]
