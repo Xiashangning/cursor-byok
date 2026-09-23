@@ -22,7 +22,7 @@ type ContributionCalendarChartProps = {
 type CalendarCell = ActivityPoint & {
   column: number;
   row: number;
-  level: number;
+  intensity: number;
 };
 
 type CellExtra = CalendarCell & {
@@ -45,13 +45,28 @@ type CalendarLayout = {
   ticks: Array<{ key: string; text: string; column: number }>;
 };
 
-const levelColors = [
-  "rgba(139, 148, 158, 0.20)",
-  "#9be9a8",
-  "#40c463",
-  "#30a14e",
-  "#216e39",
-];
+const emptyColor = "rgba(139, 148, 158, 0.20)";
+// Former step palette, now evenly spaced interpolation anchors on the 0..1 intensity scale.
+const heatStops = ["#9be9a8", "#40c463", "#30a14e", "#216e39"];
+
+function parseHex(hex: string) {
+  return [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16));
+}
+
+function heatColor(intensity: number) {
+  const position = Math.min(intensity, 1) * heatStops.length - 1;
+  const index = Math.max(0, Math.min(heatStops.length - 1, Math.floor(position)));
+  const ratio = Math.max(0, position - index);
+  const from = parseHex(heatStops[index]);
+  const to = parseHex(heatStops[index + 1] ?? heatStops[index]);
+  const mix = (channel: number) => Math.round(from[channel] + (to[channel] - from[channel]) * ratio);
+  return `rgb(${mix(0)}, ${mix(1)}, ${mix(2)})`;
+}
+
+function cellColor(intensity: number) {
+  return intensity === 0 ? emptyColor : heatColor(intensity);
+}
+
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
 const HOUR_COLUMNS_PER_DAY = 3;
 const HOURS_PER_COLUMN = 24 / HOUR_COLUMNS_PER_DAY;
@@ -87,8 +102,8 @@ function buildCalendarLayout(data: ActivityPoint[], locale: Locale): CalendarLay
   const cells: CalendarCell[] = data.map((day) => {
     const date = parseDate(day.key);
     const daysFromStart = Math.round((date.getTime() - calendarStart.getTime()) / DAY_IN_MS);
-    const level = day.tokens === 0 ? 0 : Math.max(1, Math.ceil((day.tokens / maximum) * 4));
-    return { ...day, column: Math.floor(daysFromStart / 7), row: mondayIndex(date), level };
+    const intensity = day.tokens / maximum;
+    return { ...day, column: Math.floor(daysFromStart / 7), row: mondayIndex(date), intensity };
   });
   const columnCount = cells.at(-1)!.column + 1;
   const ticks = cells.reduce<Array<{ key: string; text: string; column: number }>>((acc, cell) => {
@@ -106,12 +121,12 @@ function buildHourlyLayout(data: ActivityPoint[], locale: Locale): CalendarLayou
   const dayFormatter = new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", timeZone: "UTC" });
   const maximum = Math.max(1, ...data.map(({ tokens }) => tokens));
   const cells: CalendarCell[] = data.map((point, index) => {
-    const level = point.tokens === 0 ? 0 : Math.max(1, Math.ceil((point.tokens / maximum) * 4));
+    const intensity = point.tokens / maximum;
     return {
       ...point,
       column: Math.floor(index / 24) * HOUR_COLUMNS_PER_DAY + Math.floor(index % 24 / HOURS_PER_COLUMN),
       row: index % HOURS_PER_COLUMN,
-      level,
+      intensity,
     };
   });
   const columnCount = Math.max(1, Math.ceil(data.length / 24) * HOUR_COLUMNS_PER_DAY);
@@ -244,7 +259,7 @@ export function ContributionCalendarChart({ unit, onUnitChange, data }: Contribu
           current.extra = extra;
           current.stopAnimation();
           current.animateTo(
-            { shape, style: { fill: levelColors[cell.level] } },
+            { shape, style: { fill: cellColor(cell.intensity) } },
             { duration: resizeTransitionMs, easing: "cubicOut" },
           );
           continue;
@@ -253,7 +268,7 @@ export function ContributionCalendarChart({ unit, onUnitChange, data }: Contribu
         const rect = new Rect({
           shape,
           style: {
-            fill: levelColors[cell.level],
+            fill: cellColor(cell.intensity),
             stroke: "rgba(139, 148, 158, 0.10)",
             lineWidth: 1,
           },
