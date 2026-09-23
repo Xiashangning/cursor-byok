@@ -86,7 +86,7 @@ export const appStore = {
       const [models, calls, overview, settings, ports, cursorHarness, pluginRuntime, plugins] = await Promise.all([
         api.models(),
         api.calls(),
-        api.overview(),
+        api.overview({ timezoneOffsetMinutes: new Date().getTimezoneOffset() }),
         api.observability(),
         api.ports(),
         api.cursorHarness(),

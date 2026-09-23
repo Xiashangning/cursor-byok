@@ -27,7 +27,9 @@ impl Store {
         end_ms: Option<i64>,
         model_hashes: Option<&str>,
         bucket_ms: Option<i64>,
+        timezone_offset_minutes: Option<i32>,
     ) -> Result<Overview> {
+        let timezone_offset_ms = i64::from(timezone_offset_minutes.unwrap_or(0)) * MINUTE_MS;
         let call_row = sqlx::query(
             "SELECT
                 COUNT(*) AS llm_calls,
@@ -86,10 +88,13 @@ impl Store {
         };
 
         let (token_usage_granularity, bucket_ms, series_start_ms, bucket_count) =
-            token_usage_buckets(start_ms, end_ms, bucket_ms);
+            token_usage_buckets(start_ms, end_ms, bucket_ms, timezone_offset_ms);
+        let bucket_expression = format!(
+            "((created_at_ms - {timezone_offset_ms}) / {bucket_ms}) * {bucket_ms} + {timezone_offset_ms}"
+        );
         let rows = sqlx::query(&format!(
             "SELECT
-                (created_at_ms / {bucket_ms}) * {bucket_ms} AS bucket_start_ms,
+                {bucket_expression} AS bucket_start_ms,
                 COALESCE(SUM({fresh_input}), 0) AS input_tokens,
                 COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0) AS cache_read_tokens,
                 COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0) AS cache_write_tokens,
@@ -149,6 +154,7 @@ fn token_usage_buckets(
     start_ms: Option<i64>,
     end_ms: Option<i64>,
     requested_bucket_ms: Option<i64>,
+    timezone_offset_ms: i64,
 ) -> (TokenUsageGranularity, i64, i64, i64) {
     if let (Some(start_ms), Some(end_ms)) = (start_ms, end_ms) {
         let duration_ms = end_ms.saturating_sub(start_ms).max(1);
@@ -172,8 +178,11 @@ fn token_usage_buckets(
         } else {
             MAX_RANGE_BUCKETS
         };
-        let last_bucket_ms = end_ms.saturating_sub(1).div_euclid(bucket_ms) * bucket_ms;
-        let first_bucket_ms = start_ms.div_euclid(bucket_ms) * bucket_ms;
+        let last_bucket_ms = (end_ms.saturating_sub(1) - timezone_offset_ms).div_euclid(bucket_ms)
+            * bucket_ms
+            + timezone_offset_ms;
+        let first_bucket_ms =
+            (start_ms - timezone_offset_ms).div_euclid(bucket_ms) * bucket_ms + timezone_offset_ms;
         let bucket_count =
             ((last_bucket_ms - first_bucket_ms).div_euclid(bucket_ms) + 1).clamp(1, max_buckets);
         let series_start_ms =
@@ -181,11 +190,9 @@ fn token_usage_buckets(
         return (granularity, bucket_ms, series_start_ms, bucket_count);
     }
 
-    let today_start_ms = Utc::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .map(|value| value.and_utc().timestamp_millis())
-        .unwrap_or(0);
+    let now_ms = Utc::now().timestamp_millis();
+    let today_start_ms =
+        (now_ms - timezone_offset_ms).div_euclid(DAY_MS) * DAY_MS + timezone_offset_ms;
     let series_start_ms = today_start_ms.saturating_sub(
         i64::try_from(OVERVIEW_DAYS - 1)
             .unwrap_or(0)
@@ -224,76 +231,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_hour_range_uses_sixty_minute_buckets() {
+    fn token_usage_buckets_cover_ranges_boundaries_and_caps() {
         let start_ms = 1_800_000_000_000;
-        let (granularity, bucket_ms, series_start_ms, bucket_count) =
-            token_usage_buckets(Some(start_ms), Some(start_ms + HOUR_MS), None);
+        let cases = [
+            (
+                "one hour",
+                Some(start_ms),
+                Some(start_ms + HOUR_MS),
+                None,
+                (TokenUsageGranularity::Minute, MINUTE_MS, start_ms, 60),
+            ),
+            (
+                "minute boundary",
+                Some(start_ms + MINUTE_MS - 1_000),
+                Some(start_ms + MINUTE_MS + 1_000),
+                None,
+                (TokenUsageGranularity::Minute, MINUTE_MS, start_ms, 2),
+            ),
+            (
+                "explicit fifteen-minute day",
+                Some(start_ms),
+                Some(start_ms + DAY_MS),
+                Some(15 * MINUTE_MS),
+                (TokenUsageGranularity::Minute, 15 * MINUTE_MS, start_ms, 96),
+            ),
+            (
+                "explicit thirty-minute day",
+                Some(start_ms),
+                Some(start_ms + DAY_MS),
+                Some(30 * MINUTE_MS),
+                (TokenUsageGranularity::Minute, 30 * MINUTE_MS, start_ms, 48),
+            ),
+            (
+                "explicit hourly month",
+                Some(start_ms),
+                Some(start_ms + 30 * DAY_MS),
+                Some(HOUR_MS),
+                (TokenUsageGranularity::Hour, HOUR_MS, start_ms, 720),
+            ),
+            (
+                "explicit minute cap",
+                Some(start_ms),
+                Some(start_ms + 7 * DAY_MS),
+                Some(MINUTE_MS),
+                (
+                    TokenUsageGranularity::Minute,
+                    MINUTE_MS,
+                    start_ms + 7 * DAY_MS - MAX_EXPLICIT_BUCKETS * MINUTE_MS,
+                    MAX_EXPLICIT_BUCKETS,
+                ),
+            ),
+        ];
 
-        assert_eq!(granularity, TokenUsageGranularity::Minute);
-        assert_eq!(bucket_ms, MINUTE_MS);
-        assert_eq!(series_start_ms, start_ms);
-        assert_eq!(bucket_count, 60);
+        for (name, start, end, explicit_bucket_ms, expected) in cases {
+            let actual = token_usage_buckets(start, end, explicit_bucket_ms, 0);
+            assert_eq!(actual, expected, "case: {name}");
+        }
     }
 
     #[test]
-    fn short_range_crossing_a_minute_boundary_uses_two_buckets() {
-        let minute_start_ms = 1_800_000_000_000;
-        let (granularity, bucket_ms, series_start_ms, bucket_count) = token_usage_buckets(
-            Some(minute_start_ms + MINUTE_MS - 1_000),
-            Some(minute_start_ms + MINUTE_MS + 1_000),
-            None,
-        );
-
-        assert_eq!(granularity, TokenUsageGranularity::Minute);
-        assert_eq!(bucket_ms, MINUTE_MS);
-        assert_eq!(series_start_ms, minute_start_ms);
-        assert_eq!(bucket_count, 2);
-    }
-
-    #[test]
-    fn explicit_buckets_cover_calendar_day_and_month_windows() {
-        let day_start_ms = 1_800_000_000_000;
-
-        let (granularity, bucket_ms, series_start_ms, bucket_count) = token_usage_buckets(
-            Some(day_start_ms),
-            Some(day_start_ms + DAY_MS),
-            Some(15 * MINUTE_MS),
-        );
-        assert_eq!(granularity, TokenUsageGranularity::Minute);
-        assert_eq!(bucket_ms, 15 * MINUTE_MS);
-        assert_eq!(series_start_ms, day_start_ms);
-        assert_eq!(bucket_count, 96);
-
+    fn token_usage_buckets_align_to_requested_timezone() {
+        let start_ms = 1_800_000_000_000;
+        let timezone_offset_ms = -8 * HOUR_MS;
         let (_, bucket_ms, series_start_ms, bucket_count) = token_usage_buckets(
-            Some(day_start_ms),
-            Some(day_start_ms + DAY_MS),
-            Some(30 * MINUTE_MS),
+            Some(start_ms),
+            Some(start_ms + DAY_MS),
+            Some(DAY_MS),
+            timezone_offset_ms,
         );
-        assert_eq!(bucket_ms, 30 * MINUTE_MS);
-        assert_eq!(series_start_ms, day_start_ms);
-        assert_eq!(bucket_count, 48);
 
-        let (granularity, bucket_ms, _, bucket_count) = token_usage_buckets(
-            Some(day_start_ms),
-            Some(day_start_ms + 30 * DAY_MS),
-            Some(HOUR_MS),
-        );
-        assert_eq!(granularity, TokenUsageGranularity::Hour);
-        assert_eq!(bucket_ms, HOUR_MS);
-        assert_eq!(bucket_count, 720);
-    }
-
-    #[test]
-    fn minute_bucket_over_a_week_clamps_to_explicit_bucket_cap() {
-        let start_ms = 1_800_000_000_000;
-        let (_, bucket_ms, series_start_ms, bucket_count) =
-            token_usage_buckets(Some(start_ms), Some(start_ms + 7 * DAY_MS), Some(MINUTE_MS));
-
-        assert_eq!(bucket_ms, MINUTE_MS);
-        assert_eq!(bucket_count, MAX_EXPLICIT_BUCKETS);
+        assert_eq!(bucket_ms, DAY_MS);
+        assert_eq!(bucket_count, 2);
         assert_eq!(
             series_start_ms,
-            start_ms + 7 * DAY_MS - MAX_EXPLICIT_BUCKETS * MINUTE_MS
+            (start_ms - timezone_offset_ms).div_euclid(DAY_MS) * DAY_MS + timezone_offset_ms
         );
     }
 
@@ -322,7 +333,7 @@ mod tests {
         )
         .await;
 
-        let overview = store.overview(None, None, None, None).await.unwrap();
+        let overview = store.overview(None, None, None, None, None).await.unwrap();
         assert_eq!(overview.metrics.llm_calls, 3);
         assert_eq!(overview.metrics.successful_calls, 2);
         assert_eq!(overview.metrics.failed_calls, 1);
@@ -363,7 +374,7 @@ mod tests {
         .await;
 
         let overview = store
-            .overview(Some(now - 1_000), Some(now + 1_000), None, None)
+            .overview(Some(now - 1_000), Some(now + 1_000), None, None, None)
             .await
             .unwrap();
 
@@ -384,6 +395,7 @@ mod tests {
                 Some(now - 1_000),
                 Some(now + 1_000),
                 Some(r#"["missing-model"]"#),
+                None,
                 None,
             )
             .await
@@ -434,6 +446,7 @@ mod tests {
                 Some(base_ms + HOUR_MS),
                 None,
                 Some(15 * MINUTE_MS),
+                None,
             )
             .await
             .unwrap();

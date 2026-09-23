@@ -3,18 +3,23 @@ import { init, Rect, type ElementEvent } from "zrender";
 import type { Locale } from "../../../i18n/runtime";
 import { useI18n } from "../../../i18n/store";
 import { useTooltip, type TooltipAnchor } from "../../../shared/ui/Tooltip";
+import { ActivityUnitToggle } from "../ActivityUnitToggle";
 import styles from "./ContributionCalendarChart.module.scss";
 
-export type ContributionDay = {
-  date: string;
+export type ActivityUnit = "day" | "hour";
+
+export type ActivityPoint = {
+  key: string;
   tokens: number;
 };
 
 type ContributionCalendarChartProps = {
-  data: ContributionDay[];
+  unit: ActivityUnit;
+  onUnitChange: (unit: ActivityUnit) => void;
+  data: ActivityPoint[];
 };
 
-type CalendarCell = ContributionDay & {
+type CalendarCell = ActivityPoint & {
   column: number;
   row: number;
   level: number;
@@ -34,6 +39,12 @@ type AxisLabel = {
   left: number;
 };
 
+type CalendarLayout = {
+  cells: CalendarCell[];
+  columnCount: number;
+  ticks: Array<{ key: string; text: string; column: number }>;
+};
+
 const levelColors = [
   "rgba(139, 148, 158, 0.20)",
   "#9be9a8",
@@ -42,14 +53,14 @@ const levelColors = [
   "#216e39",
 ];
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
-const CALENDAR_CONFIG = {
-  cellAspectRatio: 0.9,
-  cellGap: 3,
-  resizeTransitionMs: 180,
-  rowCount: 7,
-  axisLabelGap: 8,
-  axisLabelWidth: 28,
+const HOUR_COLUMNS_PER_DAY = 3;
+const HOURS_PER_COLUMN = 24 / HOUR_COLUMNS_PER_DAY;
+const UNIT_CONFIG = {
+  day: { cellAspectRatio: 0.9, cellGap: 3, rowCount: 7, axisLabelGap: 8, axisLabelWidth: 28 },
+  hour: { cellAspectRatio: 1, cellGap: 2, rowCount: HOURS_PER_COLUMN, axisLabelGap: 8, axisLabelWidth: 48 },
 } as const;
+const resizeTransitionMs = 180;
+
 function parseDate(date: string) {
   return new Date(`${date}T00:00:00Z`);
 }
@@ -58,46 +69,75 @@ function mondayIndex(date: Date) {
   return (date.getUTCDay() + 6) % 7;
 }
 
-function cellOffset(index: number, cellSize: number) {
-  return index * (cellSize + CALENDAR_CONFIG.cellGap);
+function cellOffset(index: number, cellSize: number, gap: number) {
+  return index * (cellSize + gap);
 }
 
 function isCellExtra(value: unknown): value is CellExtra {
   return typeof value === "object" && value !== null && (value as CellExtra).kind === "calendar-cell";
 }
 
-function buildCalendarLayout(data: ContributionDay[], locale: Locale) {
+function buildCalendarLayout(data: ActivityPoint[], locale: Locale): CalendarLayout | null {
   if (data.length === 0) return null;
 
   const monthFormatter = new Intl.DateTimeFormat(locale, { month: "short", timeZone: "UTC" });
   const maximum = Math.max(1, ...data.map(({ tokens }) => tokens));
-  const firstDate = parseDate(data[0].date);
+  const firstDate = parseDate(data[0].key);
   const calendarStart = new Date(firstDate.getTime() - mondayIndex(firstDate) * DAY_IN_MS);
   const cells: CalendarCell[] = data.map((day) => {
-    const date = parseDate(day.date);
+    const date = parseDate(day.key);
     const daysFromStart = Math.round((date.getTime() - calendarStart.getTime()) / DAY_IN_MS);
     const level = day.tokens === 0 ? 0 : Math.max(1, Math.ceil((day.tokens / maximum) * 4));
     return { ...day, column: Math.floor(daysFromStart / 7), row: mondayIndex(date), level };
   });
   const columnCount = cells.at(-1)!.column + 1;
-  const monthTicks = cells.reduce<Array<{ key: string; text: string; column: number }>>((ticks, cell) => {
-    const date = parseDate(cell.date);
+  const ticks = cells.reduce<Array<{ key: string; text: string; column: number }>>((acc, cell) => {
+    const date = parseDate(cell.key);
     const key = `${date.getUTCFullYear()}-${date.getUTCMonth()}`;
-    if (ticks.at(-1)?.key !== key) ticks.push({ key, text: monthFormatter.format(date), column: cell.column });
-    return ticks;
+    if (acc.at(-1)?.key !== key) acc.push({ key, text: monthFormatter.format(date), column: cell.column });
+    return acc;
   }, []);
-  return { cells, columnCount, monthTicks };
+  return { cells, columnCount, ticks };
 }
 
-export function ContributionCalendarChart({ data }: ContributionCalendarChartProps) {
+function buildHourlyLayout(data: ActivityPoint[], locale: Locale): CalendarLayout | null {
+  if (data.length === 0) return null;
+
+  const dayFormatter = new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", timeZone: "UTC" });
+  const maximum = Math.max(1, ...data.map(({ tokens }) => tokens));
+  const cells: CalendarCell[] = data.map((point, index) => {
+    const level = point.tokens === 0 ? 0 : Math.max(1, Math.ceil((point.tokens / maximum) * 4));
+    return {
+      ...point,
+      column: Math.floor(index / 24) * HOUR_COLUMNS_PER_DAY + Math.floor(index % 24 / HOURS_PER_COLUMN),
+      row: index % HOURS_PER_COLUMN,
+      level,
+    };
+  });
+  const columnCount = Math.max(1, Math.ceil(data.length / 24) * HOUR_COLUMNS_PER_DAY);
+  const ticks = cells.reduce<Array<{ key: string; text: string; column: number }>>((acc, cell) => {
+    if (cell.column % HOUR_COLUMNS_PER_DAY !== 0 || cell.row !== 0) return acc;
+    const key = cell.key.slice(0, 10);
+    if (acc.at(-1)?.key === key) return acc;
+    acc.push({ key, text: dayFormatter.format(parseDate(key)), column: cell.column });
+    return acc;
+  }, []);
+  return { cells, columnCount, ticks };
+}
+
+export function ContributionCalendarChart({ unit, onUnitChange, data }: ContributionCalendarChartProps) {
   const { locale } = useI18n();
+  const config = UNIT_CONFIG[unit];
   const scrollerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
-  const layoutRef = useRef<ReturnType<typeof buildCalendarLayout>>(null);
+  const layoutRef = useRef<CalendarLayout | null>(null);
   const scheduleDrawRef = useRef<() => void>(() => undefined);
   const { show: showTooltip, hide: hideTooltip } = useTooltip();
   const [axisLabels, setAxisLabels] = useState<AxisLabel[]>([]);
-  const layout = useMemo(() => buildCalendarLayout(data, locale), [data, locale]);
+  const layout = useMemo(
+    () => (unit === "hour" ? buildHourlyLayout(data, locale) : buildCalendarLayout(data, locale)),
+    [unit, data, locale],
+  );
   const tokenFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale]);
   layoutRef.current = layout;
 
@@ -110,7 +150,7 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
       renderer: "canvas",
       width: 1,
       height: 1,
-      useDirtyRect: true,
+      useDirtyRect: false,
     });
 
     const handleMouseOver = (event: ElementEvent) => {
@@ -124,7 +164,7 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
         },
       };
       showTooltip(anchor, undefined, <div className={styles.tooltipContent}>
-        <strong>{extra.date}</strong>
+        <strong>{unit === "hour" ? extra.key.replace("T", " ") : extra.key}</strong>
         <span>{t("Token 用量：{tokens}", { tokens: tokenFormatter.format(extra.tokens) })}</span>
       </div>);
     };
@@ -145,21 +185,21 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
       if (!currentLayout) return;
       const availableWidth = Math.floor(scroller.getBoundingClientRect().width);
       if (availableWidth <= 0 || (availableWidth === lastAvailableWidth && currentLayout === lastLayout)) return;
-      const gapsWidth = (currentLayout.columnCount - 1) * CALENDAR_CONFIG.cellGap;
+      const gapsWidth = (currentLayout.columnCount - 1) * config.cellGap;
       const cellWidth = Math.max(0, (availableWidth - gapsWidth) / currentLayout.columnCount);
-      const cellHeight = cellWidth / CALENDAR_CONFIG.cellAspectRatio;
+      const cellHeight = cellWidth / config.cellAspectRatio;
       const width = availableWidth;
-      const height = CALENDAR_CONFIG.rowCount * cellHeight
-        + (CALENDAR_CONFIG.rowCount - 1) * CALENDAR_CONFIG.cellGap;
+      const height = config.rowCount * cellHeight
+        + (config.rowCount - 1) * config.cellGap;
 
       let lastLabelEnd = -Infinity;
-      const nextAxisLabels = currentLayout.monthTicks.flatMap((tick) => {
+      const nextAxisLabels = currentLayout.ticks.flatMap((tick) => {
         const left = Math.min(
-          cellOffset(tick.column, cellWidth),
-          availableWidth - CALENDAR_CONFIG.axisLabelWidth,
+          cellOffset(tick.column, cellWidth, config.cellGap),
+          availableWidth - config.axisLabelWidth,
         );
-        if (left < lastLabelEnd + CALENDAR_CONFIG.axisLabelGap) return [];
-        lastLabelEnd = left + CALENDAR_CONFIG.axisLabelWidth;
+        if (left < lastLabelEnd + config.axisLabelGap) return [];
+        lastLabelEnd = left + config.axisLabelWidth;
         return [{ ...tick, left }];
       });
       setAxisLabels(nextAxisLabels);
@@ -173,16 +213,16 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
       }
       lastLayout = currentLayout;
 
-      const currentDates = new Set(currentLayout.cells.map((cell) => cell.date));
-      for (const [date, rect] of cellRects) {
-        if (currentDates.has(date)) continue;
+      const currentKeys = new Set(currentLayout.cells.map((cell) => cell.key));
+      for (const [key, rect] of cellRects) {
+        if (currentKeys.has(key)) continue;
         chart.remove(rect);
-        cellRects.delete(date);
+        cellRects.delete(key);
       }
 
       for (const cell of currentLayout.cells) {
-        const x = cellOffset(cell.column, cellWidth);
-        const y = cellOffset(cell.row, cellHeight);
+        const x = cellOffset(cell.column, cellWidth, config.cellGap);
+        const y = cellOffset(cell.row, cellHeight, config.cellGap);
         const shape = {
           x,
           y,
@@ -198,14 +238,14 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
           width: cellWidth,
           height: cellHeight,
         } satisfies CellExtra;
-        const current = cellRects.get(cell.date);
+        const current = cellRects.get(cell.key);
 
         if (current) {
           current.extra = extra;
           current.stopAnimation();
           current.animateTo(
             { shape, style: { fill: levelColors[cell.level] } },
-            { duration: CALENDAR_CONFIG.resizeTransitionMs, easing: "cubicOut" },
+            { duration: resizeTransitionMs, easing: "cubicOut" },
           );
           continue;
         }
@@ -220,7 +260,7 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
           cursor: "default",
           extra,
         });
-        cellRects.set(cell.date, rect);
+        cellRects.set(cell.key, rect);
         chart.add(rect);
       }
       hideTooltip();
@@ -240,22 +280,22 @@ export function ContributionCalendarChart({ data }: ContributionCalendarChartPro
       scheduleDrawRef.current = () => undefined;
       chart.dispose();
     };
-  }, [layout !== null]);
+  }, [layout !== null, config]);
 
   useLayoutEffect(() => {
     scheduleDrawRef.current();
   }, [layout]);
 
-  if (!layout) return null;
-
+  const sectionLabel = unit === "hour" ? t("按小时统计的 Token 用量") : t("过去一年的 Token 用量");
   return (
-    <section className={styles.root} aria-label={t("过去一年的 Token 用量")}>
+    <section className={styles.root} aria-label={sectionLabel}>
+      <div className={styles.toolbar}><ActivityUnitToggle value={unit} onChange={onUnitChange} /></div>
       <div ref={scrollerRef} className={styles.scroller}>
         <div
           ref={canvasRef}
           className={styles.canvas}
           role="img"
-          aria-label={t("过去一年的 Token 用量日历")}
+          aria-label={sectionLabel}
         />
         <div className={styles.axis} aria-hidden="true">
           {axisLabels.map((label) => <span key={label.key} style={{ left: label.left }}>{label.text}</span>)}

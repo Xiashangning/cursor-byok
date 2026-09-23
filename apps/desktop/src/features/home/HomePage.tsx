@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, getDisabledPluginModelIds, pluginText, type Overview } from "../../shared/api";
-import { ContributionCalendarChart } from "./charts/ContributionCalendarChart";
+import { ContributionCalendarChart, type ActivityPoint, type ActivityUnit } from "./charts/ContributionCalendarChart";
 import { DailyTokenUsageChart } from "./charts/DailyTokenUsageChart";
 import { HomeMetrics } from "./metrics/HomeMetrics";
 import { PageContent } from "../../shell/layout/PageContent";
@@ -16,21 +16,69 @@ import { useI18n } from "../../i18n/store";
 type TimeRange = { startMs: number; endMs: number };
 
 const CALENDAR_DAYS = 365;
+const ACTIVITY_HOUR_DAYS = 15;
 const DAY_MS = 24 * 60 * 60_000;
+const HOUR_MS = 60 * 60_000;
 
-function contributionCalendarData(overview: Overview, endMs: number) {
+function bucketTokens(bucket: Overview["token_usage_series"][number]) {
+  return bucket.input_tokens + bucket.cache_read_tokens + bucket.cache_write_tokens + bucket.output_tokens;
+}
+
+function localDateKey(timestampMs: number) {
+  const date = new Date(timestampMs);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function localHourKey(timestampMs: number) {
+  return `${localDateKey(timestampMs)}T${String(new Date(timestampMs).getHours()).padStart(2, "0")}`;
+}
+
+function localDayStart(timestampMs: number) {
+  const date = new Date(timestampMs);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+function activityRange(days: number, endMs = Date.now()): TimeRange {
+  const start = new Date(localDayStart(endMs));
+  start.setDate(start.getDate() - (days - 1));
+  return { startMs: start.getTime(), endMs };
+}
+
+function contributionCalendarData(overview: Overview, endMs: number): ActivityPoint[] {
   const tokensByDate = new Map<string, number>();
   for (const bucket of overview.token_usage_series) {
-    const date = new Date(bucket.bucket_start_ms).toISOString().slice(0, 10);
-    const tokens = bucket.input_tokens + bucket.cache_read_tokens + bucket.cache_write_tokens + bucket.output_tokens;
-    tokensByDate.set(date, (tokensByDate.get(date) ?? 0) + tokens);
+    const date = localDateKey(bucket.bucket_start_ms);
+    tokensByDate.set(date, (tokensByDate.get(date) ?? 0) + bucketTokens(bucket));
   }
-  const lastDay = new Date(Math.max(0, endMs - 1));
-  lastDay.setUTCHours(0, 0, 0, 0);
-  const firstDayMs = lastDay.getTime() - (CALENDAR_DAYS - 1) * DAY_MS;
+  const lastDay = new Date(localDayStart(Math.max(0, endMs - 1)));
+  const firstDay = new Date(lastDay);
+  firstDay.setDate(firstDay.getDate() - (CALENDAR_DAYS - 1));
   return Array.from({ length: CALENDAR_DAYS }, (_, offset) => {
-    const date = new Date(firstDayMs + offset * DAY_MS).toISOString().slice(0, 10);
-    return { date, tokens: tokensByDate.get(date) ?? 0 };
+    const date = new Date(firstDay);
+    date.setDate(date.getDate() + offset);
+    const key = localDateKey(date.getTime());
+    return { key, tokens: tokensByDate.get(key) ?? 0 };
+  });
+}
+
+function hourlyActivityData(overview: Overview, endMs: number): ActivityPoint[] {
+  const tokensByHour = new Map<string, number>();
+  for (const bucket of overview.token_usage_series) {
+    const key = localHourKey(bucket.bucket_start_ms);
+    tokensByHour.set(key, (tokensByHour.get(key) ?? 0) + bucketTokens(bucket));
+  }
+  const firstHour = new Date(localDayStart(Math.max(0, endMs - 1)));
+  firstHour.setDate(firstHour.getDate() - (ACTIVITY_HOUR_DAYS - 1));
+  const hoursToday = new Date(Math.max(0, endMs - 1)).getHours() + 1;
+  return Array.from({ length: (ACTIVITY_HOUR_DAYS - 1) * 24 + hoursToday }, (_, offset) => {
+    const date = new Date(firstHour);
+    date.setHours(date.getHours() + offset);
+    const key = localHourKey(date.getTime());
+    return { key, tokens: tokensByHour.get(key) ?? 0 };
   });
 }
 
@@ -75,7 +123,27 @@ export function HomePage() {
   const [rangeOverview, setRangeOverview] = useState<Overview | null>(null);
   const [rangeBusy, setRangeBusy] = useState(false);
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const [activityUnit, setActivityUnit] = useState<ActivityUnit>("hour");
+  const [activityData, setActivityData] = useState<{ unit: ActivityUnit; data: ActivityPoint[] } | null>(null);
   const selectedRange = preset === "custom" ? customRange : presetRange(preset);
+
+  useEffect(() => {
+    let active = true;
+    const endMs = Date.now();
+    const range = activityRange(activityUnit === "hour" ? ACTIVITY_HOUR_DAYS : CALENDAR_DAYS, endMs);
+    void api.overview({
+      ...range,
+      bucketMs: activityUnit === "hour" ? HOUR_MS : DAY_MS,
+      timezoneOffsetMinutes: new Date().getTimezoneOffset(),
+    }).then((next) => {
+      if (!active) return;
+      const data = activityUnit === "hour"
+        ? hourlyActivityData(next, endMs)
+        : contributionCalendarData(next, endMs);
+      setActivityData({ unit: activityUnit, data });
+    });
+    return () => { active = false; };
+  }, [activityUnit, refreshVersion]);
 
   useEffect(() => {
     if (!selectedRange) return;
@@ -85,6 +153,7 @@ export function HomePage() {
       ...selectedRange,
       modelHashes: appliedModels,
       bucketMs: granularity,
+      timezoneOffsetMinutes: new Date().getTimezoneOffset(),
     }).then((next) => {
       if (active) setRangeOverview(next);
     }).finally(() => {
@@ -102,6 +171,9 @@ export function HomePage() {
     outputTokens: bucket.output_tokens,
   }));
   const contribution = contributionCalendarData(overview, Date.now());
+  const currentActivityData = activityData?.unit === activityUnit
+    ? activityData.data
+    : activityUnit === "day" ? contribution : [];
   const metrics = {
     llmCalls: filteredOverview.metrics.llm_calls,
     successfulCalls: filteredOverview.metrics.successful_calls,
@@ -172,8 +244,12 @@ export function HomePage() {
 
     {
       key: "activity",
-      estimatedHeight: 106,
-      content: <ContributionCalendarChart data={contribution} />,
+      estimatedHeight: 240,
+      content: <ContributionCalendarChart
+        unit={activityUnit}
+        onUnitChange={setActivityUnit}
+        data={currentActivityData}
+      />,
     },
   ];
 

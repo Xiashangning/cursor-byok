@@ -38,7 +38,7 @@ function colorMark(color: string): string {
 }
 
 function formatDay(value: Date) {
-  return `${value.getUTCMonth() + 1}/${value.getUTCDate()}`;
+  return `${value.getMonth() + 1}/${value.getDate()}`;
 }
 
 function pad(value: number) {
@@ -49,7 +49,7 @@ function formatAxisLabel(bucketStartMs: number, granularity: TokenUsageGranulari
   const value = new Date(bucketStartMs);
   if (granularity === "minute") return `${pad(value.getHours())}:${pad(value.getMinutes())}`;
   if (granularity === "hour") return `${pad(value.getHours())}:00`;
-  const day = value.getUTCDay();
+  const day = value.getDay();
   if (day === 6) return t("周六");
   if (day === 0) return t("周日");
   return formatDay(value);

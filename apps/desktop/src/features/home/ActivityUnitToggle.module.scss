@@ -1,0 +1,23 @@
+@use "../../styles/typography" as type;
+
+.root {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  border-radius: 5px;
+
+  button {
+    height: 25px;
+    padding: 0 8px;
+    color: var(--vscode-descriptionForeground);
+    background: transparent;
+    border: 0;
+    border-right: 1px solid var(--vscode-sideBar-border);
+    font-size: type.$font-size-xs;
+    white-space: nowrap;
+
+    &:last-child { border-right: 0; }
+    &:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+    &[aria-pressed="true"] { color: var(--vscode-list-activeSelectionForeground); background: var(--vscode-list-activeSelectionBackground); }
+  }
+}
