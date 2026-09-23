@@ -46,7 +46,6 @@ type CalendarLayout = {
 };
 
 const emptyColor = "rgba(139, 148, 158, 0.20)";
-// Former step palette, now evenly spaced interpolation anchors on the 0..1 intensity scale.
 const heatStops = ["#9be9a8", "#40c463", "#30a14e", "#216e39"];
 
 function parseHex(hex: string) {

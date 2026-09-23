@@ -67,7 +67,7 @@ async function begin(context: PluginContext): Promise<OAuth2Begin> {
   }
   const session: Session = { deviceCode };
   return {
-    session: session as unknown as JsonValue,
+    session,
     userCode,
     verificationUrl,
     ...(text(body.verification_uri_complete)

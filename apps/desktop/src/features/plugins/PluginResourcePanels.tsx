@@ -4,7 +4,6 @@ import {
   getDisabledPluginAccountIds,
   getDisabledPluginModelIds,
   setPluginAccountEnabled,
-  setPluginModelEnabled,
   setMultiplePluginModelsEnabled,
   pluginText,
   type PluginAddMethod,
@@ -343,7 +342,7 @@ function ProviderModelsView({ provider, onBack }: { provider: PluginProviderDesc
 
   const toggleModel = (modelId: string) => {
     const isCurrentlyDisabled = disabledIds.has(modelId);
-    setPluginModelEnabled(modelId, isCurrentlyDisabled);
+    setMultiplePluginModelsEnabled([modelId], isCurrentlyDisabled);
     setDisabledIds(getDisabledPluginModelIds());
   };
 

@@ -1,4 +1,4 @@
-import type { JsonValue, PluginContext } from "cursor-byok:plugin";
+import type { PluginContext } from "cursor-byok:plugin";
 import type {
   ProviderInvokeInput,
   ProviderOutput,
@@ -106,7 +106,7 @@ async function invoke(
       // 刷新过令牌时经补丁持久化,下一次调用与模型同步直接用新令牌。
       return data.accessToken === storedAccessToken
         ? { status: "completed" }
-        : { status: "completed", patch: { privateData: data as unknown as JsonValue } };
+        : { status: "completed", patch: { privateData: data } };
     } catch (error) {
       // 401/403 先刷新一次再重试:令牌可能已过期或被同账号的其他客户端轮换。
       // HttpError 只在读取响应状态时抛出,此时尚未发出任何事件,重试不会重复输出。

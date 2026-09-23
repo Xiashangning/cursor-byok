@@ -99,7 +99,6 @@ export function CursorSettingsPage() {
         type: draft.model.type,
         base_url: draft.model.base_url.trim(),
         api_key: draft.model.api_key.trim(),
-        // 编辑已有模型时密钥在编辑器里是脱敏后的空值,交给服务端从存储回填
         model_hash: editing?.model_hash ?? null,
         custom_headers_enabled: draft.model.custom_headers_enabled,
         custom_headers,

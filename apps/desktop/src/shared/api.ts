@@ -347,16 +347,6 @@ export function getDisabledPluginModelIds(): Set<string> {
   return new Set(cachedDisabledPluginModelIds);
 }
 
-export function setPluginModelEnabled(modelId: string, enabled: boolean): void {
-  if (enabled) {
-    cachedDisabledPluginModelIds.delete(modelId);
-  } else {
-    cachedDisabledPluginModelIds.add(modelId);
-  }
-  window.dispatchEvent(new CustomEvent("cursor_plugin_models_changed"));
-  void api.setDisabledPluginModels([...cachedDisabledPluginModelIds]).catch(() => {});
-}
-
 export function setMultiplePluginModelsEnabled(modelIds: string[], enabled: boolean): void {
   if (enabled) {
     for (const id of modelIds) {

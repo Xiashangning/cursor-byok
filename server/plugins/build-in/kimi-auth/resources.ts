@@ -1,4 +1,4 @@
-import type { JsonValue, NetworkResponse, PluginContext } from "cursor-byok:plugin";
+import type { NetworkResponse, PluginContext } from "cursor-byok:plugin";
 import { refreshBundle } from "./token.ts";
 import type {
   ResourceDraft,
@@ -111,7 +111,7 @@ export async function credentialDraft(credential: CredentialCandidate): Promise<
     displayName: credential.displayName ?? identity.displayName,
     quota: null,
   };
-  return { key: identity.key, privateData: data as unknown as JsonValue };
+  return { key: identity.key, privateData: data };
 }
 
 export function accountData(resource: ResourceSnapshot): AccountData {
@@ -234,7 +234,7 @@ export function quotaExhaustedPatch(data: AccountData, nowMs = Date.now()): Reso
     updatedAtMs: nowMs,
   };
   return {
-    privateData: { ...data, quota } as unknown as JsonValue,
+    privateData: { ...data, quota },
     state: quotaState(quota, nowMs),
   };
 }
@@ -307,10 +307,10 @@ export async function refreshAccount(
     // 额度是锦上添花:查询失败时保持 ready。
   }
   if (!quota) {
-    return rotated ? { privateData: data as unknown as JsonValue } : { state: { status: "ready" } };
+    return rotated ? { privateData: data } : { state: { status: "ready" } };
   }
   return {
-    privateData: { ...data, quota } as unknown as JsonValue,
+    privateData: { ...data, quota },
     state: quotaState(quota),
   };
 }

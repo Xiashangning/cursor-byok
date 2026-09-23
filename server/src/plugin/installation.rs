@@ -252,3 +252,22 @@ async fn remove_if_exists(path: &Path) -> Result<()> {
         Err(error) => Err(error.into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uses_versioned_runtime_directory() {
+        let root = PathBuf::from("/tmp/plugin-runtime");
+        let asset = super::super::asset::RuntimeAsset::for_platform("macos", "aarch64").unwrap();
+        let paths = RuntimePaths::new(&root, asset);
+        assert_eq!(
+            paths.executable,
+            root.join("deno")
+                .join(format!("v{DENO_VERSION}"))
+                .join(asset.target)
+                .join("deno")
+        );
+    }
+}

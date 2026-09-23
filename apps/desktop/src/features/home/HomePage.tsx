@@ -170,10 +170,9 @@ export function HomePage() {
     cacheWriteTokens: bucket.cache_write_tokens,
     outputTokens: bucket.output_tokens,
   }));
-  const contribution = contributionCalendarData(overview, Date.now());
   const currentActivityData = activityData?.unit === activityUnit
     ? activityData.data
-    : activityUnit === "day" ? contribution : [];
+    : activityUnit === "day" ? contributionCalendarData(overview, Date.now()) : [];
   const metrics = {
     llmCalls: filteredOverview.metrics.llm_calls,
     successfulCalls: filteredOverview.metrics.successful_calls,

@@ -1,6 +1,6 @@
 import { useRef } from "react";
 import type { ModelInput, ModelType } from "../../shared/api";
-import { defaultContextOptions, defaultCustomHeadersText, defaultEffortOptions, formatTokenCount, parseTokenCount } from "../../shared/utils/modelDefaults";
+import { defaultContextOptions, defaultCustomHeadersText, defaultEffortOptions, formatTokenCount, parseOptions, parseTokenCount } from "../../shared/utils/modelDefaults";
 import { modelPresets, presetEndpoint, trimTrailingSlash, type ModelPreset } from "../../shared/utils/modelPresets";
 import { Button } from "../../shared/ui/Button";
 import { Checkbox } from "../../shared/ui/Checkbox";
@@ -11,10 +11,6 @@ import { Switch } from "../../shared/ui/Switch";
 import { claudeIcon, openAiIcon } from "../../shared/ui/icons";
 import { CursorPresetChips } from "./CursorPresetChips";
 import styles from "./CursorSettings.module.scss";
-
-function parseOptions(value: string): string[] {
-  return [...new Set(value.split(",").map((item) => item.trim()).filter(Boolean))];
-}
 
 export type CursorModelDraft = {
   providerId: string;

@@ -311,3 +311,18 @@ impl BlobSynchronizer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_timeout_allows_slow_cursor_acknowledgements() {
+        assert_eq!(SET_TIMEOUT, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn get_timeout_allows_slow_cursor_responses() {
+        assert_eq!(GET_TIMEOUT, Duration::from_secs(10 * 60));
+    }
+}

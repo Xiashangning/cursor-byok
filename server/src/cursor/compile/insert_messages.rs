@@ -163,6 +163,16 @@ pub(super) fn covered_identities(
     action: &pb::BackgroundTaskCompletionAction,
     base_messages: &[CanonicalMessage],
 ) -> HashSet<String> {
+    let Some(last_assistant) = base_messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant)
+    else {
+        return HashSet::new();
+    };
+    let covered_event_ids: HashSet<&str> = base_messages[..last_assistant]
+        .iter()
+        .filter_map(|message| message.runtime_event_id.as_deref())
+        .collect();
     let mut covered = HashSet::new();
     for completion in &action.completions {
         if completion.reason != pb::BackgroundTaskCompletionReason::TaskFinished as i32 {
@@ -175,16 +185,7 @@ pub(super) fn covered_identities(
             continue;
         };
         let event_id = background_event_id(&identity);
-        let Some(position) = base_messages
-            .iter()
-            .position(|message| message.runtime_event_id.as_deref() == Some(event_id.as_str()))
-        else {
-            continue;
-        };
-        if base_messages[position + 1..]
-            .iter()
-            .any(|message| message.role == Role::Assistant)
-        {
+        if covered_event_ids.contains(event_id.as_str()) {
             covered.insert(identity);
         }
     }
@@ -376,6 +377,84 @@ mod tests {
             &[notification("agent-1", "task-call-1"), assistant("a")],
         );
         assert!(covered.contains(&identity));
+    }
+
+    #[test]
+    fn covered_matches_complete_ids_before_the_last_assistant() {
+        let action = action(vec![completion("agent:1", "call:1")]);
+        let expected = HashSet::from([format_identity(
+            pb::BackgroundTaskKind::Subagent,
+            "agent:1",
+            "call:1",
+        )]);
+        let mut assistant_notification = notification("agent:1", "call:1");
+        assistant_notification.role = Role::Assistant;
+        for (messages, is_covered) in [
+            (
+                vec![
+                    notification("agent:1", "call:1"),
+                    assistant("a"),
+                    notification("agent:1", "call:1"),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    assistant("a"),
+                    notification("agent:1", "call:1"),
+                    notification("agent:1", "call:1"),
+                ],
+                false,
+            ),
+            (
+                vec![notification("agent:1", "call:10"), assistant("a")],
+                false,
+            ),
+            (vec![assistant_notification.clone()], false),
+            (vec![assistant_notification, assistant("a")], true),
+        ] {
+            let covered = covered_identities(&action, &messages);
+            assert_eq!(
+                covered,
+                if is_covered {
+                    expected.clone()
+                } else {
+                    HashSet::new()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn covered_ignores_invalid_and_unfinished_notifications() {
+        let mut completions = vec![completion("agent-1", "call-1"); 8];
+        completions[0].reason = pb::BackgroundTaskCompletionReason::TaskProgress as i32;
+        completions[1].reason = -1;
+        completions[2].kind = -1;
+        completions[3].kind = pb::BackgroundTaskKind::Unspecified as i32;
+        completions[4].subagent_id = None;
+        completions[5].subagent_id = Some(String::new());
+        completions[6].tool_call_id = None;
+        completions[7].tool_call_id = Some(String::new());
+        assert!(covered_identities(
+            &action(completions),
+            &[notification("agent-1", "call-1"), assistant("a")],
+        )
+        .is_empty());
+
+        let mut shell = completion("shell:1", "call:1");
+        shell.kind = pb::BackgroundTaskKind::Shell as i32;
+        shell.subagent_id = None;
+        let identity = format_identity(pb::BackgroundTaskKind::Shell, "shell:1", "call:1");
+        let mut message = notification("shell:1", "call:1");
+        message.runtime_event_id = Some(background_event_id(&identity));
+        let messages = [message, assistant("a")];
+        assert_eq!(
+            covered_identities(&action(vec![shell.clone()]), &messages),
+            HashSet::from([identity])
+        );
+        shell.task_id.clear();
+        assert!(covered_identities(&action(vec![shell]), &messages).is_empty());
     }
 
     #[test]
