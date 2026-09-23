@@ -70,8 +70,10 @@ async fn route<M: Message>(
     proxy::forward(Extension(proxy.clone()), request).await
 }
 
+const COMPATIBILITY_REQUEST_LIMIT: usize = 1024 * 1024;
+
 async fn consume_body(request: Request<Body>) -> Result<()> {
-    to_bytes(request.into_body(), usize::MAX)
+    to_bytes(request.into_body(), COMPATIBILITY_REQUEST_LIMIT)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     Ok(())

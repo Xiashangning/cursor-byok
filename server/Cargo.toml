@@ -16,6 +16,7 @@ path = "src/bin/cursor-server.rs"
 [dependencies]
 async-stream = "0.3"
 axum = "0.8"
+http-body-util = "0.1"
 base64 = "0.22"
 bytes = "1"
 chrono = "0.4"
@@ -52,7 +53,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tower-http = { version = "0.6", features = ["cors", "decompression-gzip", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "decompression-gzip", "fs", "limit"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
@@ -68,4 +69,4 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }

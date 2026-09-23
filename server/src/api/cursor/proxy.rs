@@ -10,6 +10,7 @@ use axum::{
 use crate::Result;
 
 const CURSOR_UPSTREAM: &str = "https://api2.cursor.sh";
+const BUFFERED_REQUEST_LIMIT: usize = 64 * 1024 * 1024;
 pub const UPSTREAM_URL_HEADER: &str = "x-server-upstream-url";
 
 #[derive(Clone)]
@@ -161,7 +162,7 @@ pub async fn forward_buffered(
         header::ACCEPT_ENCODING,
         axum::http::HeaderValue::from_static("identity"),
     );
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, BUFFERED_REQUEST_LIMIT)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     let upstream = proxy

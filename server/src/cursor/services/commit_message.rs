@@ -42,6 +42,7 @@ const PREVIOUS_COMMIT_LIMIT: usize = 12;
 const EXPLICIT_CONTEXT_LIMIT: usize = 20_000;
 const GENERATION_TIMEOUT: Duration = Duration::from_secs(180);
 const COMMIT_MAX_OUTPUT_TOKENS: u64 = 30_000;
+const COMMIT_REQUEST_LIMIT: usize = 16 * 1024 * 1024;
 
 pub async fn write_git_commit_message(
     State(registry): State<TransportRegistry>,
@@ -79,7 +80,7 @@ async fn generate_local(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
     tracing::info!(?connect_timeout_ms, "write git commit message received");
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, COMMIT_REQUEST_LIMIT)
         .await
         .map_err(|error| Error::Protocol(format!("cannot read request body: {error}")))?;
     let request: ai::WriteGitCommitMessageRequest = connect::decode_unary(&body)?;

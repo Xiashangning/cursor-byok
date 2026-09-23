@@ -8,7 +8,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use tower_http::decompression::RequestDecompressionLayer;
+use tower_http::{decompression::RequestDecompressionLayer, limit::RequestBodyLimitLayer};
 
 use crate::{
     api::cursor::{
@@ -31,6 +31,10 @@ use crate::{
 };
 
 const INITIAL_APPEND_WAIT: Duration = Duration::from_secs(30);
+const RUN_REQUEST_LIMIT: usize = 64 * 1024;
+const BIDI_REQUEST_LIMIT: usize = 64 * 1024 * 1024;
+const DEFAULT_REQUEST_LIMIT: usize = 4 * 1024 * 1024;
+const COMPRESSED_REQUEST_LIMIT: usize = 64 * 1024 * 1024;
 
 pub fn router(
     registry: TransportRegistry,
@@ -168,8 +172,10 @@ fn router_with_proxy(
         .route("/auth/full_stripe_profile", get(account::stripe_profile))
         .route("/auth/stripe_profile", get(account::stripe_profile))
         .merge(tab::router())
-        .route_layer(DefaultBodyLimit::disable())
+        .route_layer(DefaultBodyLimit::max(DEFAULT_REQUEST_LIMIT))
         .route_layer(RequestDecompressionLayer::new())
+        // Applied last, so compressed bytes are bounded before decompression.
+        .route_layer(RequestBodyLimitLayer::new(COMPRESSED_REQUEST_LIMIT))
         .fallback(proxy::forward)
         .method_not_allowed_fallback(proxy::forward)
         .layer(Extension(proxy))
@@ -205,7 +211,7 @@ async fn run_sse_handler(
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let (parts, body) = buffered(request).await?;
+    let (parts, body) = buffered(request, RUN_REQUEST_LIMIT).await?;
     let request: agent::BidiRequestId = connect::decode_unary(&body)?;
     let route = registry.wait_route(&request.request_id).await;
     let trace = registry.trace(&request.request_id);
@@ -242,7 +248,7 @@ async fn bidi_handler(
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let (parts, body) = buffered(request).await?;
+    let (parts, body) = buffered(request, BIDI_REQUEST_LIMIT).await?;
     let request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
     let mut decoded = bidi::decode(&request)?;
     let first_model = decoded.model_id().map(str::to_owned);
@@ -391,12 +397,30 @@ fn trace_outcome(
     metadata
 }
 
-async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts, Bytes)> {
+async fn buffered(
+    request: Request<Body>,
+    decompressed_limit: usize,
+) -> Result<(axum::http::request::Parts, Bytes)> {
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, usize::MAX)
-        .await
-        .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
+    let body = to_bytes(body, decompressed_limit).await.map_err(|error| {
+        // 长度超限映射为 413,与 RequestBodyLimitLayer 对压缩字节上限的处理一致;
+        // 其他读取失败仍是 400。
+        if is_length_limit(&error) {
+            crate::Error::RequestTooLarge(format!(
+                "decompressed request body exceeds the {decompressed_limit}-byte limit"
+            ))
+        } else {
+            crate::Error::Protocol(format!("cannot read request body: {error}"))
+        }
+    })?;
     Ok((parts, body))
+}
+
+fn is_length_limit(error: &axum::Error) -> bool {
+    std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |error| {
+        error.source()
+    })
+    .any(|error| error.is::<http_body_util::LengthLimitError>())
 }
 
 fn parent_headers(headers: &HeaderMap) -> Result<Option<TransportParent>> {
@@ -454,6 +478,20 @@ mod tests {
             anthropic_thinking_effort: None,
             thinking_budget_tokens: None,
         }
+    }
+
+    #[tokio::test]
+    async fn buffered_requests_reject_decompressed_bodies_over_the_route_limit() {
+        use axum::response::IntoResponse;
+
+        let request = Request::new(Body::from(vec![0_u8; 17]));
+        let error = buffered(request, 16).await.unwrap_err();
+        assert!(matches!(error, crate::Error::RequestTooLarge(_)));
+        // 与 RequestBodyLimitLayer 的压缩上限响应一致:413,而不是 400。
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[tokio::test]

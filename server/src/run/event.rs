@@ -30,6 +30,7 @@ impl From<crate::Error> for RunFailure {
         use crate::Error;
         match error {
             Error::Protocol(message) | Error::Config(message) => Self::Protocol(message),
+            Error::RequestTooLarge(message) => Self::Client(message),
             Error::Provider(message) | Error::ProviderStatus { message, .. } => {
                 Self::Provider(message)
             }
