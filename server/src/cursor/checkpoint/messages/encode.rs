@@ -6,13 +6,13 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     model::{
-        project_messages, CanonicalMessage, ContentPart, ProjectedContent, ProjectedMessage, Role,
-        ToolCall, ToolCallContent, ToolRoundAssistant,
+        project_messages, CanonicalMessage, ContentPart, ProjectedContent,
+        ProjectedMessage, Role, ToolCall, ToolCallContent, ToolRoundAssistant,
     },
     Error, Result,
 };
 
-use super::REPLAY_ENVELOPE_PREFIX;
+use super::{COMPLETED_TOOL_MESSAGES_FIELD, REPLAY_ENVELOPE_PREFIX};
 
 pub fn stable_messages(
     instructions: &str,
@@ -74,6 +74,40 @@ pub fn staged_tool_round(
             tool_calls: Some(calls),
         }),
     )?)?)
+}
+
+pub fn with_completed_tool_messages(
+    pending: &str,
+    completed: &[CanonicalMessage],
+) -> Result<String> {
+    let completed_call_ids = super::completed_call_ids(completed);
+    let mut wire: Value = serde_json::from_str(pending)?;
+    let content = wire
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| Error::Protocol("Cursor pending assistant has no content".into()))?;
+    content.retain(|part| {
+        part.get("toolCallId")
+            .and_then(Value::as_str)
+            .is_none_or(|call_id| !completed_call_ids.contains(call_id))
+    });
+    let cursor = wire
+        .get_mut("providerOptions")
+        .and_then(Value::as_object_mut)
+        .and_then(|options| options.get_mut("cursor"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| Error::Protocol("Cursor pending assistant has no provider state".into()))?;
+    if let Some(contracts) = cursor
+        .get_mut("pendingToolExecutionContracts")
+        .and_then(Value::as_object_mut)
+    {
+        contracts.retain(|call_id, _| !completed_call_ids.contains(call_id));
+    }
+    cursor.insert(
+        COMPLETED_TOOL_MESSAGES_FIELD.into(),
+        serde_json::to_value(completed)?,
+    );
+    Ok(serde_json::to_string(&wire)?)
 }
 
 pub fn staged_final(

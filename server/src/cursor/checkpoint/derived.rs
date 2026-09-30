@@ -120,7 +120,7 @@ impl CheckpointBuilder {
         Ok((todo_ids, plan_id))
     }
 
-    async fn base_todo_state(&self) -> Result<serde_json::Value> {
+    pub(crate) async fn base_todo_state(&self) -> Result<serde_json::Value> {
         let mut todos = Vec::with_capacity(self.base.todos.len());
         for raw_id in &self.base.todos {
             let id = BlobId::from_bytes(raw_id)?;
@@ -157,7 +157,7 @@ pub(super) fn update_current_step_state(
     let result_indices = messages
         .iter()
         .filter_map(|message| match &message.content {
-            MessageContent::ToolResult(result) => {
+            MessageContent::ToolResult(result) if !result.is_error => {
                 update_message_index(&result.content).map(|index| (result.call_id.as_str(), index))
             }
             _ => None,
@@ -169,7 +169,9 @@ pub(super) fn update_current_step_state(
             continue;
         };
         for call in tool_calls {
-            if normalize(&call.name) != "updatecurrentstep" {
+            if normalize(&call.name) != "updatecurrentstep"
+                || !result_indices.contains_key(call.call_id.as_str())
+            {
                 continue;
             }
             if let (Some(step), Some(message_index)) = (

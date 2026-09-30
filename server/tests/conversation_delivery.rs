@@ -574,7 +574,7 @@ async fn completion_consumed_by_await_is_suppressed_by_the_ledger_without_client
     provider.push(tool_response(
         "model-await",
         "await-call",
-        "await",
+        "Await",
         r#"{"task_id":"ledger-child"}"#,
     ));
     provider.push(text_response("model-awaited", "consumed the result"));

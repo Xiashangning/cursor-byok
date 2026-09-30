@@ -3,6 +3,7 @@
 mod checkpoint;
 mod configuration;
 mod conversation;
+mod image;
 mod inference;
 mod message;
 mod observability;
@@ -16,6 +17,7 @@ mod truncation;
 pub use checkpoint::*;
 pub use configuration::*;
 pub use conversation::*;
+pub(crate) use image::*;
 pub use inference::*;
 pub use message::*;
 pub use observability::*;

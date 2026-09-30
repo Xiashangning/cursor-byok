@@ -16,8 +16,7 @@ pub(crate) fn path(call: &ToolCall) -> Result<String> {
     if normalized(&call.name) == "editnotebook" {
         string(call, "target_notebook")
     } else {
-        // Claude 系模型常按 Claude Code 习惯输出 file_path/filePath,做别名兼容。
-        string_any(call, &["path", "file_path", "filePath"])
+        string(call, "path")
     }
 }
 
@@ -38,7 +37,7 @@ pub(crate) fn after_read(
                 return Err("cannot edit a truncated Read result".into());
             }
             match success.output.as_ref() {
-                Some(pb::read_success::Output::Content(content)) => normalize_newlines(content),
+                Some(pb::read_success::Output::Content(content)) => content.clone(),
                 Some(pb::read_success::Output::Data(_)) => {
                     return Err("cannot edit a binary file".into());
                 }
@@ -61,13 +60,15 @@ pub(crate) fn after_read(
         }
         None => return Err("Read result is empty".into()),
     };
+    let before = if normalized(&call.name) == "strreplace" {
+        // Cursor exposes text reads as logical text, with CRLF and lone CR
+        // normalized to LF. Keep the server-side edit contract at that same boundary.
+        normalize_newlines(&before)
+    } else {
+        before
+    };
     let after = match normalized(&call.name).as_str() {
-        "write" => {
-            // Claude Code 习惯的 content 作为 contents 的别名兼容。
-            normalize_newlines(
-                &string_any(call, &["contents", "content"]).map_err(|error| error.to_string())?,
-            )
-        }
+        "write" => string(call, "contents").map_err(|error| error.to_string())?,
         "strreplace" => replace_string(call, &before)?,
         "editnotebook" => edit_notebook(call, &before)?,
         _ => return Err(format!("{} is not an edit tool", call.name)),
@@ -110,13 +111,39 @@ pub(crate) fn failure(path: String, error: impl Into<String>) -> pb::EditResult 
 }
 
 pub(crate) fn normalize_newlines(value: &str) -> String {
-    let normalized = value.replace("\r\n", "\n");
-    normalized.replace('\r', "\n")
+    if !value.contains('\r') {
+        return value.to_string();
+    }
+    // Single pass: CRLF and lone CR both become LF, matching Cursor's logical-text reads.
+    let mut normalized = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(index) = rest.find('\r') {
+        normalized.push_str(&rest[..index]);
+        if rest[index + 1..].starts_with('\n') {
+            normalized.push('\n');
+            rest = &rest[index + 2..];
+        } else {
+            normalized.push('\n');
+            rest = &rest[index + 1..];
+        }
+    }
+    normalized.push_str(rest);
+    normalized
+}
+
+/// StrReplace 的 old/new 在 LF 归一后不得相同;校验层与执行层共用同一规则。
+pub(crate) fn replacement_changes_text(old: &str, new: &str) -> bool {
+    normalize_newlines(old) != normalize_newlines(new)
 }
 
 fn replace_string(call: &ToolCall, before: &str) -> std::result::Result<String, String> {
-    let old = normalize_newlines(&string(call, "old_string").map_err(|error| error.to_string())?);
-    let new = normalize_newlines(&string(call, "new_string").map_err(|error| error.to_string())?);
+    let old = string(call, "old_string").map_err(|error| error.to_string())?;
+    let new = string(call, "new_string").map_err(|error| error.to_string())?;
+    if !replacement_changes_text(&old, &new) {
+        return Err("new_string must differ from old_string".into());
+    }
+    let old = normalize_newlines(&old);
+    let new = normalize_newlines(&new);
     if old.is_empty() {
         return Err("old_string must not be empty".into());
     }
@@ -167,7 +194,7 @@ fn edit_notebook(call: &ToolCall, before: &str) -> std::result::Result<String, S
         };
         let mut cell = serde_json::json!({
             "cell_type": cell_type,
-            "metadata": {},
+            "metadata": {"vscode": {"languageId": language}},
             "source": source_lines(&new),
         });
         if cell_type == "code" {
@@ -233,16 +260,11 @@ fn source_lines(value: &str) -> Vec<Value> {
 }
 
 fn string(call: &ToolCall, field: &str) -> Result<String> {
-    string_any(call, &[field])
-}
-
-fn string_any(call: &ToolCall, fields: &[&str]) -> Result<String> {
-    fields
-        .iter()
-        .find_map(|field| call.arguments.get(field))
+    call.arguments
+        .get(field)
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| Error::Protocol(format!("{} is missing {}", call.name, fields[0])))
+        .ok_or_else(|| Error::Protocol(format!("{} is missing {field}", call.name)))
 }
 
 fn normalized(value: &str) -> String {
@@ -284,42 +306,96 @@ mod tests {
         .to_string()
     }
 
-    #[test]
-    fn edit_aliases_preserve_canonical_values_and_match_display() {
-        let read = pb::ReadResult {
+    fn read_text(text: &str) -> pb::ReadResult {
+        pb::ReadResult {
             result: Some(pb::read_result::Result::Success(pb::ReadSuccess {
-                output: Some(pb::read_success::Output::Content("before".into())),
+                output: Some(pb::read_success::Output::Content(text.into())),
                 ..Default::default()
             })),
-        };
-        for name in ["Write", "StrReplace"] {
-            for field in ["path", "file_path", "filePath"] {
-                let mut call = notebook_call("before");
-                call.name = name.into();
-                call.arguments = json!({field: "/test", "content": "after", "old_string": "before", "new_string": "after"});
-                assert_eq!(path(&call).unwrap(), "/test");
-                assert_eq!(after_read(&call, &read).unwrap().after, "after");
-                let rendered = crate::cursor::tools::codec::render_tool_call(&call, false).unwrap();
-                let Some(pb::tool_call::Tool::EditToolCall(tool)) = rendered.tool else {
-                    panic!("expected edit")
-                };
-                let args = tool.args.unwrap();
-                assert_eq!(args.path, "/test");
-                assert_eq!(args.stream_content.as_deref(), Some("after"));
-            }
         }
-        let mut call = notebook_call("before");
+    }
+
+    #[test]
+    fn write_preserves_input_and_original_line_endings() {
+        let mut call = notebook_call("unused");
         call.name = "Write".into();
-        call.arguments =
-            json!({"path": "/primary", "file_path": "/alias", "contents": "", "content": "alias"});
-        assert_eq!(path(&call).unwrap(), "/primary");
-        assert_eq!(after_read(&call, &read).unwrap().after, "");
-        for value in [Value::Null, json!(42), json!([])] {
-            call.arguments["path"] = value.clone();
-            assert!(path(&call).is_err());
-            call.arguments["contents"] = value;
-            assert!(after_read(&call, &read).is_err());
+        for contents in ["", "a\r\nb\rc\n", "a\n", "no final newline"] {
+            call.arguments = json!({"path": "/test", "contents": contents});
+            let edited = after_read(&call, &read_text("before\r\n")).unwrap();
+            assert_eq!(edited.before, "before\r\n");
+            assert_eq!(edited.after, contents);
+            let rendered = crate::cursor::tools::codec::render_tool_call(&call, false).unwrap();
+            let Some(pb::tool_call::Tool::EditToolCall(tool)) = rendered.tool else {
+                panic!("expected edit card")
+            };
+            let args = tool.args.unwrap();
+            assert_eq!(args.path, "/test");
+            assert_eq!(args.stream_content.as_deref(), Some(contents));
         }
+        call.arguments = json!({"file_path": "/alias", "content": "alias"});
+        assert!(path(&call).is_err());
+        assert!(after_read(&call, &read_text("")).is_err());
+        for value in [Value::Null, json!(42), json!([])] {
+            call.arguments = json!({"path": value, "contents": value});
+            assert!(path(&call).is_err());
+            assert!(after_read(&call, &read_text("")).is_err());
+        }
+    }
+
+    #[test]
+    fn replacement_normalizes_read_match_and_written_text_to_lf() {
+        let mut call = notebook_call("before");
+        call.name = "StrReplace".into();
+        for (before, old, new, normalized_before, after) in [
+            ("a\nb\n", "a\nb", "x", "a\nb\n", "x\n"),
+            (
+                "keep\r\ntarget\nline\rfooter",
+                "target\rline",
+                "new\r\nline\rend",
+                "keep\ntarget\nline\nfooter",
+                "keep\nnew\nline\nend\nfooter",
+            ),
+        ] {
+            call.arguments = json!({"path": "/test", "old_string": old, "new_string": new});
+            let edited = after_read(&call, &read_text(before)).unwrap();
+            assert_eq!(edited.before, normalized_before);
+            assert_eq!(edited.after, after);
+        }
+    }
+
+    #[test]
+    fn replacement_remains_literal_and_counts_logical_occurrences() {
+        let mut call = notebook_call("before");
+        call.name = "StrReplace".into();
+        call.arguments = json!({
+            "path": "/test",
+            "old_string": "[before]\r\n",
+            "new_string": "after\r",
+        });
+        let before = "keep [before]\r\nkeep\n[before]\rkeep";
+        let error = after_read(&call, &read_text(before)).unwrap_err();
+        assert_eq!(error, "old_string is not unique; found 2 occurrences");
+
+        call.arguments["replace_all"] = json!(true);
+        let edited = after_read(&call, &read_text(before)).unwrap();
+        assert_eq!(edited.before, "keep [before]\nkeep\n[before]\nkeep");
+        assert_eq!(edited.after, "keep after\nkeep\nafter\nkeep");
+
+        call.arguments = json!({"path": "/test", "old_string": "same\r\n", "new_string": "same\n"});
+        assert_eq!(
+            after_read(&call, &read_text("same\n")).unwrap_err(),
+            "new_string must differ from old_string"
+        );
+        call.arguments = json!({"path": "/test", "old_string": "", "new_string": "x"});
+        assert_eq!(
+            after_read(&call, &read_text("same\n")).unwrap_err(),
+            "old_string must not be empty"
+        );
+        call.arguments = json!({"path": "/test", "old_string": "missing", "new_string": "x"});
+        assert_eq!(
+            after_read(&call, &read_text("same\n")).unwrap_err(),
+            "old_string was not found"
+        );
     }
 
     #[test]
@@ -329,6 +405,30 @@ mod tests {
         // misleading "not unique" error (non-empty cell).
         let error = edit_notebook(&notebook_call(""), &single_cell_notebook()).unwrap_err();
         assert_eq!(error, "old_string must not be empty");
+    }
+
+    #[test]
+    fn edit_notebook_inserts_cell_with_language_metadata() {
+        let mut call = notebook_call("");
+        call.arguments = json!({
+            "target_notebook": "/notebook.ipynb",
+            "cell_idx": 1,
+            "new_string": "console.log('hi')\n",
+            "is_new_cell": true,
+            "cell_language": "typescript",
+        });
+        let before = json!({
+            "cells": [{"cell_type": "markdown", "metadata": {}, "source": ["# Title\n"]}],
+        })
+        .to_string();
+
+        let edited: Value = serde_json::from_str(&edit_notebook(&call, &before).unwrap()).unwrap();
+        let inserted = &edited["cells"][1];
+        assert_eq!(inserted["cell_type"], "code");
+        assert_eq!(inserted["metadata"]["vscode"]["languageId"], "typescript");
+        assert_eq!(inserted["source"], json!(["console.log('hi')\n"]));
+        assert!(inserted["execution_count"].is_null());
+        assert_eq!(inserted["outputs"], json!([]));
     }
 
     #[test]

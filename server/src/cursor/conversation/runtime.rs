@@ -18,7 +18,10 @@ use crate::{
         },
         transport::{OrderedInbox, TransportHandle},
     },
+    model::ConversationId,
     run::{CommandResult, RunEngine, RunHandle, RunPhase},
+    store::Store,
+    Result,
 };
 
 use super::{
@@ -200,6 +203,32 @@ impl ConversationRuntime {
                                     Some(pb::agent_client_message::Message::RunRequest(
                                         request,
                                     )) => {
+                                        if let Some(action) = request
+                                            .action
+                                            .as_ref()
+                                            .and_then(|action| action.action.as_ref())
+                                            .and_then(|action| match action {
+                                                pb::conversation_action::Action::BackgroundTaskCompletionAction(action) => Some(action),
+                                                _ => None,
+                                            })
+                                        {
+                                            if let Some(generation) = current.as_ref() {
+                                                match complete_shell_awaits(
+                                                    generation,
+                                                    action,
+                                                    &dependencies.store,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(true) => continue,
+                                                    Ok(false) => {}
+                                                    Err(error) => {
+                                                        generation.results.send_error(error);
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         waiting_for_action = false;
                                         if draining {
                                             handle.reopen();
@@ -254,6 +283,21 @@ impl ConversationRuntime {
                                             }
                                             Ok(codec::ClientExecEvent::Message(message)) => {
                                                 let _ = handle.emit(&message);
+                                            }
+                                            Ok(codec::ClientExecEvent::DelayedMessage {
+                                                delay,
+                                                exec_id,
+                                                message,
+                                            }) => {
+                                                let handle = handle.clone();
+                                                let tool_runtime = generation.tool_runtime.clone();
+                                                tokio::spawn(async move {
+                                                    tokio::time::sleep(delay).await;
+                                                    if tool_runtime.exec_call(exec_id).await.is_some()
+                                                    {
+                                                        let _ = handle.emit(&message);
+                                                    }
+                                                });
                                             }
                                             Ok(codec::ClientExecEvent::Completed(result)) => {
                                                 generation.results.send(*result)
@@ -324,6 +368,11 @@ impl ConversationRuntime {
                                                     .take_exec(throw.id)
                                                     .await
                                                 {
+                                                    Some(pending)
+                                                        if matches!(
+                                                            pending.stage,
+                                                            crate::cursor::tools::runtime::ExecStage::ShellAwaitPoll
+                                                        ) => {}
                                                     Some(pending) => generation.results.send(
                                                         compat::failure_with_message(
                                                             &pending.call,
@@ -436,6 +485,32 @@ impl ConversationRuntime {
                                             )
                                             .await;
                                         }
+                                        Some(
+                                            pb::conversation_action::Action::BackgroundTaskCompletionAction(
+                                                action,
+                                            ),
+                                        ) => {
+                                            let Some(generation) = current.as_ref() else {
+                                                continue;
+                                            };
+                                            match complete_shell_awaits(
+                                                generation,
+                                                &action,
+                                                &dependencies.store,
+                                            )
+                                            .await
+                                            {
+                                                Ok(true) => {}
+                                                Ok(false) => {
+                                                    generation.results.send_error(
+                                                        unsupported_runtime_action_error(
+                                                            &pb::conversation_action::Action::BackgroundTaskCompletionAction(action),
+                                                        ),
+                                                    );
+                                                }
+                                                Err(error) => generation.results.send_error(error),
+                                            }
+                                        }
                                         Some(pb::conversation_action::Action::CancelAction(_)) => {
                                             if let Some(generation) = current.as_ref() {
                                                 if let Some(run) = generation.run.lock().clone() {
@@ -512,6 +587,33 @@ impl ConversationRuntime {
             }
         });
     }
+}
+
+async fn complete_shell_awaits(
+    generation: &RunGeneration,
+    action: &pb::BackgroundTaskCompletionAction,
+    store: &Store,
+) -> Result<bool> {
+    let Some(matched) = generation.tools.complete_shell_awaits(action).await? else {
+        return Ok(false);
+    };
+    store
+        .record_consumed_background_completions(
+            &ConversationId::new(
+                generation
+                    .request
+                    .conversation_id
+                    .as_deref()
+                    .unwrap_or_default(),
+            ),
+            pb::BackgroundTaskKind::Shell.as_str_name(),
+            &matched.consumed,
+        )
+        .await?;
+    for completion in matched.completions {
+        generation.results.send(completion);
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]

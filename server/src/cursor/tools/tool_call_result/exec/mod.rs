@@ -4,7 +4,7 @@ mod render;
 
 use crate::{
     cursor::{protocol::proto::agent::v1 as pb, tools::codec as interaction},
-    model::ToolResult,
+    model::{image_metadata, ToolResult},
     Error, Result,
 };
 
@@ -13,6 +13,56 @@ use crate::cursor::tools::{
     edit,
     runtime::{ExecStage, PendingExec},
 };
+
+pub(crate) fn complete_diagnostics(
+    pending: PendingExec,
+    results: &[pb::DiagnosticsResult],
+) -> Result<ToolCompletion> {
+    let mut text = Vec::new();
+    let mut files = Vec::new();
+    let mut total_diagnostics = 0i32;
+    let mut failed = false;
+    for result in results {
+        let (content, is_error) = output::output(
+            &pb::exec_client_message::Message::DiagnosticsResult(result.clone()),
+            &pending.call,
+        )?;
+        text.push(content);
+        failed |= is_error;
+        if let Some(pb::read_lints_tool_result::Result::Success(success)) =
+            render::diagnostics(result)?.result
+        {
+            files.extend(success.file_diagnostics);
+            total_diagnostics = total_diagnostics.saturating_add(success.total_diagnostics);
+        }
+    }
+    let content = text.join("\n\n");
+    let mut rendered = interaction::render_tool_call(&pending.call, false)?;
+    let Some(pb::tool_call::Tool::ReadLintsToolCall(tool)) = rendered.tool.as_mut() else {
+        unreachable!()
+    };
+    tool.result = Some(pb::ReadLintsToolResult {
+        result: Some(if failed {
+            pb::read_lints_tool_result::Result::Error(pb::ReadLintsToolError {
+                error_message: content.clone(),
+            })
+        } else {
+            pb::read_lints_tool_result::Result::Success(pb::ReadLintsToolSuccess {
+                total_files: i32::try_from(files.len())
+                    .map_err(|_| Error::Protocol("too many diagnostics files".into()))?,
+                file_diagnostics: files,
+                total_diagnostics,
+            })
+        }),
+    });
+    ToolCompletion::from_rendered(
+        &pending.call,
+        pending.started_at_ms,
+        content,
+        failed,
+        rendered,
+    )
+}
 
 pub(crate) fn from_exec(
     pending: PendingExec,
@@ -30,9 +80,6 @@ pub(crate) fn from_exec(
     let wire_result = gated_shell.as_ref().unwrap_or(wire_result);
     if let Message::McpStateExecResult(result) = wire_result {
         return mcp_state::complete(pending, result);
-    }
-    if let Message::ForceBackgroundSubagentResult(result) = wire_result {
-        return background_subagent(pending, result);
     }
     if let Message::SubagentAwaitResult(result) = wire_result {
         return subagent_await(pending, result);
@@ -111,50 +158,13 @@ pub(crate) fn from_exec(
     .with_read_image(read_image))
 }
 
-fn background_subagent(
-    pending: PendingExec,
-    result: &pb::ForceBackgroundSubagentResult,
-) -> Result<ToolCompletion> {
-    let mut rendered = interaction::render_tool_call(&pending.call, false)?;
-    let Some(pb::tool_call::Tool::TaskToolCall(mut tool)) = rendered.tool.take() else {
-        return Err(Error::Protocol(
-            "create-agent has no Task representation".into(),
-        ));
-    };
-    let accepted = result.status == pb::ForceBackgroundSubagentStatus::Accepted as i32;
-    let message = if accepted {
-        "background agent accepted"
-    } else {
-        "background agent was not found"
-    };
-    tool.result = Some(pb::TaskResult {
-        result: Some(if accepted {
-            pb::task_result::Result::Success(pb::TaskSuccess {
-                is_background: true,
-                result_suffix: Some(message.into()),
-                ..Default::default()
-            })
-        } else {
-            pb::task_result::Result::Error(pb::TaskError {
-                error: message.into(),
-            })
-        }),
-    });
-    Ok(orchestration_completion(
-        &pending,
-        message.into(),
-        !accepted,
-        pb::tool_call::Tool::TaskToolCall(tool),
-    ))
-}
-
 fn subagent_await(
     pending: PendingExec,
     result: &pb::SubagentAwaitResult,
 ) -> Result<ToolCompletion> {
     let mut rendered = interaction::render_tool_call(&pending.call, false)?;
     let Some(pb::tool_call::Tool::AwaitToolCall(mut tool)) = rendered.tool.take() else {
-        return Err(Error::Protocol("AWAIT has no Await representation".into()));
+        return Err(Error::Protocol("Await has no Await representation".into()));
     };
     let (content, is_error, await_result) = match result.result.as_ref() {
         Some(pb::subagent_await_result::Result::Complete(value)) => (
@@ -192,7 +202,7 @@ fn subagent_await(
                 error: value.error.clone(),
             }),
         ),
-        None => return Err(Error::Protocol("AWAIT returned no result".into())),
+        None => return Err(Error::Protocol("Await returned no result".into())),
     };
     tool.result = Some(pb::AwaitResult {
         result: Some(await_result),
@@ -237,29 +247,12 @@ fn read_image(message: &pb::exec_client_message::Message) -> Option<ReadImage> {
     let Output::Data(data) = success.output.as_ref()? else {
         return None;
     };
+    let metadata = image_metadata(data)?;
     Some(ReadImage {
-        mime_type: image_mime_type(data)?.into(),
+        mime_type: metadata.mime_type.into(),
         data: data.clone(),
         path: success.path.clone(),
     })
-}
-
-fn image_mime_type(data: &[u8]) -> Option<&'static str> {
-    let reader = image::ImageReader::new(std::io::Cursor::new(data))
-        .with_guessed_format()
-        .ok()?;
-    let format = reader.format()?;
-    let (width, height) = reader.into_dimensions().ok()?;
-    if width == 0 || height == 0 {
-        return None;
-    }
-    match format {
-        image::ImageFormat::Png => Some("image/png"),
-        image::ImageFormat::Jpeg => Some("image/jpeg"),
-        image::ImageFormat::Gif => Some("image/gif"),
-        image::ImageFormat::WebP => Some("image/webp"),
-        _ => None,
-    }
 }
 
 pub(crate) fn edit_failure(pending: PendingExec, error: String) -> Result<ToolCompletion> {
@@ -286,22 +279,12 @@ pub(crate) fn edit_failure(pending: PendingExec, error: String) -> Result<ToolCo
 }
 #[cfg(test)]
 mod tests {
-    use base64::{engine::general_purpose::STANDARD, Engine};
     use serde_json::json;
 
-    use super::{from_exec, image_mime_type};
+    use super::from_exec;
     use crate::cursor::protocol::proto::agent::v1 as pb;
     use crate::cursor::tools::runtime::{ExecContext, ExecStage, PendingExec};
     use crate::model::ToolCall;
-
-    #[test]
-    fn read_image_requires_a_decodable_supported_image() {
-        let png = STANDARD
-            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
-            .unwrap();
-        assert_eq!(image_mime_type(&png), Some("image/png"));
-        assert_eq!(image_mime_type(b"\x89PNG\r\n\x1a\n"), None);
-    }
 
     fn pending(name: &str, arguments: serde_json::Value) -> PendingExec {
         PendingExec {
@@ -323,27 +306,9 @@ mod tests {
     }
 
     #[test]
-    fn orchestration_results_become_cursor_tool_completions() {
+    fn await_result_becomes_a_cursor_tool_completion() {
         let completion = from_exec(
-            pending(
-                "create-agent",
-                json!({"title":"Inspect","prompt":"inspect"}),
-            ),
-            &pb::exec_client_message::Message::ForceBackgroundSubagentResult(
-                pb::ForceBackgroundSubagentResult {
-                    status: pb::ForceBackgroundSubagentStatus::Accepted as i32,
-                },
-            ),
-        )
-        .unwrap();
-        assert!(!completion.result().is_error);
-        assert!(matches!(
-            completion.tool_call().tool,
-            Some(pb::tool_call::Tool::TaskToolCall(_))
-        ));
-
-        let completion = from_exec(
-            pending("AWAIT", json!({"task_id":"agent-1"})),
+            pending("Await", json!({"task_id":"agent-1"})),
             &pb::exec_client_message::Message::SubagentAwaitResult(pb::SubagentAwaitResult {
                 result: Some(pb::subagent_await_result::Result::StillRunning(
                     pb::SubagentAwaitStillRunning {

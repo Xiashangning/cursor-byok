@@ -35,7 +35,9 @@ pub fn fold_derived_state_from(
                 };
                 match normalize(&name).as_str() {
                     "todowrite" | "updatetodos" => {
-                        state.todos = Some(apply_todo_write(state.todos.take(), input));
+                        if let Ok(resolved) = serde_json::from_str(&result.content) {
+                            state.todos = Some(resolved);
+                        }
                     }
                     "createplan" | "updateplan" | "writeplan" => state.plan = Some(input),
                     _ => {}
@@ -45,6 +47,39 @@ pub fn fold_derived_state_from(
         }
     }
     state
+}
+
+pub fn validated_todo_write(current: Option<Value>, input: Value) -> crate::Result<Value> {
+    let mut ids = std::collections::HashSet::new();
+    for todo in input
+        .get("todos")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = todo.get("id").and_then(Value::as_str).unwrap_or_default();
+        if id.is_empty() || !ids.insert(id) {
+            return Err(crate::Error::Protocol(
+                "TodoWrite requires unique non-empty ids".into(),
+            ));
+        }
+    }
+    let resolved = apply_todo_write(current, input);
+    let todos = resolved
+        .get("todos")
+        .and_then(Value::as_array)
+        .ok_or_else(|| crate::Error::Protocol("TodoWrite requires todos[]".into()))?;
+    for todo in todos {
+        if todo.get("content").and_then(Value::as_str).is_none()
+            || !matches!(
+                todo.get("status").and_then(Value::as_str),
+                Some("pending" | "in_progress" | "completed" | "cancelled")
+            )
+        {
+            return Err(crate::Error::Protocol("New TodoWrite ids require content and a valid status; partial updates require an existing id".into()));
+        }
+    }
+    Ok(resolved)
 }
 
 fn apply_todo_write(current: Option<Value>, mut input: Value) -> Value {
@@ -98,11 +133,22 @@ mod tests {
     };
 
     #[test]
-    fn merge_patch_inherits_content_from_checkpoint_todo_state() {
-        let messages = todo_write_messages(json!({
-            "merge": true,
-            "todos": [{"id": "tests", "status": "completed"}],
-        }));
+    fn resolved_todo_result_is_not_reapplied_to_checkpoint_state() {
+        let resolved = json!({
+            "merge": false,
+            "todos": [{
+                "id": "tests",
+                "content": "Run focused tests",
+                "status": "completed",
+            }],
+        });
+        let messages = todo_write_messages(
+            json!({
+                "merge": true,
+                "todos": [{"id": "tests", "status": "completed"}],
+            }),
+            resolved.clone(),
+        );
         let initial = DerivedState {
             todos: Some(json!({
                 "merge": false,
@@ -116,20 +162,10 @@ mod tests {
         };
 
         let state = fold_derived_state_from(&messages, initial);
-        assert_eq!(
-            state.todos,
-            Some(json!({
-                "merge": false,
-                "todos": [{
-                    "id": "tests",
-                    "content": "Run focused tests",
-                    "status": "completed",
-                }],
-            }))
-        );
+        assert_eq!(state.todos, Some(resolved));
     }
 
-    fn todo_write_messages(arguments: Value) -> Vec<CanonicalMessage> {
+    fn todo_write_messages(arguments: Value, resolved: Value) -> Vec<CanonicalMessage> {
         vec![
             CanonicalMessage {
                 message_id: "assistant".into(),
@@ -156,7 +192,7 @@ mod tests {
                 content: MessageContent::ToolResult(ToolResultContent {
                     call_id: "todo-call".into(),
                     name: "TodoWrite".into(),
-                    content: "{}".into(),
+                    content: resolved.to_string(),
                     is_error: false,
                     image: None,
                     provider_parts: Vec::new(),

@@ -11,7 +11,7 @@ use crate::{
         transport::TransportHandle,
     },
     model::{CanonicalMessage, ConversationId, ToolCall, ToolDefinition, ToolRoundAssistant},
-    store::Store,
+    store::{BlobId, Store},
     Result,
 };
 
@@ -130,6 +130,54 @@ impl CheckpointBuilder {
             .await
     }
 
+    pub(crate) async fn todo_updated(
+        &mut self,
+        current: &pb::ConversationStateStructure,
+        todos: &[pb::TodoItem],
+        completed_messages: &[CanonicalMessage],
+        mode: i32,
+        presentation: &PendingSteps,
+    ) -> Result<BuiltCheckpoint> {
+        let mut todo_ids = Vec::with_capacity(todos.len());
+        for (index, todo) in todos.iter().enumerate() {
+            let encoded = todo.encode_to_vec();
+            let id = BlobId::digest(&encoded);
+            if current.todos.get(index).map(Vec::as_slice) == Some(id.as_bytes()) {
+                todo_ids.push(id);
+            } else {
+                todo_ids.push(self.sync.persist(&encoded, &[]).await?);
+            }
+        }
+        let raw_todo_ids = todo_ids
+            .iter()
+            .map(|id| id.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let [pending] = current.pending_tool_calls.as_slice() else {
+            return Err(crate::Error::Protocol(
+                "TodoWrite progress requires one pending assistant".into(),
+            ));
+        };
+        let consumed_background_completions = self.absorb_presentation(presentation);
+        let turn_ids = self.project_turns(mode, presentation).await?;
+        self.base.todos = raw_todo_ids.clone();
+
+        let mut state = current.clone();
+        state.todos = raw_todo_ids;
+        state.turns = turn_ids.iter().map(|id| id.as_bytes().to_vec()).collect();
+        state.read_paths = self.base.read_paths.clone();
+        state.subagent_states = self.base.subagent_states.clone();
+        state.subagent_runs_by_parent_tool_call_id =
+            self.base.subagent_runs_by_parent_tool_call_id.clone();
+        state.pending_tool_calls = vec![messages::with_completed_tool_messages(
+            pending,
+            completed_messages,
+        )?];
+        Ok(BuiltCheckpoint {
+            state,
+            consumed_background_completions,
+        })
+    }
+
     pub(crate) async fn staged_tool_round(
         &mut self,
         stable_messages: &[CanonicalMessage],
@@ -178,9 +226,7 @@ impl CheckpointBuilder {
         pending_tool_calls: Vec<String>,
         presentation: &PendingSteps,
     ) -> Result<BuiltCheckpoint> {
-        self.record_background_subagents(presentation);
-        let consumed_background_completions =
-            self.record_consumed_subagent_completions(presentation);
+        let consumed_background_completions = self.absorb_presentation(presentation);
         let root_ids = self.project_roots(messages).await?;
         let turn_ids = self.project_turns(mode, presentation).await?;
         let (todo_ids, plan_id) = self.build_derived_state(messages).await?;
@@ -195,11 +241,6 @@ impl CheckpointBuilder {
             .into_iter()
             .collect();
 
-        for path in &presentation.read_paths {
-            if !self.base.read_paths.contains(path) {
-                self.base.read_paths.push(path.clone());
-            }
-        }
         let mut checkpoint = self.base.clone();
         checkpoint.root_prompt_messages_json =
             root_ids.iter().map(|id| id.as_bytes().to_vec()).collect();
@@ -223,6 +264,19 @@ impl CheckpointBuilder {
             state: checkpoint,
             consumed_background_completions,
         })
+    }
+
+    /// Incremental projection of one step's presentation into the base state:
+    /// background subagent states, consumed completions, and read paths.
+    fn absorb_presentation(&mut self, presentation: &PendingSteps) -> Vec<(String, String)> {
+        self.record_background_subagents(presentation);
+        let consumed = self.record_consumed_subagent_completions(presentation);
+        for path in &presentation.read_paths {
+            if !self.base.read_paths.contains(path) {
+                self.base.read_paths.push(path.clone());
+            }
+        }
+        consumed
     }
 
     fn record_background_subagents(&mut self, presentation: &PendingSteps) {
@@ -335,18 +389,25 @@ impl CheckpointBuilder {
                 ),
             ),
         });
-        if let Some(trace) = handle.trace() {
-            trace.artifact(
-                "checkpoint",
-                "byok_server",
-                &checkpoint.state.encode_to_vec(),
-                serde_json::json!({
-                    "root_message_count": checkpoint.state.root_prompt_messages_json.len(),
-                    "turn_count": checkpoint.state.turns.len(),
-                    "pending_tool_call_count": checkpoint.state.pending_tool_calls.len(),
-                    "emit_status": if result.is_ok() { "sent" } else { "error" },
-                }),
-            );
+        // Rendering the whole state is only worth its cost when the trace is recording.
+        if let Some(trace) = handle.trace().filter(|trace| trace.is_enabled()) {
+            let mut metadata = serde_json::json!({
+                "root_message_count": checkpoint.state.root_prompt_messages_json.len(),
+                "turn_count": checkpoint.state.turns.len(),
+                "pending_tool_call_count": checkpoint.state.pending_tool_calls.len(),
+                "emit_status": if result.is_ok() { "sent" } else { "error" },
+            });
+            match crate::cursor::protocol::json::render_state(&checkpoint.state) {
+                Some(rendered) => {
+                    metadata["truncated"] = rendered.truncated.into();
+                    metadata["total_bytes"] = rendered.total_bytes.into();
+                    trace.artifact("checkpoint", "byok_server", &rendered.json, metadata);
+                }
+                None => tracing::warn!(
+                    request_id = self.sync.request_id(),
+                    "cannot render Cursor checkpoint for its trace"
+                ),
+            }
         }
         result?;
         self.store

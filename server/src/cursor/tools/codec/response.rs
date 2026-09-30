@@ -1,4 +1,6 @@
 //! Decodes Tool execution responses received from Cursor.
+use std::time::Duration;
+
 use crate::{
     cursor::{
         protocol::{events, proto::agent::v1 as pb},
@@ -17,6 +19,11 @@ use super::request::edit_write_request;
 pub enum ClientExecEvent {
     Delta(Box<pb::AgentServerMessage>),
     Message(Box<pb::AgentServerMessage>),
+    DelayedMessage {
+        delay: Duration,
+        exec_id: u32,
+        message: Box<pb::AgentServerMessage>,
+    },
     Completed(Box<ToolCompletion>),
     Pending,
 }
@@ -51,7 +58,41 @@ pub async fn client_event(
     let pb::exec_client_message::Message::ShellStream(stream) = wire_result else {
         let entry = take(message.id, pending).await?;
         return match entry.stage {
+            ExecStage::Diagnostics(_) => {
+                let result = match wire_result {
+                    pb::exec_client_message::Message::DiagnosticsResult(result) => result.clone(),
+                    _ => crate::cursor::tools::diagnostics::failed_result(
+                        "Expected DiagnosticsResult",
+                    ),
+                };
+                crate::cursor::tools::diagnostics::advance(entry, result, pending).await
+            }
             ExecStage::EditRead => advance_edit(entry, wire_result, pending).await,
+            ExecStage::ShellAwaitPoll => {
+                match super::super::tool_call_dispatch::advance_shell_await_poll(
+                    pending,
+                    entry,
+                    wire_result,
+                )
+                .await?
+                {
+                    super::super::tool_call_dispatch::ShellAwaitPoll::Completed(completion) => {
+                        Ok(ClientExecEvent::Completed(completion))
+                    }
+                    super::super::tool_call_dispatch::ShellAwaitPoll::Retry {
+                        delay,
+                        exec_id,
+                        message,
+                    } => Ok(ClientExecEvent::DelayedMessage {
+                        delay,
+                        exec_id,
+                        message,
+                    }),
+                    super::super::tool_call_dispatch::ShellAwaitPoll::Pending => {
+                        Ok(ClientExecEvent::Pending)
+                    }
+                }
+            }
             ExecStage::Direct | ExecStage::DynamicMcp(_) | ExecStage::EditWrite(_) => {
                 completed(entry, wire_result.clone())
             }
@@ -142,9 +183,19 @@ pub async fn stream_closed(id: u32, pending: &CursorToolRuntime) -> Result<Optio
     let Some(entry) = pending.take_exec(id).await else {
         return Ok(None);
     };
+    if matches!(entry.stage, ExecStage::ShellAwaitPoll) {
+        return Ok(None);
+    }
     let error = "Cursor Exec stream closed before returning a terminal result";
-    if entry.call.name.eq_ignore_ascii_case("Shell") || entry.call.name.eq_ignore_ascii_case("Bash")
-    {
+    if let ExecStage::Diagnostics(state) = &entry.stage {
+        let mut results = state.results.clone();
+        results.push(crate::cursor::tools::diagnostics::failed_result(format!(
+            "{error}; diagnostics incomplete; remaining paths: {:?}",
+            state.paths
+        )));
+        return Ok(Some(result::complete_diagnostics(entry, &results)?));
+    }
+    if entry.call.name.eq_ignore_ascii_case("Shell") {
         let command = entry
             .call
             .arguments

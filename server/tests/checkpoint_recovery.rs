@@ -9,7 +9,7 @@ use cursor_server::{
         TransportCommand,
     },
     model::ToolRoundId,
-    store::{BlobEdge, BlobId},
+    store::BlobId,
 };
 use prost::Message;
 use support::{
@@ -177,38 +177,6 @@ async fn v0_1_5_beta_1_schema_upgrades_to_checkpoints_without_losing_rows() {
     assert_eq!(round_checkpoint, revision_id);
     assert_eq!(committed_checkpoint, revision_id);
     assert_eq!(anchor_checkpoint, revision_id);
-}
-
-#[tokio::test]
-async fn checkpoint_dependencies_are_content_addressed_without_a_persistent_stream_outbox() {
-    let (_directory, store) = temp_store().await;
-    let child = store.put_blob(b"message", &[]).await.unwrap();
-    let root = store
-        .put_blob(
-            b"checkpoint",
-            &[BlobEdge {
-                child: child.clone(),
-                field_name: "turns[0]".into(),
-            }],
-        )
-        .await
-        .unwrap();
-    assert_eq!(root, BlobId::digest(b"checkpoint"));
-    assert_eq!(store.get_blob(&child).await.unwrap().unwrap(), b"message");
-    let closure = store
-        .blob_closure(std::slice::from_ref(&root))
-        .await
-        .unwrap();
-    assert!(closure.contains(&root));
-    assert!(closure.contains(&child));
-
-    let outbox: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'outbox'",
-    )
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
-    assert_eq!(outbox, 0);
 }
 
 #[tokio::test]

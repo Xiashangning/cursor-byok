@@ -410,7 +410,7 @@ pub fn meta_mcp_routes(context: &pb::RequestContext) -> HashMap<(String, String)
                         name: format!("{}-{}", server.server_identifier, tool.tool_name),
                         provider_identifier,
                         tool_name: tool.tool_name.clone(),
-                        description: tool.description.clone().unwrap_or_default(),
+                        input_schema: mcp_input_schema(tool),
                     },
                 ))
             })

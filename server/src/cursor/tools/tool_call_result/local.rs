@@ -13,7 +13,6 @@ const SUBAGENTS_DISABLED_REMINDER: &str = "<system_reminder>The user has disable
 
 pub(crate) fn local(call: &ToolCall, message_index: usize) -> Result<ToolCompletion> {
     match normalized(&call.name).as_str() {
-        "todowrite" => todo_write(call),
         "updatecurrentstep" => update_current_step(call, message_index),
         _ => Err(Error::Protocol(format!("unsupported tool: {}", call.name))),
     }
@@ -45,8 +44,8 @@ pub(crate) fn subagents_disabled(call: &ToolCall) -> Result<ToolCompletion> {
     ))
 }
 
-fn todo_write(call: &ToolCall) -> Result<ToolCompletion> {
-    let todos = todo_items(&call.arguments);
+pub(crate) fn todo_write(call: &ToolCall, resolved: &Value) -> Result<ToolCompletion> {
+    let todos = todo_items(resolved);
     let total_count = todos.len() as i32;
     let was_merge = call
         .arguments
@@ -59,6 +58,10 @@ fn todo_write(call: &ToolCall) -> Result<ToolCompletion> {
             "TodoWrite has no Cursor representation".into(),
         ));
     };
+    tool.args = Some(pb::UpdateTodosArgs {
+        todos: todos.clone(),
+        merge: false,
+    });
     tool.result = Some(pb::UpdateTodosResult {
         result: Some(pb::update_todos_result::Result::Success(
             pb::UpdateTodosSuccess {
@@ -76,7 +79,7 @@ fn todo_write(call: &ToolCall) -> Result<ToolCompletion> {
         now_ms(),
         ToolResult {
             call_id: call.call_id.clone(),
-            content: call.arguments.to_string(),
+            content: resolved.to_string(),
             is_error: false,
             image: None,
         },

@@ -1,4 +1,5 @@
 //! Converts completed Tool work into canonical Tool results.
+mod await_shell;
 mod exec;
 mod gate;
 mod interaction;
@@ -19,9 +20,13 @@ use crate::{
 
 use super::runtime::now_ms;
 
-pub(crate) use exec::{edit_failure, from_exec};
+pub(crate) use await_shell::{
+    completed as shell_await_completed, task_status, task_status_name,
+    timed_out as shell_await_timed_out, ShellCompletion,
+};
+pub(crate) use exec::{complete_diagnostics, edit_failure, from_exec};
 pub(crate) use interaction::{complete_web_fetch, complete_web_search, from_interaction};
-pub(crate) use local::{local, subagents_disabled, todo_items};
+pub(crate) use local::{local, subagents_disabled, todo_items, todo_write};
 pub(crate) use mcp::failure as mcp_failure;
 pub(crate) use search::complete as semble;
 

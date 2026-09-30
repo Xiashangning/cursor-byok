@@ -15,11 +15,8 @@ pub(super) async fn start(
     call: &ToolCall,
     context: &ExecContext,
 ) -> Result<ToolStart> {
-    let message = match normalized(&call.name).as_str() {
-        "getmcptools" => {
-            let id = runtime.reserve_exec(call, context).await?;
-            codec::mcp_state_request(id, call)
-        }
+    let mut message = match normalized(&call.name).as_str() {
+        "getmcptools" => codec::mcp_state_request(0, call),
         "callmcptool" => {
             let server = required(call, "server")?;
             let tool = required(call, "toolName")?;
@@ -35,14 +32,27 @@ pub(super) async fn start(
                     )?),
                 });
             };
-            let id = runtime.reserve_exec(call, context).await?;
-            codec::mcp_meta_request(id, call, server, route)?
+            codec::mcp_meta_request(0, call, server, route)?
         }
-        _ => {
-            let id = runtime.reserve_exec(call, context).await?;
-            codec::request(id, call, context)?
-        }
+        _ => codec::request(0, call, context)?,
     };
+    if normalized(&call.name) == "task" {
+        let selected_context = codec::task_attachments(call).await?;
+        let Some(pb::agent_server_message::Message::ExecServerMessage(exec)) =
+            message.message.as_mut()
+        else {
+            return Err(Error::Protocol("Task has no Exec request".into()));
+        };
+        let Some(pb::exec_server_message::Message::SubagentArgs(args)) = exec.message.as_mut()
+        else {
+            return Err(Error::Protocol("Task has no SubagentArgs request".into()));
+        };
+        args.selected_context = selected_context;
+    }
+    let id = runtime.reserve_exec(call, context).await?;
+    if let Some(pb::agent_server_message::Message::ExecServerMessage(exec)) = &mut message.message {
+        exec.id = id;
+    }
     Ok(ToolStart {
         messages: vec![message],
         completion: None,

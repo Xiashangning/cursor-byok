@@ -60,9 +60,8 @@ impl PromptCompiler {
         let mut dynamic_tools = dynamic_tools.to_vec();
         dynamic_tools.sort_by(|left, right| left.name.cmp(&right.name));
         append_dynamic_tools(&mut tools, dynamic_tools)?;
-        if !model.supports_image_generation {
-            tools.retain(|tool| tool.name != "GenerateImage");
-        }
+        // No server-side image executor is installed, even for image-capable models.
+        tools.retain(|tool| tool.name != "GenerateImage");
         let fake_model_name = model
             .display_name
             .as_deref()

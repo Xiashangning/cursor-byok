@@ -6,7 +6,9 @@ use std::sync::Arc;
 use cursor_server::{
     cursor::prompting::{PromptAssets, PromptCompiler},
     cursor::TransportRegistry,
-    model::{CanonicalMessage, ModelConfigInput, ModelType, Origin, Role, OPENAI_CHAT_ENDPOINT},
+    model::{
+        CanonicalMessage, ModelConfigInput, ModelType, Origin, Role, ToolCall, OPENAI_CHAT_ENDPOINT,
+    },
     store::Store,
 };
 
@@ -40,6 +42,25 @@ pub fn registry(store: Store, provider: FakeProvider) -> TransportRegistry {
 
 pub fn user(id: &str, text: &str) -> CanonicalMessage {
     CanonicalMessage::text(id, Role::User, Origin::User, text)
+}
+
+/// A `ToolCall` fixture. `arguments` is stored both as JSON text and value;
+/// `call_id` and `model_call_id` are stable identifiers for dispatch tests.
+pub fn tool_call(
+    call_id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+    model_call_id: &str,
+) -> ToolCall {
+    ToolCall {
+        index: 0,
+        call_id: call_id.into(),
+        model_call_id: model_call_id.into(),
+        name: name.into(),
+        arguments_text: arguments.to_string(),
+        arguments,
+        argument_error: None,
+    }
 }
 
 /// An OpenAI chat-completions model fixture; only `model_id` and the context

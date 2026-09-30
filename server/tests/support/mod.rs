@@ -15,10 +15,10 @@ pub mod requests;
 pub mod wait;
 pub mod wire;
 
-pub use events::{text_response, text_response_with_usage, tool_response};
+pub use events::{text_response, text_response_with_usage, tool_calls_response, tool_response};
 pub use fake_cursor::decode_single;
 pub use fake_provider::FakeProvider;
-pub use fixtures::{openai_model_input, prompt_assets, registry, temp_store, user};
+pub use fixtures::{openai_model_input, prompt_assets, registry, temp_store, tool_call, user};
 pub use pump::{drive, text_of, PumpOutput};
 pub use requests::{resume_action, run_request, user_message_action};
 pub use wait::wait_for_provider_requests;

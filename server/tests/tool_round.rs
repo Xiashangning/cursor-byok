@@ -23,22 +23,20 @@ use cursor_server::{
     run::consume_model_cycle,
 };
 use serde_json::json;
+use support::tool_call;
 use tokio_util::sync::CancellationToken;
 
 fn call(id: &str, name: &str) -> ToolCall {
-    ToolCall {
-        index: 0,
-        call_id: id.into(),
-        model_call_id: "model:0".into(),
-        name: name.into(),
-        arguments_text: "{}".into(),
-        arguments: json!({}),
-        argument_error: None,
-    }
+    tool_call(id, name, json!({}), "model:0")
 }
 
 fn exec_context() -> ExecContext {
     ExecContext {
+        tool_definitions: support::prompt_assets()
+            .mode(cursor_server::cursor::prompting::Mode::Agent)
+            .tools
+            .clone(),
+        initial_todos: None,
         conversation_id: "conversation".into(),
         root_conversation_id: "conversation".into(),
         default_subagent_model: "model".into(),
@@ -60,7 +58,7 @@ fn mcp_context(server: &str, provider: &str, tool: &str) -> ExecContext {
             name: format!("{server}-{tool}"),
             provider_identifier: provider.into(),
             tool_name: tool.into(),
-            description: "fixture MCP tool".into(),
+            input_schema: None,
         },
     );
     context
@@ -168,6 +166,11 @@ async fn dynamic_mcp_uses_one_definition_for_stream_ui_exec_and_result() {
     let dispatcher = ToolDispatcher::new(runtime.clone());
     let mut invocation = call("browser-call", &definition.name);
     invocation.arguments = json!({"url": "https://example.com"});
+    let mut context = exec_context();
+    context.tool_definitions.push(cursor_server::model::ToolDefinition {
+        name: definition.name.clone(), description: String::new(),
+        parameters: json!({"type":"object", "properties":{"url":{"type":"string"}}, "required":["url"]}),
+    });
     let dispatched = dispatcher
         .start_batch(
             &[invocation],
@@ -179,7 +182,7 @@ async fn dynamic_mcp_uses_one_definition_for_stream_ui_exec_and_result() {
             },
             &[],
             &definitions,
-            &exec_context(),
+            &context,
         )
         .await
         .unwrap();
@@ -403,52 +406,6 @@ async fn unknown_mcp_descriptor_returns_a_tool_error_without_client_discovery() 
 }
 
 #[tokio::test]
-async fn invalid_tool_arguments_complete_as_tool_errors() {
-    let dispatcher = ToolDispatcher::new(CursorToolRuntime::default());
-    let completed = HashSet::new();
-    let started = HashSet::new();
-    let state = || ToolBatchState {
-        completed: &completed,
-        started: &started,
-        response_text: "",
-        response_thinking: "",
-    };
-
-    let mut malformed = call("call-malformed", "Read");
-    malformed.argument_error = Some("Read arguments are not valid JSON".into());
-    let mut missing = call("call-missing", "Shell");
-    missing.arguments = json!({"description": "missing command"});
-    let mut wrong_type = call("call-type", "Shell");
-    wrong_type.arguments = json!({"command": 42});
-    let mut invalid_timeout = call("call-timeout", "Shell");
-    invalid_timeout.arguments = json!({"command": "pwd", "block_until_ms": -1});
-
-    for (invocation, expected) in [
-        (malformed, "not valid JSON"),
-        (missing, "missing command"),
-        (wrong_type, "missing command"),
-        (invalid_timeout, "out of range"),
-    ] {
-        let dispatched = dispatcher
-            .start_batch(
-                &[invocation],
-                state(),
-                &[],
-                &BTreeMap::new(),
-                &exec_context(),
-            )
-            .await
-            .unwrap();
-        let completion = dispatched[0]
-            .completion
-            .as_ref()
-            .expect("invalid arguments must complete as a tool error");
-        assert!(completion.result().is_error);
-        assert!(completion.result().content.contains(expected));
-    }
-}
-
-#[tokio::test]
 async fn shell_uses_background_timeout_and_preserves_stream_identity() {
     let mut shell = call("call-shell", "Shell");
     shell.arguments = json!({
@@ -571,7 +528,7 @@ async fn shell_uses_background_timeout_and_preserves_stream_identity() {
     assert_eq!(
         completion.result().content,
         (
-            "shell running in background shell_id=42 pid=1234 terminals_folder=/tmp/terminals\nServing HTTP on port 8000\n"
+            "shell running in background shell_id=42 pid=1234 terminals_folder=/tmp/terminals\nCursor will notify you when it finishes. Outside Multitask Mode, continue independent work if possible; when none remains, you MUST call Await with this shell_id and must not end the turn. In Multitask Mode, call Await when the next step depends on this shell, or end the turn and wait for the notification.\nServing HTTP on port 8000\n"
         )
     );
     let Some(pb::tool_call::Tool::ShellToolCall(tool)) = &completion.tool_call().tool else {
@@ -872,6 +829,57 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
     assert!(!requests[2].prompt.tools.is_empty());
     assert!(requests[3].prompt.tools.is_empty());
     assert!(!requests[4].prompt.tools.is_empty());
+}
+
+#[tokio::test]
+async fn schema_failure_appends_recoverable_result_without_client_exec_or_prefix_rewrite() {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(vec![
+        ModelEvent::Start {
+            model_call_id: "invalid-schema".into(),
+        },
+        ModelEvent::ToolCallStart {
+            index: 0,
+            call_id: "invalid-shell".into(),
+            name: "Shell".into(),
+        },
+        ModelEvent::ToolCallArgumentsDelta {
+            index: 0,
+            delta: json!({"command":"pwd", "required_permissions":["network"]}).to_string(),
+        },
+        ModelEvent::ToolCallEnd { index: 0 },
+        ModelEvent::Done(FinishReason::ToolUse),
+    ]);
+    provider.push(text_response("recovered", "Corrected without execution"));
+    let registry = registry(store, provider.clone());
+    let handle = registry
+        .get_or_create("invalid-schema-request")
+        .await
+        .unwrap();
+    let mut output = handle.subscribe().unwrap();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(client_run()),
+        })
+        .await
+        .unwrap();
+    let mut seqno = 1;
+    let out = drive(&handle, &mut output, &mut seqno, |_| {
+        panic!("invalid call must never reach client Exec")
+    })
+    .await;
+    assert_eq!(out.terminal, json!({}));
+    assert!(out.execs.is_empty());
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].prompt, requests[1].prompt);
+    assert_eq!(
+        requests[0].history,
+        requests[1].history[..requests[0].history.len()]
+    );
+    assert!(requests[1].history.iter().any(|message| matches!(&message.content, ProjectedContent::ToolResult(result) if result.is_error && result.content.contains("Invalid Shell arguments"))));
 }
 
 #[tokio::test]

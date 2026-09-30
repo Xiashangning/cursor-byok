@@ -193,3 +193,81 @@ async fn subagent_parameters_apply_when_the_model_id_is_not_a_variant_slug() {
     assert_eq!(requests[0].model.context_window_tokens, Some(1_000_000));
     assert_eq!(requests[0].model.reasoning.effort.as_deref(), Some("low"));
 }
+
+#[tokio::test]
+async fn resumed_subagent_prefers_the_latest_saved_variant_over_stale_client_state() {
+    let (_directory, store) = temp_store().await;
+    let mut config = openai_model_input("provider-model", Some(200_000));
+    config.context_options = vec!["200k".into(), "1m".into()];
+    config.effort_options = vec!["low".into(), "high".into()];
+    config.reasoning_effort = Some("low".into());
+    let model = store.create_model(&config).await.unwrap();
+    let provider = FakeProvider::default();
+    for index in 0..3 {
+        provider.push(text_response(&format!("answer-{index}"), "done"));
+    }
+    let registry = registry(store.clone(), provider.clone());
+    let saved_high = format!("{}-200k-high-fast", model.model_hash);
+    let saved_low = format!("{}-200k-low", model.model_hash);
+
+    for (index, client_model, persisted_override) in [
+        (0, saved_high.as_str(), None),
+        (1, saved_high.as_str(), Some(saved_low.as_str())),
+    ] {
+        if let Some(variant) = persisted_override {
+            sqlx::query("UPDATE conversations SET model_variant = ? WHERE conversation_id = ?")
+                .bind(variant)
+                .bind("child-conversation")
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
+        let request_id = format!("child-request-{index}");
+        let handle = registry.get_or_create(&request_id).await.unwrap();
+        let mut request = run_request(
+            "child-conversation",
+            &request_id,
+            client_model,
+            None,
+            user_message_action(
+                &format!("child turn {index}"),
+                &format!("child-user-{index}"),
+                Some(pb::RequestContext::default()),
+            ),
+        );
+        let Some(pb::agent_client_message::Message::RunRequest(run)) = request.message.as_mut()
+        else {
+            unreachable!()
+        };
+        run.subagent_type_name = Some("generalPurpose".into());
+        let mut output = handle.subscribe().unwrap();
+        handle
+            .command(TransportCommand::Append {
+                seqno: 0,
+                message: Box::new(request),
+            })
+            .await
+            .unwrap();
+        let mut seqno = 1;
+        let out = drive(&handle, &mut output, &mut seqno, |_| {
+            panic!("context supplied inline")
+        })
+        .await;
+        assert_eq!(out.terminal, serde_json::json!({}));
+    }
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].model.context_window_tokens, Some(200_000));
+    assert_eq!(requests[0].model.reasoning.effort.as_deref(), Some("high"));
+    assert_eq!(requests[0].model.latency, ModelLatency::Fast);
+    assert_eq!(requests[1].model.reasoning.effort.as_deref(), Some("low"));
+    assert_eq!(requests[1].model.latency, ModelLatency::Standard);
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT model_variant FROM conversations WHERE conversation_id = ?")
+            .bind("child-conversation")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(saved_low.as_str()));
+}

@@ -122,8 +122,7 @@ pub(crate) async fn prepare(
             "hydrated_image_count": hydrated_images,
             "selected_source": "root_prompt_messages_json",
         });
-        let encoded = serde_json::to_vec(&summary)?;
-        trace.artifact("history_projection", "byok_server", &encoded, summary);
+        trace.artifact("history_projection", "byok_server", &[], summary);
     }
     let mut request_context = context::hydrate(request, context_sync).await?;
     if let Some(rules_dir) = local_rules_dir {
@@ -189,6 +188,9 @@ pub(crate) async fn prepare(
     } else {
         None
     };
+    if let (Some(messages), Some(pending)) = (base_messages.as_mut(), pending_tool_round.as_ref()) {
+        messages.extend(pending.completed_messages.iter().cloned());
+    }
     let checkpoint_mode = if request.subagent_type_name.is_some() {
         Mode::Subagent
     } else {
@@ -200,37 +202,55 @@ pub(crate) async fn prepare(
     };
     let mut model = model::requested_model(request)?;
     let requested_model_id = model.model_id.clone();
+    let subagent_conversation_exists = if request.subagent_type_name.is_some() {
+        store.conversation_exists(&conversation_id).await?
+    } else {
+        false
+    };
+    let stored_model_variant = if subagent_conversation_exists {
+        store.conversation_model_variant(&conversation_id).await?
+    } else {
+        None
+    };
     let mut selected_axis = None;
     let mut variant_applied = false;
-    if let Some(configured_model) = store.resolve_model(&model.model_id).await? {
+    let effective_model_id = stored_model_variant
+        .as_deref()
+        .unwrap_or(&requested_model_id);
+    if let Some(configured_model) = store.resolve_model(effective_model_id).await? {
         model.model_id = configured_model.model_hash.clone();
         configured_model.configure(&mut model);
-        if let Some(parts) = configured_model
-            .variant_axis()
-            .parse_slug(&configured_model.model_hash, &requested_model_id)
-        {
+        let axis = configured_model.variant_axis();
+        let parts = stored_model_variant
+            .as_deref()
+            .and_then(|variant| axis.parse_slug(&configured_model.model_hash, variant))
+            .or_else(|| axis.parse_slug(&configured_model.model_hash, &requested_model_id));
+        variant_applied = parts.is_some();
+        if let Some(parts) = parts {
             apply_variant_parts(&mut model, parts);
-            variant_applied = true;
         }
-        selected_axis = Some(configured_model.variant_axis());
-    } else if let Some((descriptor, axis, parts)) =
-        resolve_plugin_model(&plugin_models, &requested_model_id)
+        selected_axis = Some(axis);
+    } else if let Some((descriptor, axis, _)) =
+        resolve_plugin_model(&plugin_models, effective_model_id)
     {
         model.model_id = descriptor.id.clone();
+        let parts = stored_model_variant
+            .as_deref()
+            .and_then(|variant| axis.parse_slug(&descriptor.id, variant))
+            .or_else(|| axis.parse_slug(&descriptor.id, &requested_model_id));
+        variant_applied = parts.is_some();
         match parts {
-            Some(parts) => {
-                apply_variant_parts(&mut model, parts);
-                variant_applied = true;
-            }
+            Some(parts) => apply_variant_parts(&mut model, parts),
             // 插件模型没有 configure() 兜底:裸 id 按目录默认变体口径填充。
             None => apply_plugin_defaults(&mut model, &axis),
         }
         selected_axis = Some(axis);
     }
-    // 显式参数覆盖保存的默认值;根会话里也覆盖所选变体(模型选择器换档)。
-    // 子代理的变体 slug 由父代理 Task 调用烘焙,本身就是权威选择,
-    // Cursor 回程回声的 parameters 不得改写它。
-    if !variant_applied || request.subagent_type_name.is_none() {
+    // 首次子代理请求以 Task 烘焙的变体 slug 为准。续接请求以会话中
+    // 已保存的最新配置为准；Task.resume 在派发配置覆盖时先更新该值，
+    // 因而 Cursor 回传的裸模型或旧参数不会把新配置改回去。
+    // 根会话的参数始终代表模型选择器的当前选择。
+    if request.subagent_type_name.is_none() || !variant_applied {
         if let Some(requested) = request.requested_model.as_ref() {
             model::apply_requested_parameters(&mut model, requested)?;
         }
@@ -240,13 +260,14 @@ pub(crate) async fn prepare(
         .and_then(|axis| model_variant_id(axis, &model.model_id, &model));
     let dynamic = context::dynamic_mcp(request, &request_context)?;
     let subagent_model_overrides = model::overrides(request)?;
-    let model_directory = load_model_directory(store, &plugin_models).await?;
+    let configured_models = store.models().await?;
+    let model_directory = model_directory(&configured_models, &plugin_models);
     let subagents_disabled = !subagent_model_overrides.is_empty()
         && subagent_model_overrides.iter().all(|(_, selection)| {
             matches!(selection, crate::model::SubagentModelOverride::Disabled)
         });
     let available_subagent_models = if compiler.needs_available_subagent_models(checkpoint_mode) {
-        load_available_subagent_models(store, &plugin_models).await?
+        available_subagent_models(&configured_models, &plugin_models)
     } else {
         String::new()
     };
@@ -289,6 +310,16 @@ pub(crate) async fn prepare(
         }
         Some(_) | None => store.ensure_conversation(&conversation_id).await?,
     };
+    // 只有首次子任务运行负责初始化会话配置;已存在的子会话(含续接)不得
+    // 把继承的父级模型写成它的配置,显式选择由 Task 派发持久化。
+    if request.subagent_type_name.is_some() && !subagent_conversation_exists {
+        store
+            .set_conversation_model_variant(
+                &conversation_id,
+                inherited_subagent_model_variant.as_deref(),
+            )
+            .await?;
+    }
     let base_checkpoint_id = match input_id.as_deref() {
         Some(input_id) => {
             store
@@ -452,6 +483,8 @@ pub(crate) async fn prepare(
         inherited_subagent_model_variant.clone(),
         &model_directory,
         &subagent_model_overrides,
+        prompt.tools.clone(),
+        checkpoint.base_todo_state().await?,
     );
     Ok((
         PreparedRun {
@@ -621,13 +654,12 @@ fn insert_directory_model(
     directory.variants.insert(key.to_string(), axis);
 }
 
-async fn load_model_directory(
-    store: &Store,
+fn model_directory(
+    models: &[crate::model::ModelConfig],
     plugin_models: &[PluginModelDescriptor],
-) -> Result<ModelDirectory> {
-    let models = store.models().await?;
+) -> ModelDirectory {
     let mut directory = ModelDirectory::default();
-    for model in &models {
+    for model in models {
         insert_directory_model(
             &mut directory,
             &model.model_hash,
@@ -645,7 +677,7 @@ async fn load_model_directory(
             plugin_variant_axis(descriptor),
         );
     }
-    Ok(directory)
+    directory
 }
 
 /// Task 清单行:展示名 + 生效轴;轴为空时省略该段。内置与插件模型共用。
@@ -676,11 +708,10 @@ fn format_available_subagent_model(model: &crate::model::ModelConfig) -> String 
     )
 }
 
-async fn load_available_subagent_models(
-    store: &Store,
+fn available_subagent_models(
+    models: &[crate::model::ModelConfig],
     plugin_models: &[PluginModelDescriptor],
-) -> Result<String> {
-    let models = store.models().await?;
+) -> String {
     let mut lines = vec!["- inherit".to_string()];
     lines.extend(models.iter().map(format_available_subagent_model));
     lines.extend(plugin_models.iter().map(|descriptor| {
@@ -690,7 +721,7 @@ async fn load_available_subagent_models(
             &descriptor.context_options,
         )
     }));
-    Ok(lines.join("\n"))
+    lines.join("\n")
 }
 
 fn runtime_message_text(message: &CanonicalMessage) -> Result<String> {
@@ -916,7 +947,6 @@ pub(super) fn mode_from_proto(mode: i32) -> Result<Mode> {
         pb::AgentMode::Plan => Ok(Mode::Plan),
         pb::AgentMode::Debug => Ok(Mode::Debug),
         pb::AgentMode::Multitask => Ok(Mode::Multitask),
-        pb::AgentMode::Project => Ok(Mode::Projects),
         mode => Err(Error::Protocol(format!(
             "unsupported Cursor agent mode: {}",
             mode.as_str_name()
@@ -935,6 +965,8 @@ fn exec_context(
         crate::model::SubagentKind,
         crate::model::SubagentModelOverride,
     )],
+    tool_definitions: Vec<crate::model::ToolDefinition>,
+    initial_todos: serde_json::Value,
 ) -> ExecContext {
     let subagent_models = overrides
         .iter()
@@ -950,6 +982,8 @@ fn exec_context(
         })
         .collect();
     ExecContext {
+        tool_definitions,
+        initial_todos: Some(initial_todos),
         conversation_id: conversation_id.to_string(),
         root_conversation_id: request
             .conversation_group_id
@@ -1116,18 +1150,6 @@ mod tests {
     }
 
     #[test]
-    fn plugin_model_line_lists_the_effective_axes() {
-        assert_eq!(
-            format_subagent_model_line(
-                &plugin_model().display_name,
-                &plugin_model().effort_options,
-                &plugin_model().context_options,
-            ),
-            "- GPT-5 — reasoning: low, high; context: 200k, 1m"
-        );
-    }
-
-    #[test]
     fn resolve_plugin_model_accepts_exact_ids_and_variant_slugs() {
         let models = vec![plugin_model()];
         let (descriptor, _, parts) = resolve_plugin_model(&models, "plugin/codex/gpt-5").unwrap();
@@ -1285,23 +1307,8 @@ mod tests {
             mode_from_proto(pb::AgentMode::Agent as i32).unwrap(),
             Mode::Agent
         );
-        assert_eq!(
-            mode_from_proto(pb::AgentMode::Project as i32).unwrap(),
-            Mode::Projects
-        );
+        assert!(mode_from_proto(pb::AgentMode::Project as i32).is_err());
         assert!(mode_from_proto(99).is_err());
-    }
-
-    #[test]
-    fn execution_run_id_keeps_the_request_id_and_adds_eight_uuid_hex_digits() {
-        let run_id = execution_run_id("01bba7c5-9c00-4922-b1df-1f58146b5d90");
-        let suffix = run_id
-            .as_str()
-            .strip_prefix("01bba7c5-9c00-4922-b1df-1f58146b5d90:")
-            .unwrap();
-
-        assert_eq!(suffix.len(), 8);
-        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
     #[test]

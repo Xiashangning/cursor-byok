@@ -2,7 +2,9 @@
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    cursor::{checkpoint::PendingSteps, transport::TransportHandle},
+    cursor::{
+        checkpoint::PendingSteps, protocol::proto::agent::v1 as pb, transport::TransportHandle,
+    },
     model::{CheckpointId, ToolRoundId},
     store::Store,
     Error, Result,
@@ -24,6 +26,11 @@ pub(crate) enum CheckpointKind {
         stable_checkpoint_id: CheckpointId,
     },
     ToolSettled(CheckpointId),
+    TodoUpdated {
+        round_id: ToolRoundId,
+        checkpoint_id: CheckpointId,
+        todos: Vec<pb::TodoItem>,
+    },
     Final {
         checkpoint_id: CheckpointId,
         result: oneshot::Sender<Result<FinalCheckpoints>>,
@@ -56,38 +63,54 @@ impl CheckpointWorker {
         let (jobs, mut receiver) = mpsc::channel::<CheckpointJob>(32);
         let (failures, failure_receiver) = mpsc::channel(1);
         let task = tokio::spawn(async move {
+            let mut latest_state = None;
             while let Some(job) = receiver.recv().await {
                 builder.record_context_tokens(job.context_tokens);
                 let presentation = job.presentation;
                 let ready = job.ready;
                 let result = match job.kind {
                     CheckpointKind::Settled(checkpoint_id)
-                    | CheckpointKind::ToolSettled(checkpoint_id) => {
-                        publish_settled(
-                            &store,
-                            &mut builder,
-                            &handle,
-                            mode,
-                            checkpoint_id,
-                            &presentation,
-                        )
-                        .await
-                    }
+                    | CheckpointKind::ToolSettled(checkpoint_id) => publish_settled(
+                        &store,
+                        &mut builder,
+                        &handle,
+                        mode,
+                        checkpoint_id,
+                        &presentation,
+                    )
+                    .await
+                    .map(|state| latest_state = Some(state)),
                     CheckpointKind::ToolStarted {
                         round_id,
                         stable_checkpoint_id,
-                    } => {
-                        publish_started(
-                            &store,
-                            &mut builder,
-                            &handle,
-                            mode,
-                            round_id,
-                            stable_checkpoint_id,
-                            &presentation,
-                        )
-                        .await
-                    }
+                    } => publish_started(
+                        &store,
+                        &mut builder,
+                        &handle,
+                        mode,
+                        round_id,
+                        stable_checkpoint_id,
+                        &presentation,
+                    )
+                    .await
+                    .map(|state| latest_state = Some(state)),
+                    CheckpointKind::TodoUpdated {
+                        round_id,
+                        checkpoint_id,
+                        todos,
+                    } => publish_todo_updated(
+                        &store,
+                        &mut builder,
+                        &handle,
+                        mode,
+                        round_id,
+                        checkpoint_id,
+                        latest_state.as_ref(),
+                        &todos,
+                        &presentation,
+                    )
+                    .await
+                    .map(|state| latest_state = Some(state)),
                     CheckpointKind::Final {
                         checkpoint_id,
                         result,
@@ -149,10 +172,11 @@ async fn publish_settled(
     mode: i32,
     checkpoint_id: CheckpointId,
     presentation: &PendingSteps,
-) -> Result<()> {
+) -> Result<pb::ConversationStateStructure> {
     let messages = store.load_checkpoint_messages(checkpoint_id).await?;
     let checkpoint = builder.settled(&messages, mode, presentation).await?;
-    builder.publish(handle, &checkpoint).await
+    builder.publish(handle, &checkpoint).await?;
+    Ok(checkpoint.state)
 }
 
 async fn publish_started(
@@ -163,7 +187,7 @@ async fn publish_started(
     round_id: ToolRoundId,
     stable_checkpoint_id: CheckpointId,
     presentation: &PendingSteps,
-) -> Result<()> {
+) -> Result<pb::ConversationStateStructure> {
     let round = store
         .tool_round(&round_id)
         .await?
@@ -179,7 +203,44 @@ async fn publish_started(
             presentation,
         )
         .await?;
-    builder.publish(handle, &checkpoint).await
+    builder.publish(handle, &checkpoint).await?;
+    Ok(checkpoint.state)
+}
+
+async fn publish_todo_updated(
+    store: &Store,
+    builder: &mut CheckpointBuilder,
+    handle: &TransportHandle,
+    mode: i32,
+    round_id: ToolRoundId,
+    checkpoint_id: CheckpointId,
+    current: Option<&pb::ConversationStateStructure>,
+    todos: &[pb::TodoItem],
+    presentation: &PendingSteps,
+) -> Result<pb::ConversationStateStructure> {
+    let current = current.ok_or_else(|| {
+        Error::Protocol("TodoWrite completed before the active checkpoint was published".into())
+    })?;
+    let messages = store.load_checkpoint_messages(checkpoint_id).await?;
+    let start = messages
+        .iter()
+        .position(|message| {
+            matches!(
+                &message.content,
+                crate::model::MessageContent::Assistant {
+                    tool_round_id: Some(candidate),
+                    ..
+                } if candidate == &round_id
+            )
+        })
+        .ok_or_else(|| {
+            Error::Protocol("TodoWrite commit is absent from canonical history".into())
+        })?;
+    let checkpoint = builder
+        .todo_updated(current, todos, &messages[start..], mode, presentation)
+        .await?;
+    builder.publish(handle, &checkpoint).await?;
+    Ok(checkpoint.state)
 }
 
 async fn build_final(

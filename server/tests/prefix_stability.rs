@@ -25,29 +25,6 @@ fn projecting_an_append_only_context_preserves_the_complete_prefix() {
 }
 
 #[test]
-fn every_tool_result_is_projected_as_string_content() {
-    let object = serde_json::json!({"merge": false, "todos": []});
-    let messages = vec![
-        tool_result("object", object.clone()),
-        tool_result("string", serde_json::Value::String("plain text".into())),
-    ];
-    let projected = project_messages(&messages).unwrap();
-
-    let ProjectedContent::ToolResult(object_result) = &projected[0].content else {
-        panic!("expected tool result")
-    };
-    let object_text = &object_result.content;
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(object_text).unwrap(),
-        object
-    );
-    let ProjectedContent::ToolResult(string_result) = &projected[1].content else {
-        panic!("expected tool result")
-    };
-    assert_eq!(string_result.content, "plain text");
-}
-
-#[test]
 fn projected_tool_result_prefixes_remain_stable() {
     let first = vec![named_tool_result("Grep", &"x".repeat(64 * 1024))];
     let mut second = first.clone();
@@ -135,7 +112,7 @@ fn split_tool_pairs_reconstruct_the_original_provider_assistant_message() {
 #[test]
 fn every_prompt_mode_loads_the_captured_tool_set() {
     let assets = prompt_assets();
-    assert_eq!(assets.mode(Mode::Agent).tools.len(), 24);
+    assert_eq!(assets.mode(Mode::Agent).tools.len(), 23);
     assert_eq!(
         assets
             .mode(Mode::Agent)
@@ -163,9 +140,8 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "FetchMcpResource",
             "SwitchMode",
             "CallMcpTool",
-            "create-agent",
-            "send-message-to-agent",
-            "AWAIT",
+            "SendMessageToAgent",
+            "Await",
             "SembleSearch",
             "SembleFindRelated",
         ]
@@ -192,7 +168,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "1f15a80358829cf9096cd3df2c0aa9f8416c9003dd6ee57394b3f100be393390",
+        "882184c29f1907fc88e985572fff99e37b9cf002eb89f4df5645b65592c069ee",
     );
     assert_mode(
         &assets,
@@ -214,7 +190,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "f3a8989d6776dd7e20df08a821d0421ef531ff02d26a0709ac1d0ba5dc007998",
+        "6e012bcb76159a0c602d99a952ddfee43bd1ad762ea83c015d06efc7cd565414",
     );
     assert_mode(
         &assets,
@@ -238,7 +214,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "1f15a80358829cf9096cd3df2c0aa9f8416c9003dd6ee57394b3f100be393390",
+        "882184c29f1907fc88e985572fff99e37b9cf002eb89f4df5645b65592c069ee",
     );
     assert_mode(
         &assets,
@@ -261,13 +237,12 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "WebSearch",
             "Write",
             "GenerateImage",
-            "create-agent",
-            "send-message-to-agent",
-            "AWAIT",
+            "SendMessageToAgent",
+            "Await",
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "6856cb63eebe4c0822b8051cffcb82fed9e8e294a6c1bec005ddcc48b7645256",
+        "190e483d3a5a7e8cc769e964d019b68669580dadc983329ece0a0fdade07e56e",
     );
     assert_mode(
         &assets,
@@ -294,7 +269,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "f85ef20f8534664ea9fbbf19102d2a088fcbae9156831014d956a2f27788fa2a",
+        "fd2b80d67009fcf8567cc8ba2fc551a1fe74476eef193090728ec2cf25bda3fe",
     );
     assert_mode(
         &assets,
@@ -304,7 +279,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
     );
     assert_eq!(
         schema_digest(&assets.mode(Mode::Agent).tools),
-        "867b71588bfd1eea6a3bfdca2d32e08d29c6c91cc53d3d7036335b5f5a1d8187"
+        "5b7529175736a66851ccff0c694a0be72d40b00a6394df94f9ecb92daf6c6712"
     );
     let task = assets
         .mode(Mode::Agent)
@@ -333,6 +308,21 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             .as_str()
             .unwrap()
             .contains("do not combine it with `nohup`, `&`, `disown`")
+    );
+    let await_tool = assets
+        .mode(Mode::Agent)
+        .tools
+        .iter()
+        .find(|tool| tool.name == "Await")
+        .unwrap();
+    assert!(await_tool
+        .description
+        .contains("poll the terminal file through Cursor"));
+    assert_eq!(
+        await_tool.parameters["oneOf"],
+        serde_json::json!([
+            {"required": ["shell_id"]}, {"required": ["task_id"]}
+        ])
     );
     for mode in [
         Mode::Agent,
@@ -439,7 +429,7 @@ fn dynamic_mcp_tool_cannot_replace_a_mode_tool() {
 }
 
 #[test]
-fn image_generation_capability_controls_only_the_generate_image_definition() {
+fn image_generation_is_not_advertised_without_an_executor() {
     let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let without = compiler
@@ -455,8 +445,8 @@ fn image_generation_capability_controls_only_the_generate_image_definition() {
         .tools
         .iter()
         .any(|tool| tool.name == "GenerateImage"));
-    assert!(with.tools.iter().any(|tool| tool.name == "GenerateImage"));
-    assert_eq!(with.tools.len(), without.tools.len() + 1);
+    assert!(!with.tools.iter().any(|tool| tool.name == "GenerateImage"));
+    assert_eq!(with.tools, without.tools);
 }
 
 #[test]
@@ -496,10 +486,6 @@ fn subagent_uses_the_agent_prompt_and_only_the_captured_tool_delta() {
         .tools
         .iter()
         .any(|tool| tool.name == "UpdateCurrentStep"));
-}
-
-fn tool_result(id: &str, output: serde_json::Value) -> CanonicalMessage {
-    tool_result_with_call(id, &format!("call-{id}"), output)
 }
 
 fn tool_result_with_call(

@@ -7,7 +7,10 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::{
-    cursor::protocol::proto::agent::v1 as pb,
+    cursor::{
+        protocol::proto::agent::v1 as pb,
+        tools::tool_call_result::{task_status, task_status_name},
+    },
     model::{CanonicalMessage, Role},
     Error, Result,
 };
@@ -205,13 +208,6 @@ fn background_event_id(identity: &str) -> String {
     format!("{BACKGROUND_COMPLETED_PREFIX}{identity}")
 }
 
-/// 事件 ID 的身份剥离,仅供 round-trip 测试;生产路径按整条事件 ID
-/// 精确匹配,从不解析身份字段。
-#[cfg(test)]
-fn background_event_identity(event_id: &str) -> Option<&str> {
-    event_id.strip_prefix(BACKGROUND_COMPLETED_PREFIX)
-}
-
 /// 尽力提取完成项身份;字段缺失或非法时返回 None,由 project 负责报错。
 fn completion_identity(
     completion: &pb::BackgroundTaskCompletion,
@@ -230,27 +226,12 @@ fn completion_identity(
     Some(format_identity(kind, task_identity, tool_call_id))
 }
 
-fn status(completion: &pb::BackgroundTaskCompletion) -> Result<pb::BackgroundTaskStatus> {
-    let status = pb::BackgroundTaskStatus::try_from(completion.status).map_err(|_| {
-        Error::Protocol(format!(
-            "unknown background task status: {}",
-            completion.status
-        ))
-    })?;
-    if status == pb::BackgroundTaskStatus::Unspecified {
-        return Err(Error::Protocol(
-            "background task completion has unspecified status".into(),
-        ));
-    }
-    Ok(status)
-}
-
 fn completion_context(
     completion: &pb::BackgroundTaskCompletion,
     kind: pb::BackgroundTaskKind,
     agent_id: Option<&str>,
 ) -> Result<String> {
-    let status = status(completion)?;
+    let status = task_status(completion.status)?;
     let mut fields = vec![
         format!(
             "kind: {}",
@@ -260,7 +241,7 @@ fn completion_context(
                 pb::BackgroundTaskKind::Unspecified => unreachable!(),
             }
         ),
-        format!("status: {}", status_name(status)),
+        format!("status: {}", task_status_name(status)),
         format!("task_id: {}", completion.task_id),
         format!("title: {}", completion.title),
     ];
@@ -286,15 +267,6 @@ fn completion_context(
 fn optional_field(fields: &mut Vec<String>, name: &str, value: Option<&str>) {
     if let Some(value) = value.filter(|value| !value.is_empty()) {
         fields.push(format!("{name}: {value}"));
-    }
-}
-
-fn status_name(status: pb::BackgroundTaskStatus) -> &'static str {
-    match status {
-        pb::BackgroundTaskStatus::Success => "success",
-        pb::BackgroundTaskStatus::Error => "error",
-        pb::BackgroundTaskStatus::Aborted => "aborted",
-        pb::BackgroundTaskStatus::Unspecified => unreachable!(),
     }
 }
 
@@ -337,23 +309,6 @@ mod tests {
 
     fn assistant(id: &str) -> CanonicalMessage {
         CanonicalMessage::text(id, Role::Assistant, Origin::Assistant, "summary")
-    }
-
-    #[test]
-    fn identity_survives_the_event_id_round_trip_even_with_colons() {
-        // 身份字段是自由字符串,可能含 ':';事件 ID 只编码一条身份,
-        // round-trip 只做前缀剥离,不切块解析。
-        let identity = format_identity(
-            pb::BackgroundTaskKind::Subagent,
-            "agent:with:colons",
-            "call:7",
-        );
-        let event_id = background_event_id(&identity);
-        assert_eq!(
-            background_event_identity(&event_id),
-            Some(identity.as_str())
-        );
-        assert_eq!(background_event_identity("other:event"), None);
     }
 
     #[test]

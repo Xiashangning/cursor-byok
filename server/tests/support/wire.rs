@@ -121,7 +121,7 @@ pub fn subagent_result_success(id: u32, agent_id: &str) -> pb::AgentClientMessag
     }
 }
 
-/// A completed `AWAIT` result for `agent_id`.
+/// A completed `Await` result for `agent_id`.
 pub fn subagent_await_complete(id: u32, agent_id: &str) -> pb::AgentClientMessage {
     pb::AgentClientMessage {
         message: Some(pb::agent_client_message::Message::ExecClientMessage(

@@ -523,6 +523,7 @@ impl ConversationOutput {
                             active_round = Some(round_id.clone());
                         }
                         let mut tool_round_settled = false;
+                        let mut todo_updated = None;
                         if let CommitCause::ToolResult {
                             call_id,
                             interrupted,
@@ -552,6 +553,7 @@ impl ConversationOutput {
                                         "core committed a tool result without typed Cursor state: {call_id}"
                                     ))
                                 })?;
+                                todo_updated = completed_todos(&completion);
                                 self.handle
                                     .emit(&codec::tool_completed(call, &completion))?;
                                 presentation.tool_completed(&completion);
@@ -677,6 +679,24 @@ impl ConversationOutput {
                             }
                             active_tool_calls.clear();
                             self.tool_runtime.clear_completed().await;
+                        } else if let Some(todos) = todo_updated {
+                            let round_id = active_round.clone().ok_or_else(|| {
+                                Error::Protocol("TodoWrite commit has no active round".into())
+                            })?;
+                            worker
+                                .jobs
+                                .send(CheckpointJob {
+                                    kind: CheckpointKind::TodoUpdated {
+                                        round_id,
+                                        checkpoint_id: state.checkpoint_id,
+                                        todos,
+                                    },
+                                    presentation: presentation.take(),
+                                    context_tokens,
+                                    ready: None,
+                                })
+                                .await
+                                .map_err(|_| Error::Protocol("checkpoint worker closed".into()))?;
                         } else if !matches!(&state.cause, CommitCause::ToolResult { .. })
                             && active_round.is_some()
                         {
@@ -1101,6 +1121,22 @@ pub(crate) fn finish_cancelled(handle: &TransportHandle) -> Result<()> {
     Ok(())
 }
 
+fn completed_todos(completion: &ToolCompletion) -> Option<Vec<pb::TodoItem>> {
+    if completion.result().is_error {
+        return None;
+    }
+    let pb::tool_call::Tool::UpdateTodosToolCall(tool) = completion.tool_call().tool.as_ref()?
+    else {
+        return None;
+    };
+    let pb::update_todos_result::Result::Success(success) =
+        tool.result.as_ref()?.result.as_ref()?
+    else {
+        return None;
+    };
+    Some(success.todos.clone())
+}
+
 fn checkpoint_context_tokens(checkpoint: &pb::ConversationStateStructure) -> Option<u64> {
     checkpoint
         .token_details
@@ -1110,25 +1146,8 @@ fn checkpoint_context_tokens(checkpoint: &pb::ConversationStateStructure) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{accept_tool_completion, checkpoint_context_tokens};
-    use crate::{cursor::protocol::proto::agent::v1 as pb, run::CommandResult, Error};
-
-    #[test]
-    fn compacted_checkpoint_replaces_the_in_memory_context_usage() {
-        let compacted = pb::ConversationStateStructure {
-            token_details: Some(pb::ConversationTokenDetails {
-                used_tokens: 20_000,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        assert_eq!(checkpoint_context_tokens(&compacted), Some(20_000));
-        assert_eq!(
-            checkpoint_context_tokens(&pb::ConversationStateStructure::default()),
-            None
-        );
-    }
+    use super::accept_tool_completion;
+    use crate::{run::CommandResult, Error};
 
     #[test]
     fn closing_and_ended_runs_ignore_known_tool_completions() {

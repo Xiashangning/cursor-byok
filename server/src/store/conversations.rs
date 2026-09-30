@@ -27,6 +27,50 @@ impl Store {
         }))
     }
 
+    /// 会话行是否存在;子任务据此区分首次运行与续接。
+    pub(crate) async fn conversation_exists(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE conversation_id = ?)",
+        )
+        .bind(conversation_id.as_str())
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    pub(crate) async fn conversation_model_variant(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT model_variant FROM conversations WHERE conversation_id = ?",
+        )
+        .bind(conversation_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
+    pub(crate) async fn set_conversation_model_variant(
+        &self,
+        conversation_id: &ConversationId,
+        model_variant: Option<&str>,
+    ) -> Result<()> {
+        let _write = self.writes.lock().await;
+        sqlx::query(
+            "UPDATE conversations SET model_variant = ?, updated_at_ms = ?
+             WHERE conversation_id = ?",
+        )
+        .bind(model_variant)
+        .bind(now_ms())
+        .bind(conversation_id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn ensure_conversation_tx(
         tx: &mut Transaction<'_, Sqlite>,
         conversation_id: &ConversationId,
@@ -96,5 +140,48 @@ impl Store {
                 "run {run_id} no longer owns conversation {conversation_id} at checkpoint {expected}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn conversation_model_variant_round_trips_and_clears() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let conversation_id = ConversationId::new("conversation-1");
+        store.ensure_conversation(&conversation_id).await.unwrap();
+
+        assert_eq!(
+            store
+                .conversation_model_variant(&conversation_id)
+                .await
+                .unwrap(),
+            None
+        );
+        store
+            .set_conversation_model_variant(&conversation_id, Some("model-272k-high"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .conversation_model_variant(&conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("model-272k-high")
+        );
+        store
+            .set_conversation_model_variant(&conversation_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .conversation_model_variant(&conversation_id)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }

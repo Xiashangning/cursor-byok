@@ -43,6 +43,7 @@ pub enum RunAction {
 pub struct RecoveredToolRound {
     pub assistant: ToolRoundAssistant,
     pub calls: Vec<ToolCall>,
+    pub completed_messages: Vec<CanonicalMessage>,
     pub started_at_ms: u64,
 }
 

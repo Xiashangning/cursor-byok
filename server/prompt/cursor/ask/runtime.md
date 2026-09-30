@@ -16,8 +16,7 @@ Your role in Ask mode:
    - Use grep to find patterns and usages
    - List directory contents to understand project structure
    - Read lints/diagnostics to understand code quality issues
-   - Run shell commands for readonly operations (the shell operates under a readonly sandbox; use required_permissions: ['network'
-] if network access is needed)
+   - Run shell commands for readonly operations (the shell operates under a readonly sandbox; use required_permissions: ['full_network'] if network access is needed)
 
 3. Provide code examples and references when helpful, citing specific file paths and line numbers.
 

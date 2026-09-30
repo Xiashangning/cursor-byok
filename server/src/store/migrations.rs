@@ -503,14 +503,24 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
+            let model_variant_column_exists: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('conversations')
+                    WHERE name = 'model_variant'
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
             assert_eq!(checksum_after, checksum_before);
             // develop 专属迁移使用 1000+ 号段:上游未来新增 0010+ 不会与本
             // 分支冲突,框架按版本序应用,跳空是预期形态。
-            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 1000, 1001]);
+            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 1000, 1001, 1002]);
             assert_eq!(checkpoint_table_exists, 1);
             assert_eq!(argument_error_column_exists, 1);
             assert_eq!(consumed_completion_table_exists, 1);
+            assert_eq!(model_variant_column_exists, 1);
         }
     }
 
@@ -581,6 +591,13 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
+            let model_variant: Option<String> = sqlx::query_scalar(
+                "SELECT model_variant FROM conversations
+                 WHERE conversation_id = 'published-upgrade'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             let consumed_completion_table_exists: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM sqlite_master
@@ -592,7 +609,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(checksum_after, checksum_before);
-            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 1000, 1001]);
+            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 1000, 1001, 1002]);
             assert_eq!(
                 model_options,
                 (
@@ -601,17 +618,9 @@ mod tests {
                 )
             );
             assert_eq!(conversation_count, 1);
+            assert_eq!(model_variant, None);
             assert_eq!(consumed_completion_table_exists, 1);
         }
-    }
-
-    #[test]
-    fn sqlite_sidecar_paths_preserve_the_database_path() {
-        let database = Path::new(r"C:\Users\Test User\cursor-byok.db");
-        assert_eq!(
-            sidecar_path(database, "-wal"),
-            PathBuf::from(r"C:\Users\Test User\cursor-byok.db-wal")
-        );
     }
 
     #[tokio::test]

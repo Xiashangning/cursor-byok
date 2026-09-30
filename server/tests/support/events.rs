@@ -52,20 +52,26 @@ pub fn tool_response(
     name: &str,
     arguments: &str,
 ) -> Vec<ModelEvent> {
-    vec![
-        ModelEvent::Start {
-            model_call_id: model_call_id.into(),
-        },
-        ModelEvent::ToolCallStart {
-            index: 0,
-            call_id: call_id.into(),
-            name: name.into(),
-        },
-        ModelEvent::ToolCallArgumentsDelta {
-            index: 0,
-            delta: arguments.into(),
-        },
-        ModelEvent::ToolCallEnd { index: 0 },
-        ModelEvent::Done(FinishReason::ToolUse),
-    ]
+    tool_calls_response(model_call_id, &[(call_id, name, arguments.to_owned())])
+}
+/// A batch of tool calls that ends the model cycle with `FinishReason::ToolUse`.
+/// Each entry is `(call_id, name, arguments)`; the index is the position.
+pub fn tool_calls_response(model_call_id: &str, calls: &[(&str, &str, String)]) -> Vec<ModelEvent> {
+    let mut events = vec![ModelEvent::Start {
+        model_call_id: model_call_id.into(),
+    }];
+    for (index, (call_id, name, arguments)) in calls.iter().enumerate() {
+        events.push(ModelEvent::ToolCallStart {
+            index,
+            call_id: (*call_id).into(),
+            name: (*name).into(),
+        });
+        events.push(ModelEvent::ToolCallArgumentsDelta {
+            index,
+            delta: arguments.clone(),
+        });
+        events.push(ModelEvent::ToolCallEnd { index });
+    }
+    events.push(ModelEvent::Done(FinishReason::ToolUse));
+    events
 }

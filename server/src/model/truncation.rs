@@ -19,7 +19,7 @@ pub(crate) fn truncate_edges(label: &str, content: &str, limit: usize) -> String
     }
 }
 
-fn utf8_prefix(value: &str, limit: usize) -> &str {
+pub(crate) fn utf8_prefix(value: &str, limit: usize) -> &str {
     let mut end = limit.min(value.len());
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;

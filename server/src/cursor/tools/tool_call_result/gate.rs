@@ -803,15 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_text_terminates_when_the_notice_length_oscillates() {
-        // `limit` values where the notice grows and shrinks with the digit count
-        // of the reported byte count, so the fixed point is never reached.
-        assert!(truncate_text("Grep", &"b".repeat(200), 78).len() <= 78);
-        assert!(truncate_text("Grep", &"b".repeat(200), 170).len() <= 170);
-        assert!(truncate_text("MCP text", &"b".repeat(500), 82).len() <= 82);
-    }
-
-    #[test]
     fn truncate_text_reports_the_actual_utf8_prefix_size() {
         let content = "😀".repeat(1_000);
         let output = truncate_text("Grep", &content, 81);

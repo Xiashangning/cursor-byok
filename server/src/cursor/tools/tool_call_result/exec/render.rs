@@ -6,31 +6,31 @@ use crate::{cursor::protocol::proto::agent::v1 as pb, model::ToolCall, Error, Re
 pub(super) fn read(result: &pb::ReadResult, call: &ToolCall) -> Result<pb::ReadToolResult> {
     use pb::{read_result::Result as Input, read_tool_result::Result as Output};
     let result = match result.result.as_ref() {
-        Some(Input::Success(success)) => Output::Success(pb::ReadToolSuccess {
-            is_empty: match success.output.as_ref() {
-                Some(pb::read_success::Output::Content(content)) => content.is_empty(),
-                Some(pb::read_success::Output::Data(data)) => data.is_empty(),
-                None => true,
-            },
-            exceeded_limit: success.truncated,
-            total_lines: success.total_lines.max(0) as u32,
-            file_size: success.file_size.max(0).min(u32::MAX as i64) as u32,
-            path: success.path.clone(),
-            read_range: read_range(call),
-            include_line_numbers: call
-                .arguments
-                .get("include_line_numbers")
-                .and_then(Value::as_bool),
-            output: success.output.as_ref().map(|output| match output {
-                pb::read_success::Output::Content(content) => {
-                    pb::read_tool_success::Output::Content(content.clone())
-                }
-                pb::read_success::Output::Data(data) => {
-                    pb::read_tool_success::Output::Data(data.clone())
-                }
-            }),
-            ..Default::default()
-        }),
+        Some(Input::Success(success)) => {
+            let total_lines = success.total_lines.max(0) as u32;
+            Output::Success(pb::ReadToolSuccess {
+                is_empty: match success.output.as_ref() {
+                    Some(pb::read_success::Output::Content(content)) => content.is_empty(),
+                    Some(pb::read_success::Output::Data(data)) => data.is_empty(),
+                    None => true,
+                },
+                exceeded_limit: success.truncated,
+                total_lines,
+                file_size: success.file_size.max(0).min(u32::MAX as i64) as u32,
+                path: success.path.clone(),
+                read_range: read_range(call, total_lines),
+                include_line_numbers: None,
+                output: success.output.as_ref().map(|output| match output {
+                    pb::read_success::Output::Content(content) => {
+                        pb::read_tool_success::Output::Content(content.clone())
+                    }
+                    pb::read_success::Output::Data(data) => {
+                        pb::read_tool_success::Output::Data(data.clone())
+                    }
+                }),
+                ..Default::default()
+            })
+        }
         Some(Input::Error(value)) => error_read(&value.error),
         Some(Input::Rejected(value)) => error_read(&value.reason),
         Some(Input::FileNotFound(value)) => error_read(&format!("file not found: {}", value.path)),
@@ -51,17 +51,24 @@ fn error_read(message: &str) -> pb::read_tool_result::Result {
     })
 }
 
-fn read_range(call: &ToolCall) -> Option<pb::ReadRange> {
-    let start_line = call
+fn read_range(call: &ToolCall, total_lines: u32) -> Option<pb::ReadRange> {
+    let offset = call
         .arguments
         .get("offset")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    // schema 约定负 offset 从文件末尾倒数(-1 是最后一行)。
+    let start_line = if offset < 0 {
+        let from_end = u32::try_from(offset.unsigned_abs()).ok()?;
+        total_lines.saturating_sub(from_end.saturating_sub(1))
+    } else {
+        u32::try_from(offset).ok()?
+    };
     let limit = call
         .arguments
         .get("limit")
         .and_then(Value::as_u64)
-        .map(|value| value as u32)?;
+        .and_then(|value| u32::try_from(value).ok())?;
     Some(pb::ReadRange {
         start_line,
         end_line: start_line.saturating_add(limit),
