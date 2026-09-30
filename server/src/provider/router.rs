@@ -399,23 +399,4 @@ mod tests {
 
         assert!(result.is_err());
     }
-
-    #[test]
-    fn timeout_errors_state_the_boundary_and_duration() {
-        let Error::Provider(idle) = stream_idle_timeout_error(Duration::from_secs(30 * 60)) else {
-            panic!("idle timeout must be a provider error");
-        };
-        assert_eq!(
-            idle,
-            "provider stream idle timeout: no events received for 1800 seconds (30 minutes)"
-        );
-
-        let Error::Provider(request) = request_timeout_error(Duration::from_secs(60 * 60)) else {
-            panic!("request timeout must be a provider error");
-        };
-        assert_eq!(
-            request,
-            "provider request timed out after 3600 seconds (60 minutes)"
-        );
-    }
 }

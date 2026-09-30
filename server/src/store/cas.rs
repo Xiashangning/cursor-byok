@@ -85,24 +85,4 @@ impl Store {
             .await?
             .map(|row| row.get(0)))
     }
-
-    pub async fn blob_closure(&self, roots: &[BlobId]) -> Result<Vec<BlobId>> {
-        let mut seen = std::collections::HashSet::new();
-        let mut stack = roots.to_vec();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            let rows = sqlx::query("SELECT child_blob_id FROM blob_edges WHERE parent_blob_id = ?")
-                .bind(id.as_bytes().as_slice())
-                .fetch_all(&self.pool)
-                .await?;
-            for row in rows {
-                stack.push(BlobId::from_bytes(row.get::<Vec<u8>, _>(0).as_slice())?);
-            }
-        }
-        let mut closure: Vec<_> = seen.into_iter().collect();
-        closure.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        Ok(closure)
-    }
 }

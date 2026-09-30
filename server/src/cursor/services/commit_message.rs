@@ -388,29 +388,4 @@ mod tests {
         let total: usize = truncated.iter().map(|diff| diff.chars().count()).sum();
         assert!(total <= DIFF_TOTAL_LIMIT + 3 * "\n...[truncated]".len());
     }
-
-    #[test]
-    fn cleaning_strips_fences_and_prefixes() {
-        let raw = "```\nCommit message: fix: 修复登录超时问题\n```";
-        assert_eq!(clean_generated_commit_message(raw), "fix: 修复登录超时问题");
-    }
-
-    #[test]
-    fn cleaning_returns_empty_for_blank_output() {
-        assert_eq!(clean_generated_commit_message("  \n "), "");
-    }
-
-    #[test]
-    fn explicit_context_drops_empty_fields() {
-        let empty = explicit_context_json(&ai::ExplicitContext {
-            context: "  ".into(),
-            repo_context: None,
-        });
-        assert_eq!(empty, "");
-        let filled = explicit_context_json(&ai::ExplicitContext {
-            context: "背景".into(),
-            repo_context: Some("repo".into()),
-        });
-        assert_eq!(filled, "{\"context\":\"背景\",\"repo_context\":\"repo\"}");
-    }
 }

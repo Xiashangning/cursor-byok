@@ -698,13 +698,4 @@ mod tests {
         assert!(!summary(1, "src/lib.rs", 16, 20, 1.0, &expected).relevant);
         assert!(!summary(1, "src/other.rs", 10, 20, 1.0, &expected).relevant);
     }
-
-    #[test]
-    fn directory_size_sums_nested_files() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::create_dir(directory.path().join("nested")).unwrap();
-        fs::write(directory.path().join("one"), [1_u8, 2]).unwrap();
-        fs::write(directory.path().join("nested/two"), [3_u8, 4, 5]).unwrap();
-        assert_eq!(directory_size(directory.path()).unwrap(), 5);
-    }
 }

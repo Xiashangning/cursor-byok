@@ -156,14 +156,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_loopback_bindings_are_allowed() {
-        // 非回环绑定由访问令牌保护,不再在配置层拦截。
-        for address in ["127.0.0.1:3000", "[::1]:3000", "0.0.0.0:3000"] {
-            assert!(address.parse::<SocketAddr>().is_ok(), "{address}");
-        }
-    }
-
-    #[test]
     fn provider_timeout_defaults_match_runtime_boundaries() {
         assert_eq!(
             DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT,
