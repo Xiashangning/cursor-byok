@@ -30,7 +30,7 @@ use tower::ServiceExt;
 const REQUEST_ID: &str = "slow-subagent-start";
 const APPEND: &str = "/aiserver.v1.BidiService/BidiAppend";
 
-async fn setup() -> (
+async fn setup(detailed_logging: bool) -> (
     tempfile::TempDir,
     TransportRegistry,
     fake_provider::FakeProvider,
@@ -38,6 +38,8 @@ async fn setup() -> (
     String,
 ) {
     let (directory, store) = fixtures::temp_store().await;
+    // Each new request resolves the current logging setting in the trace worker.
+    store.set_detailed_logging(detailed_logging).await.unwrap();
     let model = store
         .create_model(&fixtures::openai_model_input("test-model", None))
         .await
@@ -108,21 +110,26 @@ enum StartupModel {
 
 #[tokio::test]
 async fn heartbeat_overtaking_initial_upload_does_not_abort_subagent() {
-    exercise_startup(StartupModel::Direct, true).await;
+    exercise_startup(StartupModel::Direct, true, false).await;
 }
 
 #[tokio::test]
 async fn configured_hosted_alias_runs_byok_and_completes() {
-    exercise_startup(StartupModel::ConfiguredAlias, false).await;
+    exercise_startup(StartupModel::ConfiguredAlias, false, false).await;
 }
 
 #[tokio::test]
 async fn model_details_alias_runs_byok_and_completes() {
-    exercise_startup(StartupModel::ModelDetailsAlias, false).await;
+    exercise_startup(StartupModel::ModelDetailsAlias, false, false).await;
 }
 
-async fn exercise_startup(model: StartupModel, hold_upload: bool) {
-    let (_directory, registry, provider, router, model_id) = setup().await;
+#[tokio::test]
+async fn detailed_trace_records_readable_http_content() {
+    exercise_startup(StartupModel::ConfiguredAlias, false, true).await;
+}
+
+async fn exercise_startup(model: StartupModel, hold_upload: bool, detailed_trace: bool) {
+    let (_directory, registry, provider, router, model_id) = setup(detailed_trace).await;
     let selected = if matches!(model, StartupModel::Direct) {
         model_id.clone()
     } else {
@@ -304,12 +311,91 @@ async fn exercise_startup(model: StartupModel, hold_upload: bool) {
     .unwrap();
     assert_eq!(result.0, "completed");
     assert_eq!(result.1, 0);
+    if detailed_trace {
+        assert_detailed_trace(registry.store(), &model_id).await;
+    }
     registry.shutdown().await;
+}
+
+async fn assert_detailed_trace(store: &cursor_server::store::Store, routed_model: &str) {
+    let trace = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(trace) = store.cursor_trace(REQUEST_ID).await.unwrap() {
+                if trace.status == "completed" {
+                    break trace;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(trace.route, "local_byok");
+    assert_eq!(trace.model_id.as_deref(), Some(routed_model));
+    assert_eq!(trace.http_status, Some(200));
+    assert!(trace.request_bytes > 0);
+    assert!(trace.response_bytes > 0);
+
+    let artifacts = store.cursor_trace_artifacts(REQUEST_ID).await.unwrap();
+    assert!(!artifacts.is_empty());
+    assert!(artifacts
+        .iter()
+        .all(|artifact| artifact.artifact_type != "run_sse_request"));
+
+    let client_index = artifacts
+        .iter()
+        .position(|artifact| {
+            artifact.artifact_type == "client_message"
+                && artifact.metadata["message_type"] == "run_request"
+        })
+        .expect("decoded RunRequest trace");
+    assert!(client_index > 0);
+    assert_eq!(artifacts[client_index - 1].artifact_type, "bidi_request");
+    assert_eq!(
+        artifacts[client_index - 1].metadata["append_seqno"],
+        artifacts[client_index].metadata["append_seqno"]
+    );
+    let client: serde_json::Value = serde_json::from_slice(&artifacts[client_index].data).unwrap();
+    assert_eq!(client["runRequest"]["conversationId"], "startup-child");
+    assert_eq!(
+        client["runRequest"]["requestedModel"]["modelId"],
+        "cursor-grok-4.6-high-fast"
+    );
+    assert_eq!(
+        client["runRequest"]["action"]["userMessageAction"]["userMessage"]["text"],
+        "Return the child result"
+    );
+
+    let server = artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.artifact_type == "server_message"
+                && artifact.metadata["message_type"] == "interaction_update:turn_ended"
+        })
+        .expect("decoded TurnEnded trace");
+    let server: serde_json::Value = serde_json::from_slice(&server.data).unwrap();
+    assert!(server["interactionUpdate"]["turnEnded"].is_object());
+
+    let checkpoint = artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "checkpoint")
+        .expect("readable checkpoint trace");
+    assert_eq!(checkpoint.metadata["emit_status"], "sent");
+    assert!(serde_json::from_slice::<serde_json::Value>(&checkpoint.data).is_ok());
+    assert!(artifacts
+        .iter()
+        .any(|artifact| artifact.artifact_type == "blob_set"));
+    assert!(artifacts
+        .iter()
+        .any(|artifact| artifact.artifact_type == "run_sse_chunk"));
+    assert!(artifacts.iter().any(|artifact| {
+        artifact.artifact_type == "history_projection" && artifact.data.is_empty()
+    }));
 }
 
 #[tokio::test]
 async fn initial_append_still_requires_a_model() {
-    let (_directory, registry, _provider, router, _model) = setup().await;
+    let (_directory, registry, _provider, router, _model) = setup(true).await;
     let response = tokio::time::timeout(
         Duration::from_secs(1),
         router.oneshot(post(
@@ -325,11 +411,41 @@ async fn initial_append_still_requires_a_model() {
     .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(registry.local(REQUEST_ID).await.is_none());
+    let trace = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(trace) = registry.store().cursor_trace(REQUEST_ID).await.unwrap() {
+                if trace.status == "error" {
+                    break trace;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(trace
+        .error_message
+        .as_deref()
+        .is_some_and(|message| message.contains("must select a model")));
+    let artifacts = registry
+        .store()
+        .cursor_trace_artifacts(REQUEST_ID)
+        .await
+        .unwrap();
+    assert_eq!(
+        artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_type.as_str())
+            .collect::<Vec<_>>(),
+        ["bidi_request", "client_message"]
+    );
+    assert_eq!(artifacts[0].metadata["accepted"], false);
+    assert_eq!(artifacts[0].metadata["route_outcome"], "missing_transport");
 }
 
 #[tokio::test]
 async fn early_append_uses_the_eventual_upstream_route() {
-    let (_directory, registry, _provider, router, _model) = setup().await;
+    let (_directory, registry, _provider, router, _model) = setup(false).await;
     let mut request = post(
         APPEND,
         append_body(
@@ -367,7 +483,7 @@ async fn early_append_uses_the_eventual_upstream_route() {
 
 #[tokio::test]
 async fn orphan_followup_times_out_without_creating_a_transport() {
-    let (_directory, registry, _provider, router, _model) = setup().await;
+    let (_directory, registry, _provider, router, _model) = setup(false).await;
     let response = tokio::time::timeout(
         Duration::from_secs(35),
         router.oneshot(post(
@@ -394,7 +510,7 @@ async fn orphan_followup_times_out_without_creating_a_transport() {
 
 #[tokio::test]
 async fn alias_settings_reject_missing_targets_and_reserved_ids() {
-    let (_directory, registry, _provider, _router, model_id) = setup().await;
+    let (_directory, registry, _provider, _router, model_id) = setup(false).await;
     let store = registry.store();
     assert!(store.cursor_model_aliases().await.unwrap().is_empty());
     for (alias, target) in [
@@ -417,7 +533,7 @@ async fn alias_settings_reject_missing_targets_and_reserved_ids() {
 
 #[tokio::test]
 async fn local_selections_and_variants_take_priority_over_saved_hosted_aliases() {
-    let (_directory, registry, _provider, _router, target) = setup().await;
+    let (_directory, registry, _provider, _router, target) = setup(false).await;
     let store = registry.store();
     store
         .set_cursor_model_aliases(std::collections::BTreeMap::from([(
@@ -472,7 +588,7 @@ async fn local_selections_and_variants_take_priority_over_saved_hosted_aliases()
 
 #[tokio::test]
 async fn deleted_alias_target_is_rejected_instead_of_forwarded() {
-    let (_directory, registry, _provider, router, model_id) = setup().await;
+    let (_directory, registry, _provider, router, model_id) = setup(false).await;
     registry
         .store()
         .set_cursor_model_aliases(std::collections::BTreeMap::from([(

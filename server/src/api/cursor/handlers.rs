@@ -18,12 +18,12 @@ use crate::{
     },
     cursor::{
         protocol::{
-            connect,
+            connect, json as protocol_json,
             proto::{agent::v1 as agent, aiserver::v1 as ai},
         },
         services::{
             account, analytics, commit_message, compatibility, entitlement::FreeEntitlementCache,
-            knowledge, model_catalog, server_config, tab,
+            knowledge, model_catalog, observability::DecodedMessage, server_config, tab,
         },
         transport::{TransportParent, TransportRegistry, TransportRoute},
     },
@@ -214,13 +214,9 @@ async fn run_sse_handler(
     let (parts, body) = buffered(request, RUN_REQUEST_LIMIT).await?;
     let request: agent::BidiRequestId = connect::decode_unary(&body)?;
     let route = registry.wait_route(&request.request_id).await;
+    // 订阅可能晚于 trace 行创建;resume 让已存在的 trace 立刻进入记录状态。
     let trace = registry.trace(&request.request_id);
     trace.resume();
-    trace.request(
-        "run_sse_request",
-        body.clone(),
-        serde_json::json!({"request_id": request.request_id}),
-    );
     match route {
         crate::cursor::transport::TransportRoute::Local => {
             run_sse::stream(&registry, &request.request_id).await
@@ -251,11 +247,27 @@ async fn bidi_handler(
     let (parts, body) = buffered(request, BIDI_REQUEST_LIMIT).await?;
     let request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
     let mut decoded = bidi::decode(&request)?;
-    let first_model = decoded.model_id().map(str::to_owned);
-    decoded.resolve_model_aliases(registry.store()).await?;
+    let has_initial_model = decoded.model_id().is_some();
     let conversation_id = decoded.conversation_id().map(str::to_owned);
     let trace_metadata = decoded.trace_metadata();
     let trace = registry.trace(&decoded.request_id);
+    // Render before alias resolution so `client_message` is the message Cursor
+    // actually sent; routing metadata and the raw frame remain adjacent to it.
+    let decoded_message = trace
+        .is_enabled()
+        .then(|| protocol_json::render_client(&decoded.message))
+        .flatten()
+        .map(|rendered| DecodedMessage {
+            data: rendered.json.into(),
+            metadata: serde_json::json!({
+                "append_seqno": trace_metadata["append_seqno"],
+                "message_type": trace_metadata["message_type"],
+                "truncated": rendered.truncated,
+                "total_bytes": rendered.total_bytes,
+            }),
+        });
+    decoded.resolve_model_aliases(registry.store()).await?;
+    let routed_model = decoded.model_id().map(str::to_owned);
     let local = if let Some(model_id) = decoded.model_id() {
         // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
         if routes_to_local_model(registry.store(), model_id).await? {
@@ -281,29 +293,52 @@ async fn bidi_handler(
         // BidiAppend uploads are concurrent. A small heartbeat can arrive before
         // the much larger seqno=0 RunRequest has finished uploading/decoding.
         // Wait for its model-selected route; never guess local vs upstream.
-        let route = tokio::time::timeout(
+        let route = match tokio::time::timeout(
             INITIAL_APPEND_WAIT,
             registry.wait_route(&decoded.request_id),
         )
         .await
-        .map_err(|_| {
-            crate::Error::Protocol(
-                "timed out waiting for the initial BidiAppend model selection".into(),
-            )
-        })?;
+        {
+            Ok(route) => route,
+            Err(_) => {
+                let error = crate::Error::Protocol(
+                    "timed out waiting for the initial BidiAppend model selection".into(),
+                );
+                let message = error.to_string();
+                trace.begin(conversation_id.as_deref(), "local_byok", None);
+                trace.bidi_append(
+                    body,
+                    trace_outcome(
+                        trace_metadata,
+                        false,
+                        "route_timeout",
+                        Some(message.clone()),
+                    ),
+                    decoded_message,
+                );
+                trace.finish(Some(&message));
+                return Err(error);
+            }
+        };
         matches!(route, TransportRoute::Local)
     } else {
-        trace.resume();
-        trace.request(
-            "bidi_request",
-            body.clone(),
-            trace_outcome(trace_metadata, false, "missing_transport", None),
+        let error = crate::Error::Protocol("first BidiAppend message must select a model".into());
+        let message = error.to_string();
+        trace.begin(conversation_id.as_deref(), "local_byok", None);
+        trace.bidi_append(
+            body,
+            trace_outcome(
+                trace_metadata,
+                false,
+                "missing_transport",
+                Some(message.clone()),
+            ),
+            decoded_message,
         );
-        return Err(crate::Error::Protocol(
-            "first BidiAppend message must select a model".into(),
-        ));
+        trace.finish(Some(&message));
+        return Err(error);
     };
-    if first_model.is_some() {
+    if has_initial_model {
         trace.begin(
             conversation_id.as_deref(),
             if local {
@@ -311,19 +346,19 @@ async fn bidi_handler(
             } else {
                 "cursor_official"
             },
-            first_model.as_deref(),
+            routed_model.as_deref(),
         );
     } else {
         trace.resume();
     }
     if !local {
-        if first_model.is_some() {
+        if has_initial_model {
             registry.mark_upstream(&decoded.request_id).await;
         }
-        trace.request(
-            "bidi_request",
+        trace.bidi_append(
             body.clone(),
             trace_outcome(trace_metadata, true, "upstream", None),
+            decoded_message.clone(),
         );
         return proxy::forward(
             Extension(proxy),
@@ -334,8 +369,7 @@ async fn bidi_handler(
     let parent = match parent_headers(&parts.headers) {
         Ok(parent) => parent,
         Err(error) => {
-            trace.request(
-                "bidi_request",
+            trace.bidi_append(
                 body,
                 trace_outcome(
                     trace_metadata,
@@ -343,19 +377,19 @@ async fn bidi_handler(
                     "invalid_parent",
                     Some(error.to_string()),
                 ),
+                decoded_message.clone(),
             );
             return Err(error);
         }
     };
     match bidi::append(&registry, decoded, parent).await {
-        Ok(_) => trace.request(
-            "bidi_request",
+        Ok(_) => trace.bidi_append(
             body,
             trace_outcome(trace_metadata, true, "local", None),
+            decoded_message.clone(),
         ),
         Err(error) => {
-            trace.request(
-                "bidi_request",
+            trace.bidi_append(
                 body,
                 trace_outcome(
                     trace_metadata,
@@ -363,6 +397,7 @@ async fn bidi_handler(
                     "command_rejected",
                     Some(error.to_string()),
                 ),
+                decoded_message.clone(),
             );
             return Err(error);
         }

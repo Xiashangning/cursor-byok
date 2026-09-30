@@ -131,6 +131,16 @@ impl Store {
         })
     }
 
+    /// 一次本地 Run 关联的 Cursor request id;追踪与 provider 调用靠它关联。
+    pub(crate) async fn run_cursor_request_id(&self, run_id: &str) -> Result<Option<String>> {
+        let request_id: Option<Option<String>> =
+            sqlx::query_scalar("SELECT cursor_request_id FROM runs WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(request_id.flatten())
+    }
+
     pub async fn active_run_for_cursor_request(
         &self,
         cursor_request_id: &str,

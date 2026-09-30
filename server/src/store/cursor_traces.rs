@@ -31,8 +31,8 @@ impl Store {
         route: &str,
         model_id: Option<&str>,
     ) -> Result<bool> {
-        if self.cursor_trace_exists(request_id).await? {
-            return Ok(true);
+        if let Some(status) = self.cursor_trace_status(request_id).await? {
+            return Ok(status == "running");
         }
         if !self.detailed_logging().await? {
             return Ok(false);
@@ -53,13 +53,13 @@ impl Store {
         Ok(true)
     }
 
-    pub async fn cursor_trace_exists(&self, request_id: &str) -> Result<bool> {
-        Ok(sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM cursor_run_traces WHERE request_id = ?)",
+    pub(crate) async fn cursor_trace_status(&self, request_id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT status FROM cursor_run_traces WHERE request_id = ?")
+                .bind(request_id)
+                .fetch_optional(&self.pool)
+                .await?,
         )
-        .bind(request_id)
-        .fetch_one(&self.pool)
-        .await?)
     }
 
     pub async fn append_cursor_trace_request(
@@ -183,10 +183,8 @@ impl Store {
         let _write = self.writes.lock().await;
         sqlx::query(
             "UPDATE cursor_run_traces
-             SET status = 'running', http_status = ?,
-                 first_response_at_ms = COALESCE(first_response_at_ms, ?),
-                 finished_at_ms = NULL, error_message = NULL
-             WHERE request_id = ?",
+             SET http_status = ?, first_response_at_ms = COALESCE(first_response_at_ms, ?)
+             WHERE request_id = ? AND status = 'running'",
         )
         .bind(status as i64)
         .bind(now)
@@ -257,7 +255,7 @@ impl Store {
         sqlx::query(
             "UPDATE cursor_run_traces
              SET status = ?, finished_at_ms = ?, error_message = ?
-             WHERE request_id = ?",
+             WHERE request_id = ? AND status = 'running'",
         )
         .bind(if error.is_some() {
             "error"
@@ -273,19 +271,42 @@ impl Store {
     }
 
     pub async fn cursor_trace(&self, request_id: &str) -> Result<Option<CursorRunTraceSummary>> {
-        sqlx::query("SELECT * FROM cursor_run_traces WHERE request_id = ?")
-            .bind(request_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(trace_from_row)
-            .transpose()
+        sqlx::query(
+            "SELECT request_id, conversation_id, route, model_id, status,
+                    request_bytes, response_bytes, response_event_count, http_status,
+                    received_at_ms, first_response_at_ms, finished_at_ms, error_message
+             FROM cursor_run_traces WHERE request_id = ?",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(trace_from_row)
+        .transpose()
     }
 
-    pub async fn official_cursor_traces(&self, limit: i64) -> Result<Vec<CursorRunTraceSummary>> {
+    /// Cursor traces that need their own Calls-page row. Official runs have no
+    /// local provider call; a local trace is listed only after it ends without
+    /// ever linking one. While it runs, either its provider call row (or no row
+    /// yet) represents it, so the list never swaps a trace row for a call row.
+    pub(crate) async fn standalone_cursor_traces(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<CursorRunTraceSummary>> {
         let rows = sqlx::query(
-            "SELECT * FROM cursor_run_traces
-             WHERE route = 'cursor_official'
-             ORDER BY received_at_ms DESC LIMIT ?",
+            "SELECT t.request_id, t.conversation_id, t.route, t.model_id, t.status,
+                    t.request_bytes, t.response_bytes, t.response_event_count, t.http_status,
+                    t.received_at_ms, t.first_response_at_ms, t.finished_at_ms, t.error_message
+             FROM cursor_run_traces t
+             WHERE t.route = 'cursor_official'
+                OR (
+                    t.status <> 'running'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM runs r
+                        JOIN llm_calls c ON c.run_id = r.run_id
+                        WHERE r.cursor_request_id = t.request_id
+                    )
+                )
+             ORDER BY t.received_at_ms DESC LIMIT ?",
         )
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
