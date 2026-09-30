@@ -583,6 +583,63 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    /// 删除某插件在数据库中的全部模型设置:模型开关、模型覆盖,以及这些
+    /// 账号记录的停用标记。`model_id_prefix` 与该插件模型描述符 ID 的
+    /// 前缀一致(`plugin:<plugin_id>/`);账号记录 ID 由调用方从插件资源读出。
+    pub async fn clear_plugin_settings(
+        &self,
+        model_id_prefix: &str,
+        account_ids: &[String],
+    ) -> Result<()> {
+        let _write = self.writes.lock().await;
+        let disabled_models = self
+            .disabled_plugin_models()
+            .await?
+            .into_iter()
+            .filter(|id| !id.starts_with(model_id_prefix))
+            .collect::<HashSet<_>>();
+        let overrides = self
+            .plugin_model_overrides()
+            .await?
+            .into_iter()
+            .filter(|(id, _)| !id.starts_with(model_id_prefix))
+            .collect::<HashMap<_, _>>();
+        let disabled_accounts = self
+            .disabled_plugin_accounts()
+            .await?
+            .into_iter()
+            .filter(|id| !account_ids.contains(id))
+            .collect::<HashSet<_>>();
+        let rows = [
+            (
+                DISABLED_PLUGIN_MODELS_KEY,
+                serde_json::to_string(&disabled_models)?,
+            ),
+            (
+                PLUGIN_MODEL_OVERRIDES_KEY,
+                serde_json::to_string(&overrides)?,
+            ),
+            (
+                DISABLED_PLUGIN_ACCOUNTS_KEY,
+                serde_json::to_string(&disabled_accounts)?,
+            ),
+        ];
+        // 三个键整体替换,避免只清掉其中一部分。
+        let mut transaction = self.pool.begin().await?;
+        for (key, value_json) in rows {
+            sqlx::query(
+                "INSERT INTO service_settings(setting_key, value_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
+            )
+            .bind(key)
+            .bind(value_json)
+            .bind(now_ms())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -699,6 +756,58 @@ mod tests {
                 "custom"
             );
         }
+    }
+
+    /// 清空插件只删除该插件的模型开关、模型覆盖与账号停用标记,其他插件保持原样。
+    #[tokio::test]
+    async fn clearing_plugin_settings_keeps_other_plugins() {
+        use std::collections::HashSet;
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let cleared = "plugin:dev.cleared/provider/model";
+        let kept = "plugin:dev.kept/provider/model";
+        for id in [cleared, kept] {
+            store
+                .set_plugin_model_override(
+                    id,
+                    PluginModelOverride {
+                        display_name: Some("Custom".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            store.set_plugin_model_enabled(id, false).await.unwrap();
+        }
+        store
+            .set_disabled_plugin_accounts(&HashSet::from([
+                "account-a".to_owned(),
+                "account-b".to_owned(),
+            ]))
+            .await
+            .unwrap();
+
+        store
+            .clear_plugin_settings("plugin:dev.cleared/", &["account-a".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.disabled_plugin_models().await.unwrap(),
+            HashSet::from([kept.to_owned()])
+        );
+        assert_eq!(
+            store
+                .plugin_model_overrides()
+                .await
+                .unwrap()
+                .into_keys()
+                .collect::<Vec<_>>(),
+            vec![kept]
+        );
+        assert_eq!(
+            store.disabled_plugin_accounts().await.unwrap(),
+            HashSet::from(["account-b".to_owned()])
+        );
     }
 
     #[test]

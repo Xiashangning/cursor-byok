@@ -25,7 +25,7 @@ use crate::{
     provider::{is_valid_response_event, ModelEvent, Provider},
     store::{
         CommitSettings, DesktopSettings, PluginModelOverride, PortSettings, ProxySettings,
-        ProxySettingsInput, StatisticsStorage, Store, TabSettings,
+        ProxySettingsInput, Store, TabSettings,
     },
     Error, Result,
 };
@@ -125,6 +125,24 @@ pub struct CursorTraceArtifactDetail {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct ObservabilitySettings {
     pub detailed: bool,
+}
+
+/// 本地存储占用：数据库文件与可重建缓存。
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct StorageStatistics {
+    /// 数据库文件占用（页数 × 页大小）。
+    pub bytes: i64,
+    /// 可重建缓存占用：semble 索引与克隆仓库、网页抓取结果。
+    pub cache_bytes: i64,
+}
+
+/// 手动触发的存储清理结果。
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct StorageCleanup {
+    /// 清理后的存储占用。
+    pub storage: StorageStatistics,
+    /// 本次释放的字节数：数据库文件减少量与已删除缓存之和。
+    pub freed_bytes: i64,
 }
 
 impl ControlService {
@@ -265,8 +283,8 @@ impl ControlService {
             .await
     }
 
-    pub async fn remove_plugin_configuration(&self, plugin_id: &str) -> Result<()> {
-        self.plugins.remove(plugin_id).await
+    pub async fn clear_plugin_data(&self, plugin_id: &str) -> Result<()> {
+        self.plugins.clear_data(plugin_id).await
     }
 
     pub fn plugin_runtime_status(&self) -> PluginRuntimeStatus {
@@ -627,10 +645,10 @@ impl ControlService {
             .collect::<Vec<_>>();
         calls.extend(
             self.store
-                .official_cursor_traces(limit)
+                .standalone_cursor_traces(limit)
                 .await?
                 .into_iter()
-                .map(official_call),
+                .map(cursor_trace_call),
         );
         calls.sort_by_key(|call| std::cmp::Reverse(call.call.created_at_ms));
         calls.truncate(limit.clamp(1, 500) as usize);
@@ -639,7 +657,7 @@ impl ControlService {
 
     pub async fn call(&self, call_id: &str) -> Result<CallDetail> {
         if let Some(call) = self.store.llm_call(call_id).await? {
-            let cursor_trace = self.cursor_trace_detail(&call.run_id).await?;
+            let cursor_trace = self.cursor_trace_for_run(&call.run_id).await?;
             return Ok(CallDetail {
                 request: self.store.llm_call_request(call_id).await?,
                 response_chunks: self.store.llm_call_chunks(call_id).await?,
@@ -656,14 +674,21 @@ impl ControlService {
             .store
             .cursor_trace(request_id)
             .await?
-            .filter(|trace| trace.route == "cursor_official")
             .ok_or_else(|| Error::RunNotFound(format!("call {call_id}")))?;
         Ok(CallDetail {
-            call: official_call(trace.clone()),
+            call: cursor_trace_call(trace.clone()),
             request: None,
             response_chunks: Vec::new(),
             cursor_trace: Some(self.cursor_trace_detail_from(trace).await?),
         })
+    }
+
+    /// Provider 调用属于一次本地 Run;Run 通过 `cursor_request_id` 关联 Cursor 追踪。
+    async fn cursor_trace_for_run(&self, run_id: &str) -> Result<Option<CursorTraceDetail>> {
+        let Some(request_id) = self.store.run_cursor_request_id(run_id).await? else {
+            return Ok(None);
+        };
+        self.cursor_trace_detail(&request_id).await
     }
 
     async fn cursor_trace_detail(&self, request_id: &str) -> Result<Option<CursorTraceDetail>> {
@@ -710,16 +735,24 @@ impl ControlService {
         Ok(settings)
     }
 
-    pub async fn statistics_storage(&self) -> Result<StatisticsStorage> {
-        self.store.statistics_storage().await
+    pub async fn statistics_storage(&self) -> Result<StorageStatistics> {
+        Ok(StorageStatistics {
+            bytes: self.store.database_bytes().await?,
+            cache_bytes: crate::search::cache_bytes()? as i64,
+        })
     }
 
-    pub async fn clear_statistics_storage(&self) -> Result<StatisticsStorage> {
-        self.store.clear_statistics_storage().await
-    }
-
-    pub async fn clear_all_statistics_storage(&self) -> Result<StatisticsStorage> {
-        self.store.clear_all_statistics_storage().await
+    /// 清理数据库详细记录、不可达历史与空闲页，并删除可重建的本地缓存。
+    pub async fn clean_storage(&self) -> Result<StorageCleanup> {
+        let database = self.store.clean_database().await?;
+        let freed_cache = crate::search::clear_caches()? as i64;
+        Ok(StorageCleanup {
+            storage: StorageStatistics {
+                bytes: database.bytes,
+                cache_bytes: crate::search::cache_bytes()? as i64,
+            },
+            freed_bytes: database.freed_bytes + freed_cache,
+        })
     }
 
     pub async fn proxy_settings(&self) -> Result<ProxySettings> {
@@ -801,7 +834,8 @@ fn restore_redacted_headers(next: &mut serde_json::Value, previous: &serde_json:
     restored
 }
 
-fn official_call(trace: CursorRunTraceSummary) -> CallSummary {
+fn cursor_trace_call(trace: CursorRunTraceSummary) -> CallSummary {
+    let official = trace.route == "cursor_official";
     let model_id = trace.model_id.clone().unwrap_or_else(|| "Cursor".into());
     let ttfb = trace
         .first_response_at_ms
@@ -820,10 +854,26 @@ fn official_call(trace: CursorRunTraceSummary) -> CallSummary {
                 .unwrap_or_else(|| trace.request_id.clone()),
             provider_call_index: 0,
             model_hash: None,
-            provider_type: "cursor-official".into(),
-            provider_url: "https://api2.cursor.sh".into(),
-            request_type: "cursor-run-sse".into(),
-            request_url: "https://api2.cursor.sh/agent.v1.AgentService/RunSSE".into(),
+            provider_type: if official {
+                "cursor-official".into()
+            } else {
+                "cursor-transport".into()
+            },
+            provider_url: if official {
+                "https://api2.cursor.sh".into()
+            } else {
+                "local://cursor".into()
+            },
+            request_type: if official {
+                "cursor-run-sse".into()
+            } else {
+                "cursor-transport".into()
+            },
+            request_url: if official {
+                "https://api2.cursor.sh/agent.v1.AgentService/RunSSE".into()
+            } else {
+                "/aiserver.v1.BidiService/BidiAppend".into()
+            },
             model_id: model_id.clone(),
             display_name: model_id,
             reasoning_effort: None,
@@ -855,12 +905,20 @@ fn official_call(trace: CursorRunTraceSummary) -> CallSummary {
             response_bytes: trace.response_bytes,
             stream_event_count: trace.response_event_count,
             http_status: trace.http_status,
-            error_kind: error.as_ref().map(|_| "cursor_official".into()),
+            error_kind: error.as_ref().map(|_| trace.route.clone()),
             error_message: error,
             detailed: true,
         },
-        call_kind: "cursor_official",
-        route: "cursor_official",
+        call_kind: if official {
+            "cursor_official"
+        } else {
+            "cursor_transport"
+        },
+        route: if official {
+            "cursor_official"
+        } else {
+            "local_byok"
+        },
     }
 }
 
@@ -1147,7 +1205,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        model::{ModelConfig, ModelConfigInput, ModelInvocation, ModelType, ProjectedContent},
+        model::{
+            ConversationId, ModelConfig, ModelConfigInput, ModelInvocation, ModelSpec, ModelType,
+            NewLlmCall, PreparedRun, ProjectedContent, PromptSpec, ProviderType, RunAction, RunId,
+            RunKind,
+        },
         plugin::{PluginRegistry, PluginRuntime},
         provider::{FinishReason, ModelEvent, Provider, ProviderStream},
         store::Store,
@@ -1426,10 +1488,93 @@ mod tests {
             .contains_key("cancel-test"));
     }
 
-    #[test]
-    fn connectivity_output_token_estimate_handles_words_and_empty_text() {
-        assert_eq!(super::estimate_output_tokens("1 2 3"), 3);
-        assert_eq!(super::estimate_output_tokens(""), 0);
+    #[tokio::test]
+    async fn provider_call_detail_links_trace_through_the_runs_cursor_request_id() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store.set_detailed_logging(true).await.unwrap();
+        store
+            .start_cursor_trace_if_detailed(
+                "cursor-request",
+                Some("conversation"),
+                "local_byok",
+                Some("cursor-model"),
+            )
+            .await
+            .unwrap();
+        store
+            .append_cursor_trace_artifact(
+                "cursor-request",
+                "client_message",
+                "cursor_client",
+                br#"{"runRequest":{}}"#,
+                &serde_json::json!({"message_type": "run_request"}),
+            )
+            .await
+            .unwrap();
+
+        let conversation_id = ConversationId::new("conversation");
+        let base_checkpoint_id = store.ensure_conversation(&conversation_id).await.unwrap();
+        store
+            .claim_run(&PreparedRun {
+                run_id: RunId::new("provider-run"),
+                cursor_request_id: Some("cursor-request".into()),
+                conversation_id,
+                kind: RunKind::Root,
+                model: ModelSpec::new("provider-model"),
+                prompt: PromptSpec {
+                    instructions: String::new(),
+                    tools: Vec::new(),
+                },
+                initial_messages: Vec::new(),
+                action: RunAction::Start,
+                base_checkpoint_id,
+                background_follow_up: false,
+            })
+            .await
+            .unwrap();
+        let service = service_for(store.clone());
+        // 运行中的本地 trace 不单独成行:首个 provider 调用行出现前宁可无行,
+        // 也不让列表先显示 trace 之后再替换成调用行。
+        assert!(service.calls(10).await.unwrap().is_empty());
+        assert!(service
+            .call("cursor:cursor-request")
+            .await
+            .unwrap()
+            .cursor_trace
+            .is_some());
+
+        store
+            .start_llm_call(&NewLlmCall {
+                call_id: "provider-call".into(),
+                run_id: "provider-run".into(),
+                conversation_id: "conversation".into(),
+                provider_call_index: 0,
+                model_hash: "plugin:test/provider-model".into(),
+                provider_type: ProviderType::Plugin,
+                provider_url: "plugin://test".into(),
+                request_type: ProviderType::Plugin,
+                request_url: "plugin://test".into(),
+                model_id: "provider-model".into(),
+                display_name: "Provider Model".into(),
+                reasoning_effort: None,
+                fast: false,
+                message_count: 1,
+                tool_count: 0,
+                detailed: true,
+            })
+            .await
+            .unwrap();
+
+        let linked = service.calls(10).await.unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].call.call_id, "provider-call");
+        let detail = service.call("provider-call").await.unwrap();
+        let trace = detail
+            .cursor_trace
+            .expect("provider call links to Cursor trace");
+        assert_eq!(trace.trace.request_id, "cursor-request");
+        assert_eq!(trace.artifacts.len(), 1);
+        assert_eq!(trace.artifacts[0].artifact_type, "client_message");
     }
 
     fn service_for(store: crate::store::Store) -> ControlService {

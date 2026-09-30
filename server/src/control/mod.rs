@@ -24,7 +24,8 @@ use url::{Host, Url};
 pub use auth::{AccessToken, AccessTokenSource};
 pub use service::{
     AccessTokenView, CallDetail, CallSummary, ControlService, DiscoveredModels,
-    ModelConnectivityResult, ModelDiscoveryInput, ObservabilitySettings,
+    ModelConnectivityResult, ModelDiscoveryInput, ObservabilitySettings, StorageCleanup,
+    StorageStatistics,
 };
 
 pub fn web_router(service: ControlService, assets: impl AsRef<std::path::Path>) -> Router {
@@ -161,8 +162,8 @@ pub fn api_router(service: ControlService) -> Router {
             post(plugins::oauth_poll),
         )
         .route(
-            "/__byok-api__/api/plugins/{plugin_id}",
-            axum::routing::delete(plugins::remove),
+            "/__byok-api__/api/plugins/{plugin_id}/data",
+            axum::routing::delete(plugins::clear_data),
         )
         .route(
             "/__byok-api__/api/plugins/{plugin_id}/resources/{resource_type}/add/{method_id}/begin",
@@ -206,7 +207,11 @@ pub fn api_router(service: ControlService) -> Router {
         )
         .route(
             "/__byok-api__/api/settings/storage/statistics",
-            get(settings::get_storage).delete(settings::clear_storage),
+            get(settings::get_storage),
+        )
+        .route(
+            "/__byok-api__/api/settings/storage/cleanup",
+            post(settings::clean_storage),
         )
         .route(
             "/__byok-api__/api/settings/proxy",

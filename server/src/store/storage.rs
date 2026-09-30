@@ -1,87 +1,29 @@
 //! Persists content-addressed blobs and their edges.
 //! Storage accounting and cleanup for disposable observability data.
 
-use serde::{Deserialize, Serialize};
-
 use crate::Result;
 
 use super::Store;
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct StatisticsStorage {
-    pub bytes: i64,
-    pub call_count: i64,
-    pub trace_count: i64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum StatisticsStorageScope {
-    #[default]
-    Details,
-    All,
-}
-
 impl Store {
-    pub async fn statistics_storage(&self) -> Result<StatisticsStorage> {
-        let (bytes, call_count, trace_count) = sqlx::query_as::<_, (i64, i64, i64)>(
-            r#"
-            SELECT
-                COALESCE((
-                    SELECT SUM(
-                        LENGTH(call_id) + LENGTH(run_id) + LENGTH(conversation_id) +
-                        LENGTH(provider_type) + LENGTH(provider_url) + LENGTH(request_type) +
-                        LENGTH(request_url) + LENGTH(model_id) + LENGTH(display_name) +
-                        LENGTH(status) + COALESCE(LENGTH(finish_reason), 0) +
-                        COALESCE(LENGTH(usage_json), 0) + COALESCE(LENGTH(error_kind), 0) +
-                        COALESCE(LENGTH(error_message), 0) + 256
-                    ) FROM llm_calls
-                ), 0) +
-                COALESCE((SELECT SUM(LENGTH(headers_json) + LENGTH(body_json) + 24) FROM llm_call_requests), 0) +
-                COALESCE((SELECT SUM(LENGTH(data) + 24) FROM llm_call_response_chunks), 0) +
-                COALESCE((
-                    SELECT SUM(
-                        LENGTH(request_id) + COALESCE(LENGTH(conversation_id), 0) +
-                        LENGTH(route) + COALESCE(LENGTH(model_id), 0) + LENGTH(status) +
-                        COALESCE(LENGTH(error_message), 0) + 96
-                    ) FROM cursor_run_traces
-                ), 0) +
-                COALESCE((SELECT SUM(LENGTH(artifact_type) + LENGTH(source) + LENGTH(metadata_json) + 48) FROM cursor_run_trace_artifacts), 0) +
-                COALESCE((SELECT SUM(LENGTH(data)) FROM blobs WHERE blob_id IN (SELECT blob_id FROM cursor_run_trace_artifacts)), 0),
-                (SELECT COUNT(*) FROM llm_calls),
-                (SELECT COUNT(*) FROM cursor_run_traces)
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(StatisticsStorage {
-            bytes,
-            call_count,
-            trace_count,
-        })
+    /// 数据库文件占用（页数 × 页大小）。
+    pub async fn database_bytes(&self) -> Result<i64> {
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&self.pool)
+            .await?;
+        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(page_size * page_count)
     }
 
-    pub async fn clear_statistics_storage(&self) -> Result<StatisticsStorage> {
+    /// 删除请求/响应正文与 trace 附件;调用汇总与 trace 记录保留。
+    pub(crate) async fn clear_detail_storage(&self) -> Result<()> {
         let _write = self.writes.lock().await;
         let mut transaction = self.pool.begin().await?;
         Self::clear_detail_storage_tx(&mut transaction).await?;
         transaction.commit().await?;
-        self.statistics_storage().await
-    }
-
-    pub async fn clear_all_statistics_storage(&self) -> Result<StatisticsStorage> {
-        let _write = self.writes.lock().await;
-        let mut transaction = self.pool.begin().await?;
-        Self::clear_trace_artifacts_tx(&mut transaction).await?;
-        sqlx::query("DELETE FROM llm_calls")
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query("DELETE FROM cursor_run_traces")
-            .execute(&mut *transaction)
-            .await?;
-        transaction.commit().await?;
-        self.statistics_storage().await
+        Ok(())
     }
 
     async fn clear_detail_storage_tx(
@@ -93,6 +35,16 @@ impl Store {
         sqlx::query("DELETE FROM llm_call_response_chunks")
             .execute(&mut **transaction)
             .await?;
+        // 正文清空后，调用记录不能再声称有详细记录，trace 也不能保留已不存在的字节数。
+        sqlx::query("UPDATE llm_calls SET detailed = 0 WHERE detailed = 1")
+            .execute(&mut **transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE cursor_run_traces SET request_bytes = 0, response_bytes = 0,
+             response_event_count = 0",
+        )
+        .execute(&mut **transaction)
+        .await?;
         Self::clear_trace_artifacts_tx(transaction).await
     }
 
@@ -183,11 +135,15 @@ mod tests {
         sqlx::query("INSERT INTO llm_calls(call_id, run_id, conversation_id, provider_call_index, provider_type, provider_url, request_type, request_url, model_id, display_name, status, created_at_ms, message_count, tool_count, detailed) VALUES ('call-1', 'run-1', 'conversation-1', 0, 'openai-chat', 'https://example.com', 'openai-chat', 'https://example.com/v1/chat/completions', 'model', 'Model', 'completed', 1, 1, 0, 0)")
             .execute(store.pool()).await.unwrap();
 
-        assert!(store.statistics_storage().await.unwrap().bytes > 0);
-        let cleared = store.clear_statistics_storage().await.unwrap();
-        assert_eq!(cleared.call_count, 1);
-        assert_eq!(cleared.trace_count, 0);
-        assert!(cleared.bytes > 0);
+        store.clear_detail_storage().await.unwrap();
+        assert!(
+            store.llm_call("call-1").await.unwrap().is_some(),
+            "调用汇总仍然保留"
+        );
+        assert!(
+            store.database_bytes().await.unwrap() > 0,
+            "数据库文件占用始终非零"
+        );
         assert!(store.llm_call_request("call-1").await.unwrap().is_none());
         assert!(store.llm_call_chunks("call-1").await.unwrap().is_empty());
         let model_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_configs")
@@ -213,8 +169,9 @@ mod tests {
 
         assert!(store.llm_call_request("call-1").await.unwrap().is_some());
         assert_eq!(store.llm_call_chunks("call-1").await.unwrap().len(), 1);
-        let cleared = store.clear_all_statistics_storage().await.unwrap();
-        assert_eq!(cleared.bytes, 0);
-        assert_eq!(cleared.call_count, 0);
+        store.clear_detail_storage().await.unwrap();
+        assert!(store.llm_call_request("call-1").await.unwrap().is_none());
+        assert!(store.llm_call_chunks("call-1").await.unwrap().is_empty());
+        assert!(store.llm_call("call-1").await.unwrap().is_some());
     }
 }

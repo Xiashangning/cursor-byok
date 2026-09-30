@@ -1,15 +1,18 @@
-//! Persists fetched web content and serves it from the existing server.
+//! Owns the on-disk caches under the data directory: fetched web content served from the
+//! existing server plus the semble index and repository caches cleared by storage cleanup.
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
 use axum::Router;
 use parking_lot::RwLock;
+use semble_core::SembleConfig;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 use crate::{config::managed_data_dir, Error, Result};
 
@@ -34,8 +37,13 @@ struct WebCacheInner {
 }
 
 impl WebCache {
+    /// `<数据目录>/cache/web`：网页抓取结果的存放目录。
+    pub fn managed_directory() -> Result<PathBuf> {
+        Ok(managed_data_dir()?.join("cache").join("web"))
+    }
+
     pub fn managed() -> Result<Self> {
-        Self::at(managed_data_dir()?.join("cache").join("web"))
+        Self::at(Self::managed_directory()?)
     }
 
     pub fn at(directory: PathBuf) -> Result<Self> {
@@ -91,6 +99,59 @@ impl WebCache {
     }
 }
 
+/// 删除可重建的本地缓存：semble 索引与克隆仓库、网页抓取结果，返回释放的字节数。
+pub fn clear_caches() -> Result<u64> {
+    clear_directories(&cache_directories()?)
+}
+
+/// 可重建缓存的当前占用字节数。
+pub fn cache_bytes() -> Result<u64> {
+    let mut bytes = 0;
+    for directory in cache_directories()? {
+        bytes += directory_bytes(&directory)?;
+    }
+    Ok(bytes)
+}
+
+fn cache_directories() -> Result<Vec<PathBuf>> {
+    let mut directories = SembleConfig::default()
+        .rebuildable_cache_directories()
+        .to_vec();
+    directories.push(WebCache::managed_directory()?);
+    Ok(directories)
+}
+
+/// 清空目录内容但保留目录本身：运行中的服务仍会向这些路径写入。
+fn clear_directories(directories: &[PathBuf]) -> Result<u64> {
+    let mut freed = 0;
+    for directory in directories {
+        freed += directory_bytes(directory)?;
+        if directory.exists() {
+            fs::remove_dir_all(directory)?;
+        }
+        fs::create_dir_all(directory)?;
+    }
+    Ok(freed)
+}
+
+fn directory_bytes(directory: &Path) -> Result<u64> {
+    if !directory.is_dir() {
+        return Ok(0);
+    }
+    let mut bytes = 0;
+    for entry in WalkDir::new(directory) {
+        let entry = entry.map_err(|error| cache_error(&error))?;
+        if entry.file_type().is_file() {
+            bytes += entry.metadata().map_err(|error| cache_error(&error))?.len();
+        }
+    }
+    Ok(bytes)
+}
+
+fn cache_error(error: impl std::fmt::Display) -> Error {
+    Error::Io(std::io::Error::other(format!("清理缓存失败: {error}")))
+}
+
 fn local_address(address: SocketAddr) -> SocketAddr {
     match address.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => {
@@ -113,7 +174,34 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    use super::WebCache;
+    use super::{clear_directories, SembleConfig, WebCache};
+
+    #[test]
+    fn clears_rebuildable_caches_and_keeps_embedding_models() {
+        let root = tempdir().unwrap();
+        let config = SembleConfig::new(root.path().join("semble"));
+        let models = config.cache_dir.join("models/potion-code-16M-v2");
+        let web = root.path().join("web");
+        for (path, bytes) in [
+            (config.cache_dir.join("indexes/v7/a/index.bin"), 10usize),
+            (config.cache_dir.join("repos/clone/.git/config"), 5),
+            (models.join("model.safetensors"), 2048),
+            (web.join("page.txt"), 7),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![0u8; bytes]).unwrap();
+        }
+
+        let mut directories = config.rebuildable_cache_directories().to_vec();
+        directories.push(web.clone());
+        let freed = clear_directories(&directories).unwrap();
+
+        assert_eq!(freed, 22);
+        for directory in directories {
+            assert!(std::fs::read_dir(&directory).unwrap().next().is_none());
+        }
+        assert!(models.join("model.safetensors").is_file());
+    }
 
     #[tokio::test]
     async fn stores_uuid_named_content_and_serves_it_from_existing_router() {

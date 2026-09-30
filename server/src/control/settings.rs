@@ -5,15 +5,17 @@ use axum::{
     http::{header, HeaderMap},
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::BTreeMap;
 
 use crate::store::{
     CommitPromptLocale, CommitSettings, DesktopSettings, PortSettings, ProxySettings,
-    ProxySettingsInput, StatisticsStorage, StatisticsStorageScope, TabSettings,
+    ProxySettingsInput, TabSettings,
 };
 
-use super::{AccessTokenView, ControlService, ObservabilitySettings};
+use super::{
+    AccessTokenView, ControlService, ObservabilitySettings, StorageCleanup, StorageStatistics,
+};
 
 pub async fn get_access_token(State(service): State<ControlService>) -> Json<AccessTokenView> {
     Json(service.access_token_view())
@@ -47,26 +49,12 @@ pub async fn update_ports(
     Ok(Json(service.set_ports(settings).await?))
 }
 
-pub async fn get_storage(State(service): State<ControlService>) -> Result<Json<StatisticsStorage>> {
+pub async fn get_storage(State(service): State<ControlService>) -> Result<Json<StorageStatistics>> {
     Ok(Json(service.statistics_storage().await?))
 }
 
-pub async fn clear_storage(
-    State(service): State<ControlService>,
-    input: Option<Json<ClearStorageInput>>,
-) -> Result<Json<StatisticsStorage>> {
-    let scope = input.map(|Json(input)| input.scope).unwrap_or_default();
-    let storage = match scope {
-        StatisticsStorageScope::Details => service.clear_statistics_storage().await?,
-        StatisticsStorageScope::All => service.clear_all_statistics_storage().await?,
-    };
-    Ok(Json(storage))
-}
-
-#[derive(Deserialize)]
-pub struct ClearStorageInput {
-    #[serde(default)]
-    pub scope: StatisticsStorageScope,
+pub async fn clean_storage(State(service): State<ControlService>) -> Result<Json<StorageCleanup>> {
+    Ok(Json(service.clean_storage().await?))
 }
 
 pub async fn get_proxy(State(service): State<ControlService>) -> Result<Json<ProxySettings>> {

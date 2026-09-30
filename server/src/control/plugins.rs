@@ -21,11 +21,11 @@ pub async fn list(State(service): State<ControlService>) -> Result<Json<Vec<Plug
     Ok(Json(service.plugins().await))
 }
 
-pub async fn remove(
+pub async fn clear_data(
     State(service): State<ControlService>,
     Path(plugin_id): Path<String>,
 ) -> Result<StatusCode> {
-    service.remove_plugin_configuration(&plugin_id).await?;
+    service.clear_plugin_data(&plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

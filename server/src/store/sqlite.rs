@@ -13,6 +13,8 @@ use super::{migrations, writer::WriteCoordinator};
 #[derive(Clone)]
 pub struct Store {
     pub(crate) pool: SqlitePool,
+    /// 供维护连接复用同一套连接选项;装箱避免克隆 Store 时搬运整份选项。
+    pub(crate) options: Box<SqliteConnectOptions>,
     pub(crate) writes: WriteCoordinator,
 }
 
@@ -27,11 +29,12 @@ impl Store {
         let database_path = options.get_filename().to_owned();
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
-            .connect_with(options)
+            .connect_with(options.clone())
             .await?;
         migrations::run(&pool, &database_path).await?;
         Ok(Self {
             pool,
+            options: Box::new(options),
             writes: WriteCoordinator::default(),
         })
     }

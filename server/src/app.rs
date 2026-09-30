@@ -31,6 +31,11 @@ pub struct App {
 impl App {
     pub async fn new(mut config: Config) -> Result<Self> {
         let store = Store::connect(&config.database_url).await?;
+        // 崩溃恢复：上次进程遗留的进行中状态收敛到终态（数据库清理由用户手动触发）。
+        let recovered = store.recover_interrupted_state().await?;
+        if !recovered.is_empty() {
+            tracing::info!(?recovered, "recovered interrupted state on startup");
+        }
         if config.use_persisted_ports {
             config
                 .listen_addr

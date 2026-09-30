@@ -14,8 +14,8 @@ use super::{
     descriptor::{
         parse_model_id, PluginDescriptor, PluginModelDescriptor, PluginProviderDescriptor,
         PluginResourceDescriptor, PluginResourceView, ProviderDefinition, ResourceActionResponse,
-        ResourceActionResult, ResourceDefinition, ResourcePresentation, OAUTH2_ADD_METHOD,
-        OAUTH2_AUTHORIZATION_CODE_ADD_METHOD,
+        ResourceActionResult, ResourceDefinition, ResourcePresentation, ADAPTER_ID_PREFIX,
+        OAUTH2_ADD_METHOD, OAUTH2_AUTHORIZATION_CODE_ADD_METHOD,
     },
     oauth_callback::{self, CallbackHandle, CallbackOutcome, CallbackRequest},
     quota,
@@ -1134,10 +1134,31 @@ impl PluginRegistry {
             .await
     }
 
-    pub async fn remove(&self, plugin_id: &str) -> Result<()> {
+    /// 清空插件在本机持久化的全部数据:账号资源、模型目录,以及数据库中的
+    /// 模型开关、模型覆盖与账号停用标记。插件保持安装,等同于刚安装、
+    /// 尚未添加账号的状态;重新添加账号后会重新同步模型。
+    pub async fn clear_data(&self, plugin_id: &str) -> Result<()> {
+        let executable = self.executable()?;
+        let entry = self.find_entry(&executable, plugin_id).await?;
+        // 停用账号按资源记录 ID 保存,必须在数据目录删除前读出。
+        let mut account_ids = Vec::new();
+        for resource in &entry.definition.resources {
+            account_ids.extend(
+                self.inner
+                    .state
+                    .resources(plugin_id, &resource.resource_type)
+                    .await?
+                    .into_iter()
+                    .map(|record| record.id),
+            );
+        }
         if let Some(worker) = self.inner.workers.lock().await.remove(plugin_id) {
             worker.stop().await;
         }
+        self.inner
+            .store
+            .clear_plugin_settings(&format!("{ADAPTER_ID_PREFIX}{plugin_id}/"), &account_ids)
+            .await?;
         self.inner.state.clear(plugin_id).await
     }
 

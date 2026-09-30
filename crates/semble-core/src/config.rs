@@ -21,6 +21,13 @@ impl SembleConfig {
             max_file_bytes: 1_000_000,
         }
     }
+
+    /// Cache subdirectories that are rebuilt on demand: index snapshots and cloned remote
+    /// repositories. `models` is excluded because re-downloading the embedding model is
+    /// expensive and its bytes stay valid across index rebuilds.
+    pub fn rebuildable_cache_directories(&self) -> [PathBuf; 2] {
+        [self.cache_dir.join("indexes"), self.cache_dir.join("repos")]
+    }
 }
 
 impl Default for SembleConfig {
