@@ -1,0 +1,209 @@
+@use "../../styles/typography" as type;
+
+$font-size: type.$font-size-xs;
+$line-height: 1.5;
+$padding-block: 6px;
+// 四行文本加内边距,再加边框,超出的内容在框内滚动。
+$box-height: $font-size * $line-height * 4 + $padding-block * 2 + 2px;
+
+.root {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--vscode-descriptionForeground);
+  font-size: $font-size;
+}
+
+.header {
+  min-height: 20px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  line-height: 20px;
+}
+
+.hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--vscode-descriptionForeground);
+  cursor: help;
+
+  &:hover {
+    color: var(--vscode-foreground);
+  }
+}
+
+.toggle {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  border-radius: 5px;
+
+  button {
+    height: 22px;
+    padding: 0 8px;
+    color: var(--vscode-descriptionForeground);
+    background: transparent;
+    border: 0;
+    font-size: $font-size;
+
+    &:hover {
+      color: var(--vscode-foreground);
+      background: var(--vscode-list-hoverBackground);
+    }
+
+    &[aria-pressed="true"] {
+      color: var(--vscode-list-activeSelectionForeground);
+      background: var(--vscode-list-activeSelectionBackground);
+    }
+  }
+}
+
+.box {
+  height: $box-height;
+  overflow: hidden;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 5px;
+
+  &:focus-within {
+    border-color: var(--vscode-focusBorder);
+  }
+}
+
+.editor,
+.preview {
+  width: 100%;
+  height: 100%;
+  padding: $padding-block 10px;
+  overflow-y: auto;
+  color: inherit;
+  font-size: $font-size;
+  line-height: $line-height;
+  overflow-wrap: anywhere;
+
+  &::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: var(--vscode-scrollbarSlider-background);
+    border-radius: 999px;
+  }
+}
+
+.editor {
+  background: transparent;
+  border: 0;
+  outline: none;
+  resize: none;
+
+  &::placeholder {
+    color: var(--vscode-descriptionForeground);
+  }
+
+  &:disabled {
+    opacity: 0.6;
+  }
+}
+
+.empty {
+  color: var(--vscode-descriptionForeground);
+}
+
+// 预览内的 markdown 排版:仅作用于本字段,不污染全局样式。
+.preview {
+  > :first-child {
+    margin-top: 0;
+  }
+
+  > :last-child {
+    margin-bottom: 0;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    margin: 0.6em 0 0.3em;
+    color: var(--vscode-foreground);
+    font-size: inherit;
+    font-weight: 600;
+  }
+
+  p,
+  ul,
+  ol,
+  blockquote,
+  pre,
+  table {
+    margin: 0.4em 0;
+  }
+
+  ul,
+  ol {
+    padding-left: 1.4em;
+  }
+
+  a {
+    color: var(--vscode-textLink-foreground);
+    cursor: pointer;
+  }
+
+  code {
+    padding: 0.1em 0.3em;
+    background: var(--vscode-textCodeBlock-background);
+    border-radius: 3px;
+    font-family: var(--oa-code-font);
+  }
+
+  // 无 href 的链接(javascript: 等被过滤掉后)退化成普通文本。
+  a:not([href]) {
+    color: inherit;
+    cursor: text;
+    text-decoration: none;
+  }
+
+  pre {
+    padding: 6px 8px;
+    background: var(--vscode-textCodeBlock-background);
+    border-radius: 4px;
+    overflow-x: auto;
+
+    code {
+      padding: 0;
+      background: none;
+    }
+  }
+
+  blockquote {
+    padding-left: 8px;
+    color: var(--vscode-descriptionForeground);
+    border-left: 2px solid var(--vscode-sideBar-border);
+  }
+
+  table {
+    border-collapse: collapse;
+
+    th,
+    td {
+      padding: 2px 6px;
+      border: 1px solid var(--vscode-sideBar-border);
+    }
+  }
+
+  hr {
+    border: 0;
+    border-top: 1px solid var(--vscode-sideBar-border);
+  }
+
+  img {
+    max-width: 100%;
+  }
+}

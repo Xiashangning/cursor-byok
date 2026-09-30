@@ -1,6 +1,7 @@
 import type { CallDetail } from "../../shared/api";
 import { JsonEditor } from "../../shared/ui/JsonEditor";
 import { Tabs, type TabItem } from "../../shared/ui/Tabs";
+import { callKindLabel, routeLabel } from "./labels";
 import styles from "./CallDetails.module.scss";
 
 const show = (value: string | number | null) => value ?? "-";
@@ -12,8 +13,8 @@ export function CallDetails({ detail }: { detail: CallDetail }) {
   const responseBytes = chunks.reduce((total, chunk) => total + chunk.byte_count, 0);
   const fields: Array<[string, string | number]> = [
     ["Call ID", call.call_id],
-    [t("调用类型"), call.call_kind === "cursor_official" ? t("Cursor 官方") : "LLM"],
-    [t("路由"), call.route === "cursor_official" ? t("Cursor 官方") : "BYOK"],
+    [t("调用类型"), callKindLabel(call.call_kind)],
+    [t("路由"), routeLabel(call.route)],
     ["Run ID", call.run_id],
     ["Conversation ID", call.conversation_id],
     [t("上游调用序号"), call.provider_call_index],

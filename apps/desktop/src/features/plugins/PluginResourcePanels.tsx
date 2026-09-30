@@ -552,8 +552,10 @@ function ResourceRow({ item, actions, canRefresh, isRefreshing, isDeleting, disa
           <strong>{item.displayName}</strong>
           {item.description && (() => {
             const desc = pluginText(item.description, locale).trim();
-            const isPro = desc.toLowerCase().includes("pro") || desc.toLowerCase().includes("ultra") || desc.toLowerCase().includes("premium") || desc.toLowerCase().includes("advanced");
-            const label = isPro ? (desc.toLowerCase().includes("ultra") ? "ULTRA" : "PRO") : "FREE";
+            const lower = desc.toLowerCase();
+            const paid = ["pro", "ultra", "premium", "advanced", "team", "enterprise", "business"];
+            const isPro = paid.some((tier) => lower.includes(tier));
+            const label = isPro ? (lower.includes("ultra") ? "ULTRA" : "PRO") : "FREE";
             return <span className={isPro ? styles.proBadge : styles.freeBadge}>{isPro ? `🔥 ${label}` : label}</span>;
           })()}
         </div>

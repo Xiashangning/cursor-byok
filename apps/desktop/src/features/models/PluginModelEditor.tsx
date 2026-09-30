@@ -1,6 +1,7 @@
 import { forwardRef, useImperativeHandle, useState } from "react";
 import type { PluginModelDescriptor, PluginModelOverrideInput } from "../../shared/api";
 import { FormField, TextInput } from "../../shared/ui/FormControls";
+import { MarkdownInput } from "../../shared/ui/MarkdownInput";
 import { parseOptions } from "../../shared/utils/modelDefaults";
 import styles from "./CursorSettings.module.scss";
 
@@ -34,9 +35,14 @@ export const PluginModelEditor = forwardRef<PluginModelEditorHandle, PluginModel
       <FormField label={t("显示名称")} hint={t("仅用于界面展示，不会改变发送给模型服务的模型名称。")}>
         <TextInput value={displayName} disabled={busy} onChange={(event) => setDisplayName(event.target.value)} />
       </FormField>
-      <FormField className={styles.fullWidth} label={t("备注")} hint={t("显示在 Cursor 模型说明中。")}>
-        <TextInput value={tooltip} disabled={busy} onChange={(event) => setTooltip(event.target.value)} />
-      </FormField>
+      <MarkdownInput
+        className={styles.fullWidth}
+        label={t("备注")}
+        hint={t("显示在 Cursor 模型说明中，支持 Markdown。")}
+        value={tooltip}
+        disabled={busy}
+        onChange={setTooltip}
+      />
       <FormField label={t("Effort 选项")} hint={t("用逗号分隔模型可用的 effort 值。")}>
         <TextInput aria-label={t("Effort 选项")} value={effort.text} disabled={busy} onChange={(event) => setEffort({ text: event.target.value, options: parseOptions(event.target.value) })} />
       </FormField>

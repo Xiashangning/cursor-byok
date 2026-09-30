@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type ProxySettings, type ProxySettingsInput, type StatisticsStorage, type StatisticsStorageScope, type TabSettings } from "../../shared/api";
+import { api, type ProxySettings, type ProxySettingsInput, type StorageStatistics, type TabSettings } from "../../shared/api";
 import { PageContent } from "../../shell/layout/PageContent";
 import { AccessTokenSettingsCard } from "./AccessTokenSettingsCard";
 import { AppLifecycleSettingsCard } from "./AppLifecycleSettingsCard";
@@ -26,9 +26,8 @@ export function SettingsPage() {
   const [servicePort, setServicePort] = useState(String(ports.service_port));
   const [editingPorts, setEditingPorts] = useState(false);
   const [savingPorts, setSavingPorts] = useState(false);
-  const [storage, setStorage] = useState<StatisticsStorage | null>(null);
+  const [storage, setStorage] = useState<StorageStatistics | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
-  const [clearScope, setClearScope] = useState<StatisticsStorageScope>("details");
   const [clearing, setClearing] = useState(false);
   const [outboundProxy, setOutboundProxy] = useState<ProxySettings | null>(null);
   const [proxyDraft, setProxyDraft] = useState<ProxySettingsInput>({ mode: "default", address: "", auth_enabled: false, username: "", password: "" });
@@ -86,13 +85,14 @@ export function SettingsPage() {
     setServicePort(String(ports.service_port));
     setEditingPorts(false);
   };
-  const clearStorage = async () => {
+  const cleanStorage = async () => {
     try {
       setClearing(true);
-      setStorage(await api.clearStatisticsStorage(clearScope));
+      const cleaned = await api.cleanStorage();
+      setStorage(cleaned.storage);
       setConfirmClear(false);
       await appStore.refresh();
-      message(clearScope === "all" ? t("全部统计数据已清理") : t("详细记录已清理"));
+      message(t("存储空间已清理，释放 {size}", { size: formatBytes(cleaned.freed_bytes) }));
     } catch (cause) {
       message(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -156,10 +156,7 @@ export function SettingsPage() {
     while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
     return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
   };
-  const clearTitle = clearScope === "all" ? t("确定要清理全部统计数据吗？") : t("确定要清理详细记录吗？");
-  const clearDescription = clearScope === "all"
-    ? t("所有调用汇总、详细内容和追踪记录都会被删除。模型配置、CA 和应用设置不会受到影响，此操作无法撤销。")
-    : t("仅删除请求、响应和追踪附件等详细内容，保留调用汇总、统计指标和配置。");
+  const clearDescription = t("清理详细模式记录的客户端请求、服务端响应与追踪附件，以及不可达的历史数据和无服务端引用的状态缓存，并回收空闲页；同时删除缓存中的 semble 索引、克隆仓库与网页缓存（下次使用时重建）。调用记录、模型配置和应用设置会保留，此操作无法撤销。");
   const content = (
     <div className={styles.page}>
       <TitledCard title={t("调用观测")}>
@@ -268,38 +265,37 @@ export function SettingsPage() {
       </TitledCard>
       <TitledCard title={t("存储管理")}>
         <div className={styles.storageRow}>
-          <div>
-            <strong>{t("统计数据")}</strong>
-            <small>{storage ? formatBytes(storage.bytes) : t("计算中…")}</small>
+          <div className={styles.storageStats}>
+            <div>
+              <strong>{t("统计数据")}</strong>
+              <small>{storage ? formatBytes(storage.bytes) : t("计算中…")}</small>
+            </div>
+            <div>
+              <strong>{t("缓存占用")}</strong>
+              <small>{storage ? formatBytes(storage.cache_bytes) : t("计算中…")}</small>
+            </div>
           </div>
-          <button
-            type="button"
-            className={styles.textButton}
-            onClick={() => { setClearScope("details"); setConfirmClear(true); }}
-          >
-            {t("清理存储空间")}
-          </button>
+          <div className={styles.storageActions}>
+            <button
+              type="button"
+              className={styles.textButton}
+              onClick={() => setConfirmClear(true)}
+            >
+              {t("清理存储空间")}
+            </button>
+          </div>
         </div>
       </TitledCard>
       <ConfirmDialog
         open={confirmClear}
-        title={clearTitle}
+        title={t("确定要清理存储空间吗？")}
         busy={clearing}
         cancelLabel={t("取消")}
         confirmLabel={t("确认清理")}
         onCancel={() => setConfirmClear(false)}
-        onConfirm={() => void clearStorage()}
+        onConfirm={() => void cleanStorage()}
       >
         <div className={styles.confirmContent}>
-          <Select
-            value={clearScope}
-            ariaLabel={t("清理范围")}
-            options={[
-              { value: "details", label: t("仅清理详细记录") },
-              { value: "all", label: t("清理全部统计数据") },
-            ]}
-            onChange={(value) => setClearScope(value as StatisticsStorageScope)}
-          />
           <small>{clearDescription}</small>
         </div>
       </ConfirmDialog>

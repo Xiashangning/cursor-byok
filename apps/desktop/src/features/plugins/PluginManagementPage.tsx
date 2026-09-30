@@ -6,6 +6,7 @@ import { appStore, useAppStore } from "../../shared/store/appStore";
 import { ActionMenu, type ActionMenuItem } from "../../shared/ui/ActionMenu";
 import { Button } from "../../shared/ui/Button";
 import { Card } from "../../shared/ui/Card";
+import { ConfirmDialog } from "../../shared/ui/ConfirmDialog";
 import { Modal } from "../../shared/ui/Modal";
 import { useMessage } from "../../shared/ui/message";
 import { TruncatedButton } from "../../shared/ui/TruncatedButton";
@@ -138,6 +139,8 @@ function PluginCard({ plugin, onOpen }: {
   const message = useMessage();
   const importInput = useRef<HTMLInputElement>(null);
   const [importing, setImporting] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [clearOpen, setClearOpen] = useState(false);
   const configured = plugin.providers.some((provider) => provider.configured);
   const accountCount = plugin.resources.reduce((count, resource) => count + resource.resources.length, 0);
   const [disabledModelIds, setDisabledModelIds] = useState<Set<string>>(() => getDisabledPluginModelIds());
@@ -173,10 +176,25 @@ function PluginCard({ plugin, onOpen }: {
         message(summary);
       }
     } catch (cause) {
-      message(cause instanceof Error ? cause.message : String(cause), { duration: 5000 });
+      message(errorText(cause), { duration: 5000 });
     } finally {
       setImporting(false);
       if (importInput.current) importInput.current.value = "";
+    }
+  };
+
+  // 清空后等同于刚安装插件:账号、模型目录与模型设置全部删除,插件本身保留。
+  const clearData = async () => {
+    setClearing(true);
+    try {
+      await api.clearPluginData(plugin.id);
+      await appStore.refreshPlugins();
+      message(t("已清空 {name} 的插件数据", { name: plugin.name }));
+    } catch (cause) {
+      message(errorText(cause), { duration: 5000 });
+    } finally {
+      setClearing(false);
+      setClearOpen(false);
     }
   };
 
@@ -207,12 +225,18 @@ function PluginCard({ plugin, onOpen }: {
           },
         ]
       : []),
+    {
+      id: "clear-data",
+      label: t("清空插件数据"),
+      disabled: clearing,
+      onSelect: () => setClearOpen(true),
+    },
     ...(plugin.version
       ? [{ id: "version", type: "text" as const, label: `v${plugin.version}` }]
       : []),
   ];
 
-  return (
+  return <>
     <Card className={styles.pluginCard}>
       <div className={styles.pluginCardTop}>
         <img className={styles.pluginIcon} src={plugin.icon} />
@@ -268,7 +292,18 @@ function PluginCard({ plugin, onOpen }: {
         )}
       </div>
     </Card>
-  );
+    {clearOpen && <ConfirmDialog
+      open
+      busy={clearing}
+      title={t("清空插件数据")}
+      confirmLabel={t("清空")}
+      onCancel={() => setClearOpen(false)}
+      onConfirm={() => void clearData()}
+    >
+      <p>{t("将删除 {name} 在本机保存的全部数据：账号、模型列表与模型设置，此操作不可撤销。", { name: plugin.name })}</p>
+      <p>{t("插件本身会保留，重新添加账号后会重新同步模型。")}</p>
+    </ConfirmDialog>}
+  </>;
 }
 
 function RuntimeProgressModal({ open, status, starting, onClose }: { open: boolean; status: PluginRuntimeStatus | null; starting: boolean; onClose: () => void }) {
@@ -335,4 +370,8 @@ function formatBytes(bytes: number) {
     unit += 1;
   }
   return `${value < 10 ? value.toFixed(1) : value.toFixed(0)} ${units[unit]}`;
+}
+
+function errorText(cause: unknown) {
+  return cause instanceof Error ? cause.message : String(cause);
 }

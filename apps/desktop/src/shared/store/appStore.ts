@@ -168,12 +168,6 @@ export const appStore = {
       update({ error: cause instanceof Error ? cause.message : String(cause) });
     }
   },
-  async removePluginConfiguration(pluginId: string) {
-    await perform(async () => {
-      await api.removePluginConfiguration(pluginId);
-      update({ plugins: await api.plugins() });
-    });
-  },
   async setCursorEnabled(enabled: boolean) {
     update({ cursorBusy: true, error: null });
     try { update({ cursorHarness: await api.setCursorEnabled(enabled) }); }

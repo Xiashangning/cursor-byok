@@ -4,6 +4,7 @@ import { DataTable, type DataTableColumn } from "../../shared/ui/DataTable";
 import { Icon } from "../../shared/ui/Icon";
 import { TooltipTrigger } from "../../shared/ui/TooltipTrigger";
 import { eyeIcon } from "../../shared/ui/icons";
+import { callKindLabel, routeLabel } from "./labels";
 import styles from "./CallTable.module.scss";
 
 const value = (input: string | number | null) => input ?? "-";
@@ -56,14 +57,12 @@ export function CallTable({ calls, onDetails }: { calls: LlmCall[]; onDetails: (
     {
       key: "call_kind",
       header: t("调用类型"),
-      render: (call) =>
-        call.call_kind === "cursor_official" ? t("Cursor 官方") : "LLM",
+      render: (call) => callKindLabel(call.call_kind),
     },
     {
       key: "route",
       header: t("路由"),
-      render: (call) =>
-        call.route === "cursor_official" ? t("Cursor 官方") : "BYOK",
+      render: (call) => routeLabel(call.route),
     },
 
     // { key: "model_hash", header: "Model Hash", render: (call) => value(call.model_hash), title: (call) => call.model_hash ?? undefined },

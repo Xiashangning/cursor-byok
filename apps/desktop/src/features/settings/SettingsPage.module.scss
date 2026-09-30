@@ -41,6 +41,22 @@
   }
 }
 
+.storageRow > .storageStats {
+  display: grid;
+  gap: 12px;
+
+  > div {
+    display: grid;
+    gap: 5px;
+  }
+}
+
+.storageRow > .storageActions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .textButton {
   padding: 4px;
   color: var(--vscode-textLink-foreground);

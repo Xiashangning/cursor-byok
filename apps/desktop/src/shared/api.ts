@@ -98,13 +98,15 @@ export interface PortSettings {
   service_port: number;
 }
 
-export interface StatisticsStorage {
+export interface StorageStatistics {
   bytes: number;
-  call_count: number;
-  trace_count: number;
+  cache_bytes: number;
 }
 
-export type StatisticsStorageScope = "details" | "all";
+export interface StorageCleanup {
+  storage: StorageStatistics;
+  freed_bytes: number;
+}
 
 export type ProxyMode = "default" | "custom";
 
@@ -429,7 +431,7 @@ export interface Overview {
 }
 
 export interface LlmCall {
-  call_kind: "provider_llm" | "cursor_official";
+  call_kind: "provider_llm" | "cursor_official" | "cursor_transport";
   route: "local_byok" | "cursor_official";
   call_id: string;
   run_id: string;
@@ -584,7 +586,7 @@ export const api = {
   setPluginModelOverride: (input: PluginModelOverrideInput) => request<void>("/plugins/model-overrides", { method: "PUT", body: JSON.stringify(input) }),
   setPluginModelEnabled: (pluginId: string, providerId: string, modelId: string, enabled: boolean) => request<void>(`/plugins/${encodeURIComponent(pluginId)}/providers/${encodeURIComponent(providerId)}/models/enabled`, { method: "PUT", body: JSON.stringify({ modelId, enabled }) }),
   pluginResourceExportUrl: (servicePort: number, pluginId: string, resourceType: string) => `http://127.0.0.1:${servicePort}${API_ROOT}/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/export`,
-  removePluginConfiguration: (pluginId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}`, { method: "DELETE" }),
+  clearPluginData: (pluginId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}/data`, { method: "DELETE" }),
   pluginRuntime: () => request<PluginRuntimeStatus>("/plugins/runtime"),
   initializePluginRuntime: () => request<PluginRuntimeStatus>("/plugins/runtime", { method: "POST" }),
   cancelPluginRuntimeInitialization: () => request<PluginRuntimeStatus>("/plugins/runtime", { method: "DELETE" }),
@@ -610,8 +612,8 @@ export const api = {
   setObservability: (detailed: boolean) => request<{ detailed: boolean }>("/settings/observability", { method: "PUT", body: JSON.stringify({ detailed }) }),
   ports: () => request<PortSettings>("/settings/ports"),
   setPorts: (settings: PortSettings) => request<PortSettings>("/settings/ports", { method: "PUT", body: JSON.stringify(settings) }),
-  statisticsStorage: () => request<StatisticsStorage>("/settings/storage/statistics"),
-  clearStatisticsStorage: (scope: StatisticsStorageScope) => request<StatisticsStorage>("/settings/storage/statistics", { method: "DELETE", body: JSON.stringify({ scope }) }),
+  statisticsStorage: () => request<StorageStatistics>("/settings/storage/statistics"),
+  cleanStorage: () => request<StorageCleanup>("/settings/storage/cleanup", { method: "POST" }),
   proxySettings: () => request<ProxySettings>("/settings/proxy"),
   setProxySettings: (settings: ProxySettingsInput) => request<ProxySettings>("/settings/proxy", { method: "PUT", body: JSON.stringify(settings) }),
   tabSettings: () => request<TabSettings>("/settings/tab"),

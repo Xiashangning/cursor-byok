@@ -6,6 +6,7 @@ import { Button } from "../../shared/ui/Button";
 import { Checkbox } from "../../shared/ui/Checkbox";
 import { FormField, SecretTextInput, TextInput } from "../../shared/ui/FormControls";
 import { JsonEditor } from "../../shared/ui/JsonEditor";
+import { MarkdownInput } from "../../shared/ui/MarkdownInput";
 import { Combobox, Select, type ComboboxHandle } from "../../shared/ui/Select";
 import { Switch } from "../../shared/ui/Switch";
 import { claudeIcon, openAiIcon } from "../../shared/ui/icons";
@@ -166,7 +167,7 @@ export function CursorModelEditor({ draft, modelOptions, discovering, editingExi
 
       <FormField label={t("模型名称")} hint={t("可以直接输入模型标识，也可以读取接口返回的模型列表。")}><Combobox ref={modelCombobox} value={draft.model.model_id} options={combinedOptions} placeholder="gpt-5" append={<Button className={styles.discoverButton} disabled={discovering || !canDiscover} onClick={() => void discoverModels()}>{discovering ? t("获取中…") : t("获取模型")}</Button>} onChange={(model_id) => setModel({ model_id, display_name: draft.model.display_name || model_id })} /></FormField>
       <FormField label={t("显示名称")} hint={t("仅用于界面展示，不会改变发送给模型服务的模型名称。")}> <TextInput placeholder={t("例如：主力模型")} value={draft.model.display_name} onChange={(event) => setModel({ display_name: event.target.value })} /></FormField>
-      <FormField className={styles.fullWidth} label={t("备注")} hint={t("显示在 Cursor 模型说明中。")}> <TextInput placeholder={t("请输入模型备注")} value={draft.model.tooltip_data} onChange={(event) => setModel({ tooltip_data: event.target.value })} /></FormField>
+      <MarkdownInput className={styles.fullWidth} label={t("备注")} hint={t("显示在 Cursor 模型说明中，支持 Markdown。")} placeholder={t("请输入模型备注")} value={draft.model.tooltip_data} onChange={(tooltip_data) => setModel({ tooltip_data })} />
 
       <FormField label={t("Effort 选项")} hint={t("用逗号分隔模型可用的 effort 值。")}> <TextInput aria-label={t("Effort 选项")} value={draft.model.effort_options.join(", ")} onChange={(event) => setModel({ effort_options: parseOptions(event.target.value) })} /></FormField>
       <FormField label={t("Context 选项")} hint={t("用逗号分隔模型可用的 context 值，例如 200k, 1m。")}> <TextInput aria-label={t("Context 选项")} value={draft.model.context_options.join(", ")} onChange={(event) => setModel({ context_options: parseOptions(event.target.value) })} /></FormField>
