@@ -25,3 +25,5 @@ pub(crate) fn project_background_completion_for_test(
     )?;
     Ok(projection.is_some())
 }
+
+pub(crate) use insert_messages::task_completion;

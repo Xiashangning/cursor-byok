@@ -727,8 +727,8 @@ impl CursorToolRuntime {
             entries.retain(|id, entry| {
                 let keep_running = entry.call.name.eq_ignore_ascii_case("Task");
                 if !keep_running {
-                    abort_ids.push(*id);
                     interrupted_ids.push(*id);
+                    abort_ids.push(*id);
                 }
                 keep_running
             });
@@ -765,6 +765,16 @@ impl CursorToolRuntime {
                     .then_some(*id)
             })
             .min()
+    }
+
+    pub(crate) async fn task_execs(&self) -> Vec<(u32, ToolCall)> {
+        self.execs
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, entry)| entry.call.name.eq_ignore_ascii_case("Task"))
+            .map(|(id, entry)| (*id, entry.call.clone()))
+            .collect()
     }
 
     fn next_id(&self) -> Result<u32> {

@@ -103,6 +103,15 @@ pub fn request_context_success(id: u32) -> pb::AgentClientMessage {
 
 /// A successful subagent result for `agent_id`.
 pub fn subagent_result_success(id: u32, agent_id: &str) -> pb::AgentClientMessage {
+    subagent_result_success_with_message(id, agent_id, None)
+}
+
+/// A successful subagent result carrying a final message payload.
+pub fn subagent_result_success_with_message(
+    id: u32,
+    agent_id: &str,
+    final_message: Option<&str>,
+) -> pb::AgentClientMessage {
     pb::AgentClientMessage {
         message: Some(pb::agent_client_message::Message::ExecClientMessage(
             pb::ExecClientMessage {
@@ -111,6 +120,7 @@ pub fn subagent_result_success(id: u32, agent_id: &str) -> pb::AgentClientMessag
                     pb::SubagentResult {
                         result: Some(pb::subagent_result::Result::Success(pb::SubagentSuccess {
                             agent_id: agent_id.into(),
+                            final_message: final_message.map(str::to_owned),
                             ..Default::default()
                         })),
                     },
