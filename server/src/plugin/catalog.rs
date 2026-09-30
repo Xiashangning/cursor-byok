@@ -354,6 +354,7 @@ mod tests {
                 "dev.cursorbyok.examples.codex-auth",
                 "dev.cursorbyok.examples.grok-auth",
                 "dev.cursorbyok.examples.kimi-auth",
+                "dev.cursorbyok.examples.qoder-auth",
             ]
         );
     }

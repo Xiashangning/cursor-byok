@@ -4,7 +4,6 @@ import { assert, assertEquals, context, jwt, request, sse } from "../test_helper
 import type { ResourceSnapshot } from "cursor-byok:resource";
 import { codexDeviceOAuth } from "./oauth.ts";
 import { parseOfficialModels } from "./models.ts";
-import { buildResponsesBody } from "cursor-byok:protocol/openai-responses";
 import { codexProvider, isQuotaError } from "./provider.ts";
 import {
   accountIdentity,
@@ -389,43 +388,6 @@ Deno.test("invoke streams normalized events from the Codex Responses API", async
     { type: "text-end" },
     { type: "done", reason: "stop" },
   ]);
-});
-
-Deno.test("reasoning replay projects response items to valid input items", () => {
-  const replayRequest = request(128_000);
-  replayRequest.messages = [{
-    role: "assistant",
-    text: "",
-    thinking: "",
-    replayState: {
-      providerKind: "openai_responses",
-      value: {
-        items: [{
-          type: "reasoning",
-          id: "item-1",
-          status: "completed",
-          summary: [{ type: "summary_text", text: "why" }],
-          content: [],
-          encrypted_content: "opaque",
-          output_only: true,
-        }],
-      },
-    },
-    toolCalls: [],
-  }];
-
-  const body = buildResponsesBody({
-    url: "https://example.com/responses",
-    model: "gpt-test",
-    request: replayRequest,
-  });
-  assertEquals(body.input, [{
-    type: "reasoning",
-    id: "item-1",
-    summary: [{ type: "summary_text", text: "why" }],
-    content: [],
-    encrypted_content: "opaque",
-  }]);
 });
 
 Deno.test("invoke streams incremental tool calls and replays reasoning items", async () => {

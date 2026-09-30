@@ -138,8 +138,37 @@ pub struct StoredModel {
     pub max_output_tokens: Option<u64>,
     #[serde(default)]
     pub images: bool,
+    /// 插件给出的 effort 档位;为空时描述符回退到宿主的默认列表。
+    #[serde(default)]
+    pub effort_options: Vec<String>,
+    /// 插件给出的上下文窗口;为空时描述符回退到宿主的默认列表。
+    #[serde(default)]
+    pub context_options: Vec<String>,
     #[serde(default)]
     pub private_data: serde_json::Value,
+}
+
+/// 选项列表按覆盖路径的同一规则归一:去空白、小写、丢空值、保序去重。
+fn definition_options(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<String> {
+    let mut options: Vec<String> = Vec::new();
+    for value in object
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(option) = value.as_str() else {
+            continue;
+        };
+        let option = option.trim().to_ascii_lowercase();
+        if !option.is_empty() && !options.contains(&option) {
+            options.push(option);
+        }
+    }
+    options
 }
 
 impl StoredModel {
@@ -179,6 +208,8 @@ impl StoredModel {
                 .get("maxOutputTokens")
                 .and_then(serde_json::Value::as_u64),
             images: capability("images"),
+            effort_options: definition_options(object, "effortOptions"),
+            context_options: definition_options(object, "contextOptions"),
             private_data: object
                 .get("privateData")
                 .cloned()
@@ -193,6 +224,8 @@ impl StoredModel {
             "displayName": self.display_name,
             "description": self.description,
             "maxOutputTokens": self.max_output_tokens,
+            "effortOptions": self.effort_options,
+            "contextOptions": self.context_options,
             "capabilities": { "images": self.images },
             "privateData": self.private_data,
         })
@@ -481,6 +514,8 @@ mod tests {
             "id": "gpt-test",
             "displayName": "GPT Test",
             "capabilities": {"images": true},
+            "effortOptions": ["low", "XHIGH", " "],
+            "contextOptions": ["200k", "200K", "1m"],
             "privateData": {"reasoningEfforts": ["low"]},
         }))
         .unwrap();
@@ -491,6 +526,13 @@ mod tests {
         let models = store.models("dev.example", "codex").await.unwrap();
         assert_eq!(models.len(), 1);
         assert!(models[0].images);
+        // 选项按覆盖路径的同一规则归一:小写、去空、保序去重。
+        assert_eq!(models[0].effort_options, vec!["low", "xhigh"]);
+        assert_eq!(models[0].context_options, vec!["200k", "1m"]);
         assert_eq!(models[0].private_data["reasoningEfforts"][0], "low");
+        assert_eq!(
+            models[0].snapshot()["contextOptions"],
+            serde_json::json!(["200k", "1m"])
+        );
     }
 }

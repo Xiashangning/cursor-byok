@@ -29,7 +29,7 @@ export function jwt(payload: Record<string, unknown>): string {
   return `header.${encoded}.signature`;
 }
 
-type RequestInit = { body?: string; headers?: Record<string, string> };
+type RequestInit = { method?: string; body?: string; headers?: Record<string, string> };
 type FetchHandler = (
   url: string,
   init?: RequestInit,
@@ -56,6 +56,20 @@ export function context(
 
 export async function* sse(lines: string[]): AsyncGenerator<string> {
   for (const line of lines) yield line;
+}
+
+/** 构造非流式网络响应;字符串 body 原样返回,其余走 JSON 序列化。 */
+export function response(body: unknown, status = 200): NetworkResponse {
+  return {
+    status,
+    headers: {},
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  };
+}
+
+/** 构造流式网络响应;lines 直接作为 SSE 行产出。 */
+export function streamResponse(lines: string[], status = 200): NetworkEventStream {
+  return { status, headers: {}, lines: sse(lines) };
 }
 
 export function request(maxOutputTokens = 32_000): LlmRequest {

@@ -171,10 +171,98 @@ const KIMI_AUTH: &[(&str, &str)] = &[
     ),
 ];
 
+const QODER_AUTH: &[(&str, &str)] = &[
+    (
+        "plugin.json",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/plugin.json"
+        )),
+    ),
+    (
+        "main.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/main.ts"
+        )),
+    ),
+    (
+        "provider.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/provider.ts"
+        )),
+    ),
+    (
+        "agent_request.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/agent_request.ts"
+        )),
+    ),
+    (
+        "agent_stream.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/agent_stream.ts"
+        )),
+    ),
+    (
+        "catalog.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/catalog.ts"
+        )),
+    ),
+    (
+        "models.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/models.ts"
+        )),
+    ),
+    (
+        "texts.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/texts.ts"
+        )),
+    ),
+    (
+        "sign.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/sign.ts"
+        )),
+    ),
+    (
+        "oauth.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/oauth.ts"
+        )),
+    ),
+    (
+        "resources.ts",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/resources.ts"
+        )),
+    ),
+    (
+        "assets/qoder.svg",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/build-in/qoder-auth/assets/qoder.svg"
+        )),
+    ),
+];
+
 const PLUGINS: &[(&str, &[(&str, &str)])] = &[
     ("codex-auth", CODEX_AUTH),
     ("grok-auth", GROK_AUTH),
     ("kimi-auth", KIMI_AUTH),
+    ("qoder-auth", QODER_AUTH),
 ];
 
 /// Installs each built-in through a complete staging directory. A bundle is

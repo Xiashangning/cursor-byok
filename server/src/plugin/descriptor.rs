@@ -304,14 +304,22 @@ impl PluginModelDescriptor {
             max_output_tokens: model.max_output_tokens,
             images: model.images,
             enabled: true,
-            effort_options: DEFAULT_EFFORT_OPTIONS
-                .iter()
-                .map(|value| (*value).to_owned())
-                .collect(),
-            context_options: DEFAULT_CONTEXT_OPTIONS
-                .iter()
-                .map(|value| (*value).to_owned())
-                .collect(),
+            effort_options: if model.effort_options.is_empty() {
+                DEFAULT_EFFORT_OPTIONS
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect()
+            } else {
+                model.effort_options.clone()
+            },
+            context_options: if model.context_options.is_empty() {
+                DEFAULT_CONTEXT_OPTIONS
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect()
+            } else {
+                model.context_options.clone()
+            },
         }
     }
 
@@ -377,9 +385,18 @@ mod tests {
             description: Some("plugin default".into()),
             max_output_tokens: None,
             images: false,
+            effort_options: Vec::new(),
+            context_options: Vec::new(),
             private_data: serde_json::Value::Null,
         };
         let base = PluginModelDescriptor::new("dev.example", "Example", "", &provider, &model);
+        assert_eq!(
+            base.effort_options,
+            DEFAULT_EFFORT_OPTIONS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        );
 
         let merged = base.clone().with_override(&PluginModelOverride {
             tooltip: Some("user tooltip".into()),
@@ -403,5 +420,38 @@ mod tests {
         assert_eq!(merged.effort_options, vec!["low"]);
         assert_eq!(merged.context_options, vec!["1m"]);
         assert_eq!(merged.max_output_tokens, Some(65_536));
+    }
+
+    #[test]
+    fn plugin_options_replace_the_host_defaults() {
+        let provider = ProviderDefinition {
+            id: "qoder".into(),
+            display_name: serde_json::Value::Null,
+            description: serde_json::Value::Null,
+            provider_type: "qoder".into(),
+            resource_type: None,
+            has_models: true,
+        };
+        let model = StoredModel {
+            id: "qmodel_38max".into(),
+            display_name: "Qwen3.8-Max".into(),
+            description: None,
+            max_output_tokens: None,
+            images: true,
+            effort_options: vec!["low".into(), "medium".into(), "xhigh".into()],
+            context_options: vec!["200k".into(), "400k".into(), "1m".into()],
+            private_data: serde_json::Value::Null,
+        };
+        let base = PluginModelDescriptor::new("dev.example", "Example", "", &provider, &model);
+        assert_eq!(base.effort_options, vec!["low", "medium", "xhigh"]);
+        assert_eq!(base.context_options, vec!["200k", "400k", "1m"]);
+
+        // 用户覆盖仍然优先于插件提供的档位。
+        let merged = base.with_override(&PluginModelOverride {
+            context_options: Some(vec!["1m".into()]),
+            ..PluginModelOverride::default()
+        });
+        assert_eq!(merged.effort_options, vec!["low", "medium", "xhigh"]);
+        assert_eq!(merged.context_options, vec!["1m"]);
     }
 }

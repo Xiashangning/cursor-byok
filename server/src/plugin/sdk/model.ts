@@ -10,6 +10,10 @@ export type ModelDefinition = {
   displayName: string;
   description?: string;
   maxOutputTokens?: number;
+  /** 该模型可选的 effort 档位;缺省时宿主使用内置默认值。 */
+  effortOptions?: string[];
+  /** 该模型可选的上下文窗口;缺省时宿主使用内置默认值。 */
+  contextOptions?: string[];
   capabilities?: ModelCapabilities;
   /** 之后的调用原样传回;永远不会展示给用户。 */
   privateData?: JsonValue;
