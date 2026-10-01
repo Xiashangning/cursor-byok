@@ -17,6 +17,7 @@ const DISABLED_PLUGIN_MODELS_KEY: &str = "disabled_plugin_models";
 const DISABLED_PLUGIN_ACCOUNTS_KEY: &str = "disabled_plugin_accounts";
 const ACCESS_TOKEN_KEY: &str = "access_token";
 const PLUGIN_MODEL_OVERRIDES_KEY: &str = "plugin_model_overrides";
+const APP_API_SETTINGS_KEY: &str = "app_api";
 
 /// Embedded default system prompts for commit message generation.
 pub const DEFAULT_COMMIT_PROMPT_ZH_CN: &str = include_str!("../../prompt/cursor/commit/zh-CN.md");
@@ -28,6 +29,12 @@ pub const PUBLIC_TAB_SERVICE_URL: &str = "https://tab.leokun.cn";
 pub struct PortSettings {
     pub proxy_port: u16,
     pub service_port: u16,
+}
+
+/// 本机 Agent 管理 API（/byok/app/v1）开关；鉴权复用控制 API 访问令牌。
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct AppApiSettings {
+    pub enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -544,6 +551,32 @@ impl Store {
         Ok(())
     }
 
+    pub async fn app_api_settings(&self) -> Result<AppApiSettings> {
+        let value = sqlx::query_scalar::<_, String>(
+            "SELECT value_json FROM service_settings WHERE setting_key = ?",
+        )
+        .bind(APP_API_SETTINGS_KEY)
+        .fetch_optional(&self.pool)
+        .await?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .unwrap_or_else(|| Ok(AppApiSettings::default()))
+    }
+
+    pub async fn set_app_api_settings(&self, settings: AppApiSettings) -> Result<AppApiSettings> {
+        let value_json = serde_json::to_string(&settings)?;
+        let _write = self.writes.lock().await;
+        sqlx::query(
+            "INSERT INTO service_settings(setting_key, value_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(APP_API_SETTINGS_KEY)
+        .bind(value_json)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(settings)
+    }
+
     pub async fn plugin_model_overrides(&self) -> Result<HashMap<String, PluginModelOverride>> {
         let value = sqlx::query_scalar::<_, String>(
             "SELECT value_json FROM service_settings WHERE setting_key = ?",
@@ -645,7 +678,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_proxy_settings, PluginModelOverride, ProxyMode, ProxySettingsInput,
+        read_proxy_settings, AppApiSettings, PluginModelOverride, ProxyMode, ProxySettingsInput,
         ProxySettingsSecret, Store, PROXY_SETTINGS_KEY,
     };
 
@@ -853,5 +886,29 @@ mod tests {
             .unwrap();
         assert_eq!(saved.mode, ProxyMode::Custom);
         assert_eq!(saved.address, "http://127.0.0.1:7890");
+    }
+
+    #[tokio::test]
+    async fn app_api_settings_default_to_disabled_and_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("test.db").display());
+        let store = Store::connect(&url).await.unwrap();
+
+        assert_eq!(
+            store.app_api_settings().await.unwrap(),
+            AppApiSettings { enabled: false }
+        );
+        let enabled = AppApiSettings { enabled: true };
+        assert_eq!(store.set_app_api_settings(enabled).await.unwrap(), enabled);
+        // 重新连接后读到同一个开关。
+        assert_eq!(
+            Store::connect(&url)
+                .await
+                .unwrap()
+                .app_api_settings()
+                .await
+                .unwrap(),
+            enabled
+        );
     }
 }

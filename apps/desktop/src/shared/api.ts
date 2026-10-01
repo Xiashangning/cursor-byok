@@ -98,6 +98,10 @@ export interface PortSettings {
   service_port: number;
 }
 
+export interface AppApiSettings {
+  enabled: boolean;
+}
+
 export interface StorageStatistics {
   bytes: number;
   cache_bytes: number;
@@ -634,4 +638,6 @@ export const api = {
   setCommitSettings: (settings: CommitSettings) => request<CommitSettingsView>("/settings/commit", { method: "PUT", body: JSON.stringify(settings) }),
   accessToken: () => request<AccessTokenInfo>("/settings/access-token"),
   regenerateAccessToken: () => request<AccessTokenInfo>("/settings/access-token/regenerate", { method: "POST" }),
+  appApiSettings: () => request<AppApiSettings>("/settings/app-api"),
+  setAppApiSettings: (settings: AppApiSettings) => request<AppApiSettings>("/settings/app-api", { method: "PUT", body: JSON.stringify(settings) }),
 };

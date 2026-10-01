@@ -1,4 +1,5 @@
 //! Exposes the local control API.
+mod app_api;
 mod auth;
 mod calls;
 mod harness;
@@ -112,7 +113,7 @@ fn proxy_error(error: impl std::fmt::Display) -> Response<Body> {
 }
 
 pub fn api_router(service: ControlService) -> Router {
-    Router::new()
+    let api = Router::new()
         .route(
             "/__byok-api__/api/settings/cursor-model-aliases",
             get(settings::get_model_aliases).put(settings::update_model_aliases),
@@ -239,6 +240,10 @@ pub fn api_router(service: ControlService) -> Router {
             post(settings::regenerate_access_token),
         )
         .route(
+            "/__byok-api__/api/settings/app-api",
+            get(settings::get_app_api).put(settings::update_app_api),
+        )
+        .route(
             "/__byok-api__/api/harness/cursor/status",
             get(harness::status),
         )
@@ -250,7 +255,9 @@ pub fn api_router(service: ControlService) -> Router {
             "/__byok-api__/api/harness/cursor/enabled",
             put(harness::set_enabled),
         )
-        .with_state(service.clone())
+        .with_state(service.clone());
+    // 本机 Agent 管理入口(/byok/app/v1);与内部管理路由共用下方的访问令牌鉴权。
+    app_api::attach(service.clone(), api)
         // 鉴权只约束 API;静态控制台页面保持可直接打开,由页面引导输入令牌。
         .layer(axum::middleware::from_fn_with_state(
             service.access_token().clone(),

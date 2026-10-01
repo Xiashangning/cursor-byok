@@ -9,8 +9,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 use crate::store::{
-    CommitPromptLocale, CommitSettings, DesktopSettings, PortSettings, ProxySettings,
-    ProxySettingsInput, TabSettings,
+    AppApiSettings, CommitPromptLocale, CommitSettings, DesktopSettings, PortSettings,
+    ProxySettings, ProxySettingsInput, TabSettings,
 };
 
 use super::{
@@ -36,6 +36,17 @@ pub async fn update(
     Json(settings): Json<ObservabilitySettings>,
 ) -> Result<Json<ObservabilitySettings>> {
     Ok(Json(service.set_observability(settings).await?))
+}
+
+pub async fn get_app_api(State(service): State<ControlService>) -> Result<Json<AppApiSettings>> {
+    Ok(Json(service.app_api_settings().await?))
+}
+
+pub async fn update_app_api(
+    State(service): State<ControlService>,
+    Json(settings): Json<AppApiSettings>,
+) -> Result<Json<AppApiSettings>> {
+    Ok(Json(service.set_app_api_settings(settings).await?))
 }
 
 pub async fn get_ports(State(service): State<ControlService>) -> Result<Json<PortSettings>> {

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type ProxySettings, type ProxySettingsInput, type StorageStatistics, type TabSettings } from "../../shared/api";
 import { PageContent } from "../../shell/layout/PageContent";
 import { AccessTokenSettingsCard } from "./AccessTokenSettingsCard";
+import { AppApiSettingsCard } from "./AppApiSettingsCard";
 import { AppLifecycleSettingsCard } from "./AppLifecycleSettingsCard";
 import { CommitSettingsCard } from "./CommitSettingsCard";
 import { ProxySettingsCard } from "./ProxySettingsCard";
@@ -226,6 +227,7 @@ export function SettingsPage() {
         </div>
       </TitledCard>
       <AccessTokenSettingsCard />
+      <AppApiSettingsCard servicePort={ports.service_port} />
       <ProxySettingsCard settings={outboundProxy} draft={proxyDraft} editing={editingProxy} saving={savingProxy} onDraftChange={setProxyDraft} onEdit={editProxy} onCancel={cancelProxyEdit} onSave={() => void saveProxy()} />
       <TabSettingsCard settings={tabSettings} draft={tabDraft} editing={editingTab} saving={savingTab} onDraftChange={setTabDraft} onEdit={editTab} onCancel={cancelTabEdit} onSave={() => void saveTab()} />
       <CommitSettingsCard />
