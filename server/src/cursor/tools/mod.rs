@@ -136,7 +136,8 @@ impl ToolDispatcher {
             if call.name == "TodoWrite" && !dynamic_mcp.contains_key(&call.name) {
                 match validated_todo_write(todos.clone(), call.arguments.clone()).and_then(
                     |resolved| {
-                        let completion = tool_call_result::todo_write(call, &resolved)?;
+                        let completion =
+                            tool_call_result::todo_write(call, todos.as_ref(), &resolved)?;
                         let mut rendered_call = call.clone();
                         rendered_call.arguments = resolved.clone();
                         let messages = if publish_started {

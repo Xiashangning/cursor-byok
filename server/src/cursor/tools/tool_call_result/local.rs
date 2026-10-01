@@ -44,7 +44,11 @@ pub(crate) fn subagents_disabled(call: &ToolCall) -> Result<ToolCompletion> {
     ))
 }
 
-pub(crate) fn todo_write(call: &ToolCall, resolved: &Value) -> Result<ToolCompletion> {
+pub(crate) fn todo_write(
+    call: &ToolCall,
+    previous: Option<&Value>,
+    resolved: &Value,
+) -> Result<ToolCompletion> {
     let todos = todo_items(resolved);
     let total_count = todos.len() as i32;
     let was_merge = call
@@ -58,8 +62,11 @@ pub(crate) fn todo_write(call: &ToolCall, resolved: &Value) -> Result<ToolComple
             "TodoWrite has no Cursor representation".into(),
         ));
     };
+    // Cursor compares the completed call's args against its result to describe
+    // the change. Keep the pre-update list in args and the full merged list in
+    // the result.
     tool.args = Some(pb::UpdateTodosArgs {
-        todos: todos.clone(),
+        todos: previous.map(todo_items).unwrap_or_default(),
         merge: false,
     });
     tool.result = Some(pb::UpdateTodosResult {
@@ -178,4 +185,113 @@ fn normalized(name: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+    use serde_json::json;
+
+    use super::*;
+    use crate::cursor::prompting::validated_todo_write;
+
+    fn call(arguments: Value) -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "todo-call".into(),
+            model_call_id: "model-call".into(),
+            name: "TodoWrite".into(),
+            arguments_text: arguments.to_string(),
+            arguments,
+            argument_error: None,
+        }
+    }
+
+    fn rendered(completion: &ToolCompletion) -> pb::UpdateTodosToolCall {
+        let encoded = completion.tool_call().encode_to_vec();
+        let decoded = pb::ToolCall::decode(encoded.as_slice()).unwrap();
+        let Some(pb::tool_call::Tool::UpdateTodosToolCall(tool)) = decoded.tool else {
+            panic!("expected TodoWrite wire call");
+        };
+        tool
+    }
+
+    fn success(tool: &pb::UpdateTodosToolCall) -> &pb::UpdateTodosSuccess {
+        let Some(pb::update_todos_result::Result::Success(result)) = tool
+            .result
+            .as_ref()
+            .and_then(|result| result.result.as_ref())
+        else {
+            panic!("expected TodoWrite success");
+        };
+        result
+    }
+
+    #[test]
+    fn new_todos_render_as_additions_without_changing_model_results() {
+        let previous = json!({"merge": false, "todos": []});
+        let call = call(json!({"merge": false, "todos": [
+            {"id": "read", "content": "Read fixture", "status": "pending"},
+            {"id": "verify", "content": "Verify fixture", "status": "pending"},
+        ]}));
+        let resolved =
+            validated_todo_write(Some(previous.clone()), call.arguments.clone()).unwrap();
+        let completion = todo_write(&call, Some(&previous), &resolved).unwrap();
+
+        let tool = rendered(&completion);
+        assert!(tool.args.as_ref().unwrap().todos.is_empty());
+        let result = success(&tool);
+        assert_eq!(result.todos.len(), 2);
+        assert_eq!(result.total_count, 2);
+        assert!(result
+            .todos
+            .iter()
+            .all(|todo| todo.status == pb::TodoStatus::Pending as i32));
+        assert_eq!(
+            serde_json::from_str::<Value>(&completion.result().content).unwrap(),
+            resolved
+        );
+    }
+
+    #[test]
+    fn merged_todo_completion_keeps_previous_status_and_all_items() {
+        let previous = json!({"merge": false, "todos": [
+            {"id": "read", "content": "Read fixture", "status": "completed"},
+            {"id": "verify", "content": "Verify fixture", "status": "in_progress", "dependencies": ["read"]},
+        ]});
+        let call = call(json!({"merge": true, "todos": [
+            {"id": "verify", "status": "completed"},
+        ]}));
+        let resolved =
+            validated_todo_write(Some(previous.clone()), call.arguments.clone()).unwrap();
+        let completion = todo_write(&call, Some(&previous), &resolved).unwrap();
+
+        let tool = rendered(&completion);
+        let args = tool.args.as_ref().unwrap();
+        let result = success(&tool);
+        assert_eq!(args.todos.len(), 2);
+        assert_eq!(args.todos[1].status, pb::TodoStatus::InProgress as i32);
+        assert!(result.was_merge);
+        assert_eq!(result.total_count, 2);
+        assert_eq!(result.todos[0].id, "read");
+        assert_eq!(result.todos[1].content, "Verify fixture");
+        assert_eq!(result.todos[1].status, pb::TodoStatus::Completed as i32);
+        assert_eq!(result.todos[1].dependencies, ["read"]);
+    }
+
+    #[test]
+    fn clearing_todos_keeps_the_previous_list_for_cursor_display() {
+        let previous = json!({"merge": false, "todos": [
+            {"id": "read", "content": "Read fixture", "status": "pending"},
+        ]});
+        let call = call(json!({"merge": false, "todos": []}));
+        let resolved =
+            validated_todo_write(Some(previous.clone()), call.arguments.clone()).unwrap();
+        let completion = todo_write(&call, Some(&previous), &resolved).unwrap();
+
+        let tool = rendered(&completion);
+        assert_eq!(tool.args.as_ref().unwrap().todos.len(), 1);
+        assert!(success(&tool).todos.is_empty());
+        assert_eq!(success(&tool).total_count, 0);
+    }
 }
