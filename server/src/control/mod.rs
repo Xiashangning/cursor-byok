@@ -139,6 +139,7 @@ pub fn api_router(service: ControlService) -> Router {
         .route("/__byok-api__/api/llm-calls", get(calls::list))
         .route("/__byok-api__/api/llm-calls/{call_id}", get(calls::detail))
         .route("/__byok-api__/api/plugins", get(plugins::list))
+        .route("/__byok-api__/api/plugins/install", post(plugins::install))
         .route(
             "/__byok-api__/api/plugins/disabled-models",
             get(plugins::get_disabled_models).put(plugins::set_disabled_models),

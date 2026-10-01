@@ -265,6 +265,19 @@ const PLUGINS: &[(&str, &[(&str, &str)])] = &[
     ("qoder-auth", QODER_AUTH),
 ];
 
+/// 内置插件的 id 和目录名都不能被用户安装覆盖。
+pub(super) fn is_reserved_plugin(plugin_id: &str) -> bool {
+    PLUGINS.iter().any(|(directory, files)| {
+        *directory == plugin_id || plugin_id_of(files).as_deref() == Some(plugin_id)
+    })
+}
+
+fn plugin_id_of(files: &[(&str, &str)]) -> Option<String> {
+    let manifest = files.iter().find(|(name, _)| *name == "plugin.json")?.1;
+    let value: serde_json::Value = serde_json::from_str(manifest).ok()?;
+    value.get("id")?.as_str().map(str::to_owned)
+}
+
 /// Installs each built-in through a complete staging directory. A bundle is
 /// accepted only when every embedded file and the completion fingerprint match.
 pub(super) fn install(installed: &Path) -> Result<()> {

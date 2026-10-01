@@ -71,6 +71,35 @@
         }
       ]
     },
+    "0365fc0890ababe3": {
+      "source": "替换已安装的插件",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/plugins/PluginManagementPage.tsx",
+          "line": 124,
+          "column": 14
+        }
+      ]
+    },
+    "038a2d003bb2ac52": {
+      "source": "添加插件",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/plugins/PluginManagementPage.tsx",
+          "line": 112,
+          "column": 45
+        },
+        {
+          "file": "features/plugins/PluginManagementPage.tsx",
+          "line": 113,
+          "column": 61
+        }
+      ]
+    },
     "03ff62ab4b818492": {
       "source": "缓存写入：{tokens} × ${price}/1M = {cost}",
       "kind": "template",
@@ -187,7 +216,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 359,
+          "line": 422,
           "column": 21
         }
       ]
@@ -247,7 +276,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 255,
+          "line": 318,
           "column": 12
         }
       ]
@@ -500,6 +529,18 @@
         }
       ]
     },
+    "131b13aa265996df": {
+      "source": "替换",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/plugins/PluginManagementPage.tsx",
+          "line": 126,
+          "column": 21
+        }
+      ]
+    },
     "133340e53175128a": {
       "source": "一键测试",
       "kind": "text",
@@ -543,7 +584,7 @@
       "refs": [
         {
           "file": "shared/ui/MarkdownInput.tsx",
-          "line": 58,
+          "line": 64,
           "column": 88
         }
       ]
@@ -637,7 +678,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 124,
+          "line": 187,
           "column": 16
         }
       ]
@@ -698,7 +739,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 170,
+          "line": 233,
           "column": 23
         }
       ]
@@ -816,7 +857,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 662,
+          "line": 663,
           "column": 14
         }
       ]
@@ -828,7 +869,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 299,
+          "line": 362,
           "column": 21
         }
       ]
@@ -903,7 +944,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 636,
+          "line": 637,
           "column": 50
         }
       ]
@@ -955,7 +996,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 343,
+          "line": 406,
           "column": 122
         }
       ]
@@ -1073,7 +1114,7 @@
         },
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 323,
+          "line": 386,
           "column": 70
         },
         {
@@ -1141,6 +1182,18 @@
           "file": "features/home/metrics/HomeMetrics.tsx",
           "line": 86,
           "column": 5
+        }
+      ]
+    },
+    "2e25a3ab4a9d35c5": {
+      "source": "插件已添加",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/plugins/PluginManagementPage.tsx",
+          "line": 79,
+          "column": 15
         }
       ]
     },
@@ -1250,12 +1303,12 @@
         },
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 602,
+          "line": 603,
           "column": 30
         },
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 608,
+          "line": 609,
           "column": 23
         }
       ]
@@ -1267,7 +1320,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 684,
+          "line": 685,
           "column": 28
         }
       ]
@@ -1279,7 +1332,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 701,
+          "line": 702,
           "column": 122
         }
       ]
@@ -1344,6 +1397,18 @@
           "file": "features/plugins/PluginResourcePanels.tsx",
           "line": 152,
           "column": 64
+        }
+      ]
+    },
+    "364f56d49a0bd21a": {
+      "source": "插件已替换",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/plugins/PluginManagementPage.tsx",
+          "line": 94,
+          "column": 15
         }
       ]
     },
@@ -1422,7 +1487,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 280,
+          "line": 343,
           "column": 32
         }
       ]
@@ -1600,12 +1665,12 @@
         },
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 323,
+          "line": 386,
           "column": 80
         },
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 633,
+          "line": 634,
           "column": 82
         }
       ]
@@ -1617,7 +1682,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 113,
+          "line": 176,
           "column": 68
         }
       ]
@@ -1658,7 +1723,7 @@
       "refs": [
         {
           "file": "shared/ui/MarkdownInput.tsx",
-          "line": 59,
+          "line": 65,
           "column": 90
         }
       ]
@@ -1925,7 +1990,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 322,
+          "line": 385,
           "column": 12
         }
       ]
@@ -1937,7 +2002,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 113,
+          "line": 176,
           "column": 46
         }
       ]
@@ -1975,12 +2040,12 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 681,
+          "line": 682,
           "column": 30
         },
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 703,
+          "line": 704,
           "column": 83
         }
       ]
@@ -2165,7 +2230,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 303,
+          "line": 366,
           "column": 11
         }
       ]
@@ -2272,7 +2337,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 664,
+          "line": 665,
           "column": 21
         }
       ]
@@ -2322,7 +2387,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 315,
+          "line": 378,
           "column": 7
         }
       ]
@@ -2499,7 +2564,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 598,
+          "line": 608,
           "column": 43
         }
       ]
@@ -2829,7 +2894,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 594,
+          "line": 604,
           "column": 43
         }
       ]
@@ -2865,7 +2930,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 358,
+          "line": 421,
           "column": 31
         }
       ]
@@ -2894,7 +2959,7 @@
       "refs": [
         {
           "file": "shared/ui/MarkdownInput.tsx",
-          "line": 66,
+          "line": 72,
           "column": 95
         }
       ]
@@ -2968,7 +3033,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 250,
+          "line": 313,
           "column": 36
         }
       ]
@@ -2980,7 +3045,7 @@
       "refs": [
         {
           "file": "shared/api.ts",
-          "line": 532,
+          "line": 536,
           "column": 21
         }
       ]
@@ -3004,7 +3069,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 106,
+          "line": 169,
           "column": 25
         }
       ]
@@ -3034,7 +3099,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 343,
+          "line": 406,
           "column": 20
         }
       ]
@@ -3157,7 +3222,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 355,
+          "line": 418,
           "column": 32
         }
       ]
@@ -3193,6 +3258,20 @@
           "file": "shared/ui/Pagination.tsx",
           "line": 26,
           "column": 92
+        }
+      ]
+    },
+    "8ab9b6dc13ae660b": {
+      "source": "已安装 {name}。替换插件文件并保留已保存的账号？",
+      "kind": "template",
+      "placeholders": [
+        "name"
+      ],
+      "refs": [
+        {
+          "file": "features/plugins/PluginManagementPage.tsx",
+          "line": 130,
+          "column": 8
         }
       ]
     },
@@ -3347,7 +3426,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 268,
+          "line": 331,
           "column": 18
         }
       ]
@@ -3402,7 +3481,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 357,
+          "line": 420,
           "column": 31
         }
       ]
@@ -3472,7 +3551,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 683,
+          "line": 684,
           "column": 25
         }
       ]
@@ -3522,7 +3601,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 629,
+          "line": 630,
           "column": 111
         }
       ]
@@ -3573,12 +3652,12 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 99,
+          "line": 162,
           "column": 9
         },
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 317,
+          "line": 380,
           "column": 9
         }
       ]
@@ -3616,7 +3695,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 79,
+          "line": 142,
           "column": 11
         }
       ]
@@ -3628,7 +3707,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 125,
+          "line": 188,
           "column": 14
         }
       ]
@@ -3640,7 +3719,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 356,
+          "line": 419,
           "column": 30
         }
       ]
@@ -3654,7 +3733,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 172,
+          "line": 235,
           "column": 17
         },
         {
@@ -3847,7 +3926,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 192,
+          "line": 255,
           "column": 15
         }
       ]
@@ -3916,7 +3995,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 80,
+          "line": 143,
           "column": 11
         }
       ]
@@ -4005,7 +4084,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 695,
+          "line": 696,
           "column": 88
         }
       ]
@@ -4105,6 +4184,18 @@
         }
       ]
     },
+    "ac5bd4e2d774b305": {
+      "source": "请在桌面应用中选择插件目录",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "shared/api.ts",
+          "line": 584,
+          "column": 43
+        }
+      ]
+    },
     "ac69f68b7010ec79": {
       "source": "下载并安装",
       "kind": "text",
@@ -4174,12 +4265,12 @@
         },
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 590,
+          "line": 591,
           "column": 32
         },
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 596,
+          "line": 597,
           "column": 25
         },
         {
@@ -4203,7 +4294,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 645,
+          "line": 646,
           "column": 84
         }
       ]
@@ -4249,12 +4340,12 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 104,
+          "line": 167,
           "column": 7
         },
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 346,
+          "line": 409,
           "column": 70
         }
       ]
@@ -4295,7 +4386,12 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 102,
+          "line": 112,
+          "column": 57
+        },
+        {
+          "file": "features/plugins/PluginManagementPage.tsx",
+          "line": 165,
           "column": 11
         }
       ]
@@ -4468,7 +4564,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 698,
+          "line": 699,
           "column": 122
         }
       ]
@@ -4529,7 +4625,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 113,
+          "line": 176,
           "column": 83
         }
       ]
@@ -4570,7 +4666,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 304,
+          "line": 367,
           "column": 11
         }
       ]
@@ -4623,7 +4719,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 323,
+          "line": 386,
           "column": 45
         }
       ]
@@ -4678,7 +4774,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 101,
+          "line": 164,
           "column": 11
         }
       ]
@@ -4796,6 +4892,18 @@
         }
       ]
     },
+    "caf9b4c94097a333": {
+      "source": "选择插件目录",
+      "kind": "text",
+      "placeholders": [],
+      "refs": [
+        {
+          "file": "features/plugins/PluginManagementPage.tsx",
+          "line": 71,
+          "column": 50
+        }
+      ]
+    },
     "cb2f1709f983d2f4": {
       "source": "模型名称",
       "kind": "text",
@@ -4825,7 +4933,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 107,
+          "line": 170,
           "column": 9
         }
       ]
@@ -4837,12 +4945,12 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 230,
+          "line": 293,
           "column": 14
         },
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 298,
+          "line": 361,
           "column": 14
         }
       ]
@@ -4953,7 +5061,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 216,
+          "line": 279,
           "column": 20
         }
       ]
@@ -5107,7 +5215,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 347,
+          "line": 410,
           "column": 44
         }
       ]
@@ -5259,7 +5367,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 250,
+          "line": 313,
           "column": 25
         }
       ]
@@ -5271,7 +5379,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 672,
+          "line": 673,
           "column": 11
         }
       ]
@@ -5617,7 +5725,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 638,
+          "line": 639,
           "column": 100
         }
       ]
@@ -5713,7 +5821,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 274,
+          "line": 337,
           "column": 20
         }
       ]
@@ -5804,7 +5912,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginResourcePanels.tsx",
-          "line": 644,
+          "line": 645,
           "column": 84
         }
       ]
@@ -5884,7 +5992,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 206,
+          "line": 269,
           "column": 32
         }
       ]
@@ -5896,7 +6004,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 66,
+          "line": 119,
           "column": 14
         },
         {
@@ -6025,7 +6133,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 83,
+          "line": 146,
           "column": 20
         }
       ]
@@ -6037,7 +6145,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 332,
+          "line": 395,
           "column": 23
         }
       ]
@@ -6049,7 +6157,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 113,
+          "line": 176,
           "column": 19
         },
         {
@@ -6078,12 +6186,12 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 97,
+          "line": 160,
           "column": 7
         },
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 354,
+          "line": 417,
           "column": 29
         }
       ]
@@ -6146,7 +6254,7 @@
       "refs": [
         {
           "file": "features/plugins/PluginManagementPage.tsx",
-          "line": 206,
+          "line": 269,
           "column": 45
         }
       ]
