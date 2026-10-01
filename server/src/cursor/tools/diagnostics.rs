@@ -15,10 +15,12 @@ pub(crate) struct DiagnosticsState {
 /// 一次 Diagnostics 结果缺失时的统一失败表示;每条路径都必须给出可读错误。
 pub(crate) fn failed_result(error: impl Into<String>) -> pb::DiagnosticsResult {
     pb::DiagnosticsResult {
-        result: Some(pb::diagnostics_result::Result::Error(pb::DiagnosticsError {
-            path: String::new(),
-            error: error.into(),
-        })),
+        result: Some(pb::diagnostics_result::Result::Error(
+            pb::DiagnosticsError {
+                path: String::new(),
+                error: error.into(),
+            },
+        )),
     }
 }
 

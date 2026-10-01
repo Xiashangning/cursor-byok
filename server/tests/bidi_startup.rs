@@ -30,7 +30,9 @@ use tower::ServiceExt;
 const REQUEST_ID: &str = "slow-subagent-start";
 const APPEND: &str = "/aiserver.v1.BidiService/BidiAppend";
 
-async fn setup(detailed_logging: bool) -> (
+async fn setup(
+    detailed_logging: bool,
+) -> (
     tempfile::TempDir,
     TransportRegistry,
     fake_provider::FakeProvider,

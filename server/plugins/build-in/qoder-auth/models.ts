@@ -35,7 +35,7 @@ export function describeCatalogModel(entry: JsonValue): string | undefined {
   const free = model.is_free === true;
   if (free) parts.push("限免");
   const price = number(model.price_factor);
-  if (price !== null && !free) parts.push(`${price}x`);
+  if (price !== null && !free) parts.push(`${price}x 额度消耗`);
   if (promotionText) parts.push(promotionText);
   return parts.length > 0 ? parts.join(" · ") : undefined;
 }

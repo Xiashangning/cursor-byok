@@ -6,8 +6,8 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     model::{
-        project_messages, CanonicalMessage, ContentPart, ProjectedContent,
-        ProjectedMessage, Role, ToolCall, ToolCallContent, ToolRoundAssistant,
+        project_messages, CanonicalMessage, ContentPart, ProjectedContent, ProjectedMessage, Role,
+        ToolCall, ToolCallContent, ToolRoundAssistant,
     },
     Error, Result,
 };

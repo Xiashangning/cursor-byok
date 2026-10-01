@@ -111,12 +111,12 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
             // 客户端中止该运行("Subagent was aborted by the user")。显式覆盖
             // 已由服务端保存的 model_variant 生效,无需上线;resume=self 是
             // fork 新代理,仍按创建处理。
-            let model_parameters = if crate::cursor::tools::runtime::task_resume_target(call).is_some()
-            {
-                Vec::new()
-            } else {
-                task_model_parameters(call)?
-            };
+            let model_parameters =
+                if crate::cursor::tools::runtime::task_resume_target(call).is_some() {
+                    Vec::new()
+                } else {
+                    task_model_parameters(call)?
+                };
             Message::SubagentArgs(pb::SubagentArgs {
                 tool_call_id: call.call_id.clone(),
                 subagent_type: optional_string("subagent_type").unwrap_or_default(),

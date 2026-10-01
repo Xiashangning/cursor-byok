@@ -176,7 +176,10 @@ async fn new_requests_read_the_current_detailed_logging_setting() {
             loop {
                 let trace = store.cursor_trace(&request_id).await.unwrap();
                 if enabled {
-                    if trace.as_ref().is_some_and(|trace| trace.status == "completed") {
+                    if trace
+                        .as_ref()
+                        .is_some_and(|trace| trace.status == "completed")
+                    {
                         break trace;
                     }
                 } else if !recorder.is_enabled() {
