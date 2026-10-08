@@ -1,4 +1,4 @@
-✨ **By the author of cursor-byok** → [Baocode](https://baocode.dev) — an awesome desktop UI for Claude Code.
+## ✨ **By the author of cursor-byok** → [Baocode](https://baocode.dev) — an small、light desktop UI for Claude Code.
 
 <div align="center">
 
