@@ -1,3 +1,5 @@
+### 受够了Cursor的性能？ ✨ **同作者新作** → [Baocode](https://baocode.dev) —— 为 Claude Code 打造的精致的桌面 GUI，超小尺寸，超低占用
+
 <div align="center">
 
 # cursor-byok
