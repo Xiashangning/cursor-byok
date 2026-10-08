@@ -1,4 +1,4 @@
-## ✨ **By the author of cursor-byok** → [Baocode](https://baocode.dev) — an small、light desktop UI for Claude Code.
+### Is Cursor getting too heavy? ✨ **New from the same author** → [Baocode](https://baocode.dev) — an awesome desktop GUI for Claude Code: polished, ultra-small, ultra-light.
 
 <div align="center">
 
