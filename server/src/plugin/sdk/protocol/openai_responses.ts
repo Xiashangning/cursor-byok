@@ -1,4 +1,5 @@
 import type { JsonValue, PluginContext } from "../plugin.ts";
+import { object } from "../json.ts";
 import type { LlmContentPart, LlmRequest, ModelEvent, ProviderOutput } from "../provider.ts";
 
 /** 本协议产生的回放状态种类;与宿主内置 Responses Provider 一致,可互相回放。 */
@@ -19,10 +20,6 @@ export type OpenAiResponsesCall = {
   /** 最后合并进请求体,如 { store: false }。 */
   extraBody?: Record<string, JsonValue>;
 };
-
-function record(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-}
 
 function text(value: unknown): string | null {
   return typeof value === "string" ? value : null;
@@ -49,12 +46,12 @@ function contentParts(parts: LlmContentPart[], textType: "input_text" | "output_
 }
 
 function replayItems(value: JsonValue): JsonValue[] {
-  const items = record(value)?.items;
+  const items = object(value)?.items;
   if (!Array.isArray(items)) {
     throw new Error("OpenAI Responses replay state is missing items");
   }
   return items.map((item) => {
-    const source = record(item);
+    const source = object(item);
     if (source?.type !== "reasoning") {
       throw new Error("OpenAI Responses replay state contains a non-reasoning item");
     }
@@ -190,7 +187,7 @@ function itemText(item: Record<string, unknown>): string | null {
   const content = item.content;
   if (!Array.isArray(content)) return null;
   return content
-    .map((part) => record(part))
+    .map((part) => object(part))
     .filter((part) => part?.type === "output_text")
     .map((part) => text(part?.text) ?? "")
     .join("");
@@ -203,16 +200,16 @@ function requiredIndex(value: Record<string, unknown>): number {
 }
 
 function usageEvent(value: unknown): ModelEvent {
-  const usage = record(value) ?? {};
+  const usage = object(value) ?? {};
   return {
     type: "usage",
     usage: {
       inputTokens: count(usage.input_tokens),
       outputTokens: count(usage.output_tokens),
       totalTokens: count(usage.total_tokens),
-      cacheReadTokens: count(record(usage.input_tokens_details)?.cached_tokens),
+      cacheReadTokens: count(object(usage.input_tokens_details)?.cached_tokens),
       cacheWriteTokens: null,
-      reasoningTokens: count(record(usage.output_tokens_details)?.reasoning_tokens),
+      reasoningTokens: count(object(usage.output_tokens_details)?.reasoning_tokens),
     },
   };
 }
@@ -248,6 +245,8 @@ export async function streamOpenAiResponses(
 
   let textOpen = false;
   let streamedText = "";
+  /** streamedText 所属的输出 item;切换 item 即清空,缺 output_index 沿用。 */
+  let textIndex: number | null = null;
   let thinkingOpen = false;
   const tools = new Map<number, ToolState>();
   const reasoningItems: JsonValue[] = [];
@@ -278,6 +277,19 @@ export async function streamOpenAiResponses(
       streamedText = finalText;
     }
   };
+  // 与宿主 Rust 侧 #421 修复同源:output_text.done/output_item.done 报告的
+  // 终态文本只描述单个输出 item,补全基线必须是该 item 自己的增量。整条流
+  // 累积的基线让第 2 个文本 item 起 starts_with 恒为假,补齐(以及只发终态
+  // 的中继的整段文本)被静默丢弃。切换 output_index 清空基线;事件缺
+  // output_index 沿用当前作用域;同 item 重复终态因基线已等于终态而不重放。
+  const enterTextItem = (value: Record<string, unknown>) => {
+    const index = count(value.output_index);
+    if (index === null) return;
+    if (textIndex !== index) {
+      textIndex = index;
+      streamedText = "";
+    }
+  };
   const endStartedTools = () => {
     for (const [index, tool] of tools) {
       if (tool.started && !tool.ended) {
@@ -300,12 +312,13 @@ export async function streamOpenAiResponses(
     if (payload === "[DONE]") break;
     let value: Record<string, unknown>;
     try {
-      value = record(JSON.parse(payload)) ?? {};
+      value = object(JSON.parse(payload)) ?? {};
     } catch {
       throw new Error("OpenAI Responses SSE returned invalid JSON");
     }
     switch (value.type) {
       case "response.output_text.delta": {
+        enterTextItem(value);
         closeThinking();
         if (!textOpen) {
           textOpen = true;
@@ -319,6 +332,7 @@ export async function streamOpenAiResponses(
         break;
       }
       case "response.output_text.done": {
+        enterTextItem(value);
         const finalText = text(value.text);
         if (finalText !== null) reconcileText(finalText);
         closeText();
@@ -339,7 +353,7 @@ export async function streamOpenAiResponses(
         closeThinking();
         break;
       case "response.output_item.added": {
-        const item = record(value.item);
+        const item = object(value.item);
         if (item?.type !== "function_call") break;
         sawTool = true;
         for (const event of updateTool(requiredIndex(value), item, { kind: "none" }, false, tools)) {
@@ -348,12 +362,13 @@ export async function streamOpenAiResponses(
         break;
       }
       case "response.output_item.done": {
-        const item = record(value.item);
+        const item = object(value.item);
         if (item?.type === "reasoning") {
           closeThinking();
           reasoningItems.push(item as JsonValue);
         } else if (item?.type === "message") {
           sawCompletedItem = true;
+          enterTextItem(value);
           const finalText = itemText(item);
           if (finalText !== null) reconcileText(finalText);
           closeText();
@@ -388,7 +403,7 @@ export async function streamOpenAiResponses(
         break;
       }
       case "response.completed": {
-        const usage = record(value.response)?.usage;
+        const usage = object(value.response)?.usage;
         if (usage !== undefined) output.emit(usageEvent(usage));
         closeThinking();
         closeText();

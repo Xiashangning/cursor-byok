@@ -71,6 +71,36 @@ impl PluginDataStore {
             })
     }
 
+    /// 在同一把插件锁内完成"读-改-写",避免并发的刷新与删除互相覆写。
+    /// `modify` 接收当前值(不存在时为 Null),返回要持久化的新值。
+    pub async fn modify(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        modify: impl FnOnce(serde_json::Value) -> Result<serde_json::Value>,
+    ) -> Result<()> {
+        let path = self.path(plugin_id, key)?;
+        let lock = self.lock(plugin_id);
+        let _guard = lock.lock().await;
+        let current = match tokio::fs::read(&path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+            Err(error) => {
+                return Err(Error::Config(format!(
+                    "plugin data read failed at {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let next = modify(current)?;
+        self.write_locked(&path, key, &next).await.map_err(|error| {
+            Error::Config(format!(
+                "plugin data write failed at {}: {error}",
+                path.display()
+            ))
+        })
+    }
+
     /// 全程使用同步 IO 在阻塞线程完成:tokio 异步文件的关闭是延迟的,
     /// 替换前句柄可能仍被本进程持有;同步写入保证替换时句柄已确定关闭。
     async fn write_locked(&self, path: &Path, key: &str, value: &serde_json::Value) -> Result<()> {
@@ -160,14 +190,7 @@ fn write_once(
         .map_err(|error| ("sync temporary file", error))?;
     drop(file);
     let _ = set_file_permissions(temporary);
-    // Windows 的 rename 不覆盖已存在文件,先删除旧文件。
-    #[cfg(windows)]
-    match std::fs::remove_file(target) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(("remove previous file", error)),
-    }
-    std::fs::rename(temporary, target).map_err(|error| ("replace target file", error))?;
+    crate::fs::replace_file(temporary, target).map_err(|error| ("replace target file", error))?;
     let _ = set_file_permissions(target);
     Ok(())
 }
@@ -203,28 +226,28 @@ fn validate_component(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn set_directory_permissions(path: &Path) -> Result<()> {
+fn set_directory_permissions(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o700))?;
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = _path;
     }
     Ok(())
 }
 
-fn set_file_permissions(path: &Path) -> Result<()> {
+fn set_file_permissions(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = _path;
     }
     Ok(())
 }

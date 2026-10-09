@@ -1,4 +1,5 @@
 import type { JsonValue, PluginContext } from "../plugin.ts";
+import { object } from "../json.ts";
 import type { LlmContentPart, LlmRequest, ModelEvent, ProviderOutput } from "../provider.ts";
 
 /** 本协议产生的回放状态种类;与宿主内置 Chat Provider 一致,可互相回放。 */
@@ -19,12 +20,6 @@ export type OpenAiChatCall = {
   /** 最后合并进请求体。 */
   extraBody?: Record<string, JsonValue>;
 };
-
-function record(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
 
 function text(value: unknown): string | null {
   return typeof value === "string" ? value : null;
@@ -54,9 +49,7 @@ export function buildChatBody(call: OpenAiChatCall): Record<string, JsonValue> {
   }
   for (const message of call.request.messages) {
     if (message.role === "assistant") {
-      const reasoning = message.replayState?.providerKind === REPLAY_KIND
-        ? text(record(message.replayState.value)?.reasoning_content)
-        : null;
+      const reasoning = message.replayState?.providerKind === REPLAY_KIND ? text(object(message.replayState.value)?.reasoning_content) : null;
       // Chat Completions 拒绝空字符串的 assistant content;完全无可见
       // 内容的 assistant 消息不需要发送。
       if (!message.text && message.toolCalls.length === 0 && !reasoning) continue;
@@ -157,20 +150,20 @@ function eventError(value: Record<string, unknown>): string | null {
   const error = value.error;
   if (error === undefined || error === null) return null;
   if (typeof error === "string") return error;
-  return text(record(error)?.message) ?? JSON.stringify(error);
+  return text(object(error)?.message) ?? JSON.stringify(error);
 }
 
 function usageEvent(value: unknown): ModelEvent {
-  const usage = record(value) ?? {};
+  const usage = object(value) ?? {};
   return {
     type: "usage",
     usage: {
       inputTokens: count(usage.prompt_tokens),
       outputTokens: count(usage.completion_tokens),
       totalTokens: count(usage.total_tokens),
-      cacheReadTokens: count(record(usage.prompt_tokens_details)?.cached_tokens),
+      cacheReadTokens: count(object(usage.prompt_tokens_details)?.cached_tokens),
       cacheWriteTokens: null,
-      reasoningTokens: count(record(usage.completion_tokens_details)?.reasoning_tokens),
+      reasoningTokens: count(object(usage.completion_tokens_details)?.reasoning_tokens),
     },
   };
 }
@@ -213,6 +206,7 @@ export async function streamOpenAiChat(
 
   let textOpen = false;
   let thinkingOpen = false;
+  let sawText = false;
   let reasoning = "";
   const tools = new Map<number, ToolState>();
   let finalUsage: ModelEvent | null = null;
@@ -229,7 +223,7 @@ export async function streamOpenAiChat(
     }
     let value: Record<string, unknown>;
     try {
-      value = record(JSON.parse(payload)) ?? {};
+      value = object(JSON.parse(payload)) ?? {};
     } catch {
       throw new Error("OpenAI Chat SSE returned invalid JSON");
     }
@@ -238,9 +232,9 @@ export async function streamOpenAiChat(
     if (value.usage !== undefined && value.usage !== null) {
       finalUsage = usageEvent(value.usage);
     }
-    const choice = Array.isArray(value.choices) ? record(value.choices[0]) : null;
+    const choice = Array.isArray(value.choices) ? object(value.choices[0]) : null;
     if (!choice) continue;
-    const delta = record(choice.delta) ?? {};
+    const delta = object(choice.delta) ?? {};
     const reasoningDelta = text(delta.reasoning_content) ?? text(delta.reasoning);
     if (reasoningDelta) {
       if (!thinkingOpen) {
@@ -258,16 +252,17 @@ export async function streamOpenAiChat(
       }
       if (!textOpen) {
         textOpen = true;
+        sawText = true;
         output.emit({ type: "text-start" });
       }
       output.emit({ type: "text-delta", text: content });
     }
     if (Array.isArray(delta.tool_calls)) {
       for (const [position, rawTool] of delta.tool_calls.entries()) {
-        const toolDelta = record(rawTool);
+        const toolDelta = object(rawTool);
         if (!toolDelta) continue;
         const index = count(toolDelta.index) ?? position;
-        const fn = record(toolDelta.function) ?? {};
+        const fn = object(toolDelta.function) ?? {};
         for (
           const event of updateTool(
             index,
@@ -310,6 +305,12 @@ export async function streamOpenAiChat(
   }
   const reason = finish ??
     (sawDoneMarker ? (tools.size > 0 ? "tool-use" : "stop") : null);
+  // 空响应保护:既没有内容/工具调用也没有用量时,多数情况下是上游或
+  // 网关截断,不能按成功收尾。
+  const sawContent = sawText || reasoning.length > 0 || tools.size > 0;
+  if (!sawContent && finalUsage === null) {
+    throw new Error("OpenAI Chat stream returned an empty response");
+  }
   if (reason === null) {
     throw new Error("OpenAI Chat stream ended without finish_reason");
   }

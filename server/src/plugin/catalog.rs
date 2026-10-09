@@ -20,6 +20,7 @@ const MAX_ICON_BYTES: u64 = 1024 * 1024;
 #[derive(Clone)]
 pub struct PluginCatalog {
     roots: Vec<PathBuf>,
+    installed: PathBuf,
     definition_loader: PluginDefinitionLoader,
     app_version: String,
 }
@@ -45,19 +46,37 @@ impl PluginCatalog {
         // 内置插件按版本预装进 installed;版本一致时不写盘。
         super::builtin::install(&installed)?;
         // 扫描顺序即优先级:debug 下源码目录优先,保证内置插件热改生效;
-        // 发布构建只有 installed 一个根。
+        // 发布构建只有 installed 一个根。用户安装始终写入 installed。
         #[cfg(debug_assertions)]
         let roots = vec![
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/build-in"),
-            installed,
+            installed.clone(),
         ];
         #[cfg(not(debug_assertions))]
-        let roots = vec![installed];
+        let roots = vec![installed.clone()];
         Ok(Self {
             roots,
+            installed,
             definition_loader: PluginDefinitionLoader::managed()?,
             app_version,
         })
+    }
+
+    pub(crate) async fn install_user_plugin(
+        &self,
+        source: &Path,
+        executable: &Path,
+        replace: bool,
+    ) -> Result<super::user_install::PrepareOutcome> {
+        super::user_install::prepare(
+            &self.installed,
+            &self.definition_loader,
+            &self.app_version,
+            source,
+            executable,
+            replace,
+        )
+        .await
     }
 
     pub(crate) fn loader(&self) -> &PluginDefinitionLoader {
@@ -155,7 +174,7 @@ fn require_app_version(manifest: &PluginManifest, app_version: &str) -> Result<(
     )))
 }
 
-async fn load_plugin(
+pub(super) async fn load_plugin(
     directory: &Path,
     loader: &PluginDefinitionLoader,
     executable: &Path,
@@ -255,11 +274,42 @@ fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> 
         }
         for method in &resource.add {
             validate_id(&method.id, "plugin add method id")?;
-            if method.method_type != super::descriptor::OAUTH2_ADD_METHOD {
+            if !matches!(
+                method.method_type.as_str(),
+                super::descriptor::OAUTH2_ADD_METHOD
+                    | super::descriptor::OAUTH2_AUTHORIZATION_CODE_ADD_METHOD
+            ) {
                 return Err(Error::Config(format!(
                     "plugin '{plugin_id}' add method '{}' uses unsupported type '{}'",
                     method.id, method.method_type
                 )));
+            }
+            if method.method_type == super::descriptor::OAUTH2_ADD_METHOD
+                && method.callback.is_some()
+            {
+                return Err(Error::Config(format!(
+                    "plugin '{plugin_id}' device OAuth method '{}' cannot declare callback settings",
+                    method.id
+                )));
+            }
+            if let Some(callback) = &method.callback {
+                if callback.port == Some(0) {
+                    return Err(Error::Config(format!(
+                        "plugin '{plugin_id}' OAuth callback port must be greater than zero"
+                    )));
+                }
+                if let Some(path) = callback.path.as_deref() {
+                    if !path.starts_with('/')
+                        || path.len() > 128
+                        || path.contains('?')
+                        || path.contains('#')
+                        || path.contains("//")
+                    {
+                        return Err(Error::Config(format!(
+                            "plugin '{plugin_id}' contains invalid OAuth callback path '{path}'"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -291,7 +341,7 @@ fn icon_data_url(directory: &Path, relative: &str) -> Result<String> {
         _ => {
             return Err(Error::Config(format!(
                 "unsupported plugin icon: {relative}"
-            )))
+            )));
         }
     };
     Ok(format!(
@@ -308,10 +358,24 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/build-in");
         let sdk = tempfile::tempdir().unwrap();
         let catalog = PluginCatalog {
-            roots: vec![root],
+            roots: vec![root.clone()],
+            installed: root,
             definition_loader: PluginDefinitionLoader::for_test(sdk.path()).unwrap(),
             app_version: env!("CARGO_PKG_VERSION").into(),
         };
-        assert!(!catalog.manifests().is_empty());
+        let ids: Vec<_> = catalog
+            .manifests()
+            .into_iter()
+            .map(|(manifest, _)| manifest.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "dev.cursorbyok.examples.codex-auth",
+                "dev.cursorbyok.examples.grok-auth",
+                "dev.cursorbyok.examples.kimi-auth",
+                "dev.cursorbyok.examples.qoder-auth",
+            ]
+        );
     }
 }

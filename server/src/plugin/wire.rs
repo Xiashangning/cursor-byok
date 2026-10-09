@@ -165,13 +165,13 @@ pub fn model_event(value: &serde_json::Value) -> Result<ModelEvent> {
             reason => {
                 return Err(Error::Protocol(format!(
                     "unknown plugin finish reason: {reason}"
-                )))
+                )));
             }
         }),
         kind => {
             return Err(Error::Protocol(format!(
                 "unknown plugin model event: {kind}"
-            )))
+            )));
         }
     };
     Ok(event)

@@ -1,5 +1,6 @@
 {
   "fmt": {
     "lineWidth": 200
-  }
+  },
+  "importMap": "./import-map.json"
 }

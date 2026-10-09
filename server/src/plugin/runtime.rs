@@ -28,6 +28,8 @@ struct PluginRuntimeInner {
     status: RwLock<PluginRuntimeStatus>,
     initializing: AtomicBool,
     cancellation: Mutex<Option<CancellationToken>>,
+    #[cfg(test)]
+    test_executable: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -126,6 +128,8 @@ impl PluginRuntime {
                 status: RwLock::new(status),
                 initializing: AtomicBool::new(false),
                 cancellation: Mutex::new(None),
+                #[cfg(test)]
+                test_executable: None,
             }),
         })
     }
@@ -142,7 +146,20 @@ impl PluginRuntime {
         status.clone()
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test(root: PathBuf, executable: PathBuf) -> Result<Self> {
+        let mut runtime = Self::new(root)?;
+        Arc::get_mut(&mut runtime.inner)
+            .expect("new runtime")
+            .test_executable = Some(executable);
+        Ok(runtime)
+    }
+
     pub fn executable(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = &self.inner.test_executable {
+            return Some(path.clone());
+        }
         let asset = self.inner.asset?;
         if self.status().state != PluginRuntimeState::Ready {
             return None;

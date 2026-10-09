@@ -75,6 +75,7 @@ export function __descriptor(definition: ProviderPluginDefinition) {
       providerType: provider.providerType,
       resourceType: provider.resourceType ?? null,
       hasModels: provider.models !== undefined,
+      hasNotes: provider.models?.notes !== undefined,
     })),
     resources: (definition.resources ?? []).map((resource) => ({
       type: resource.type,
@@ -84,6 +85,12 @@ export function __descriptor(definition: ProviderPluginDefinition) {
         id: method.id,
         displayName: method.displayName,
         description: method.description ?? null,
+        callback: method.type === "oauth2.authorization-code"
+          ? {
+            port: method.callback?.port ?? null,
+            path: method.callback?.path ?? "/oauth-callback",
+          }
+          : null,
       })),
       import: resource.import
         ? {
@@ -93,6 +100,13 @@ export function __descriptor(definition: ProviderPluginDefinition) {
           multiple: resource.import.multiple ?? false,
         }
         : null,
+      actions: (resource.actions ?? []).map((action) => ({
+        id: action.id,
+        displayName: action.displayName,
+        description: action.description ?? null,
+        target: action.target ?? "resource",
+        destructive: action.destructive ?? false,
+      })),
       canRefresh: resource.refresh !== undefined,
       canRemove: resource.remove !== undefined,
     })),

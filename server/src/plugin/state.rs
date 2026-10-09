@@ -138,8 +138,37 @@ pub struct StoredModel {
     pub max_output_tokens: Option<u64>,
     #[serde(default)]
     pub images: bool,
+    /// 插件给出的 effort 档位;为空时描述符回退到宿主的默认列表。
+    #[serde(default)]
+    pub effort_options: Vec<String>,
+    /// 插件给出的上下文窗口;为空时描述符回退到宿主的默认列表。
+    #[serde(default)]
+    pub context_options: Vec<String>,
     #[serde(default)]
     pub private_data: serde_json::Value,
+}
+
+/// 选项列表按覆盖路径的同一规则归一:去空白、小写、丢空值、保序去重。
+fn definition_options(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<String> {
+    let mut options: Vec<String> = Vec::new();
+    for value in object
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(option) = value.as_str() else {
+            continue;
+        };
+        let option = option.trim().to_ascii_lowercase();
+        if !option.is_empty() && !options.contains(&option) {
+            options.push(option);
+        }
+    }
+    options
 }
 
 impl StoredModel {
@@ -179,6 +208,8 @@ impl StoredModel {
                 .get("maxOutputTokens")
                 .and_then(serde_json::Value::as_u64),
             images: capability("images"),
+            effort_options: definition_options(object, "effortOptions"),
+            context_options: definition_options(object, "contextOptions"),
             private_data: object
                 .get("privateData")
                 .cloned()
@@ -193,6 +224,8 @@ impl StoredModel {
             "displayName": self.display_name,
             "description": self.description,
             "maxOutputTokens": self.max_output_tokens,
+            "effortOptions": self.effort_options,
+            "contextOptions": self.context_options,
             "capabilities": { "images": self.images },
             "privateData": self.private_data,
         })
@@ -224,10 +257,7 @@ impl PluginStateStore {
             .data
             .read(plugin_id, &resource_key(resource_type))
             .await?;
-        if value.is_null() {
-            return Ok(Vec::new());
-        }
-        Ok(serde_json::from_value(value)?)
+        parse_records(value)
     }
 
     pub async fn upsert_resources(
@@ -236,40 +266,45 @@ impl PluginStateStore {
         resource_type: &str,
         drafts: Vec<ResourceDraft>,
     ) -> Result<UpsertOutcome> {
-        let mut records = self.resources(plugin_id, resource_type).await?;
         let now = now_ms();
         let mut outcome = UpsertOutcome {
             added: 0,
             updated: 0,
         };
-        for draft in drafts {
+        for draft in &drafts {
             if draft.key.trim().is_empty() {
                 return Err(Error::Protocol("plugin resource draft requires key".into()));
             }
-            let state = draft
-                .state
-                .map_or(ResourceState::Ready, ResourceState::from);
-            match records.iter_mut().find(|record| record.key == draft.key) {
-                Some(existing) => {
-                    existing.private_data = draft.private_data;
-                    existing.state = state;
-                    existing.updated_at_ms = now;
-                    outcome.updated += 1;
-                }
-                None => {
-                    records.push(ResourceRecord {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        key: draft.key,
-                        private_data: draft.private_data,
-                        state,
-                        created_at_ms: now,
-                        updated_at_ms: now,
-                    });
-                    outcome.added += 1;
-                }
-            }
         }
-        self.save_resources(plugin_id, resource_type, &records)
+        self.data
+            .modify(plugin_id, &resource_key(resource_type), |value| {
+                let mut records = parse_records(value)?;
+                for draft in drafts {
+                    let state = draft
+                        .state
+                        .map_or(ResourceState::Ready, ResourceState::from);
+                    match records.iter_mut().find(|record| record.key == draft.key) {
+                        Some(existing) => {
+                            existing.private_data = draft.private_data;
+                            existing.state = state;
+                            existing.updated_at_ms = now;
+                            outcome.updated += 1;
+                        }
+                        None => {
+                            records.push(ResourceRecord {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                key: draft.key,
+                                private_data: draft.private_data,
+                                state,
+                                created_at_ms: now,
+                                updated_at_ms: now,
+                            });
+                            outcome.added += 1;
+                        }
+                    }
+                }
+                Ok(serde_json::to_value(records)?)
+            })
             .await?;
         Ok(outcome)
     }
@@ -281,19 +316,22 @@ impl PluginStateStore {
         resource_id: &str,
         patch: ResourcePatch,
     ) -> Result<()> {
-        let mut records = self.resources(plugin_id, resource_type).await?;
-        let record = records
-            .iter_mut()
-            .find(|record| record.id == resource_id)
-            .ok_or_else(|| Error::RunNotFound(format!("plugin resource {resource_id}")))?;
-        if let Some(private_data) = patch.private_data {
-            record.private_data = private_data;
-        }
-        if let Some(state) = patch.state {
-            record.state = state.into();
-        }
-        record.updated_at_ms = now_ms();
-        self.save_resources(plugin_id, resource_type, &records)
+        self.data
+            .modify(plugin_id, &resource_key(resource_type), |value| {
+                let mut records = parse_records(value)?;
+                let record = records
+                    .iter_mut()
+                    .find(|record| record.id == resource_id)
+                    .ok_or_else(|| Error::RunNotFound(format!("plugin resource {resource_id}")))?;
+                if let Some(private_data) = patch.private_data {
+                    record.private_data = private_data;
+                }
+                if let Some(state) = patch.state {
+                    record.state = state.into();
+                }
+                record.updated_at_ms = now_ms();
+                Ok(serde_json::to_value(records)?)
+            })
             .await
     }
 
@@ -303,15 +341,19 @@ impl PluginStateStore {
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ResourceRecord> {
-        let mut records = self.resources(plugin_id, resource_type).await?;
-        let index = records
-            .iter()
-            .position(|record| record.id == resource_id)
-            .ok_or_else(|| Error::RunNotFound(format!("plugin resource {resource_id}")))?;
-        let removed = records.remove(index);
-        self.save_resources(plugin_id, resource_type, &records)
+        let mut removed: Option<ResourceRecord> = None;
+        self.data
+            .modify(plugin_id, &resource_key(resource_type), |value| {
+                let mut records = parse_records(value)?;
+                let index = records
+                    .iter()
+                    .position(|record| record.id == resource_id)
+                    .ok_or_else(|| Error::RunNotFound(format!("plugin resource {resource_id}")))?;
+                removed = Some(records.remove(index));
+                Ok(serde_json::to_value(records)?)
+            })
             .await?;
-        Ok(removed)
+        Ok(removed.expect("remove_resource stashed the removed record"))
     }
 
     pub async fn models(&self, plugin_id: &str, provider_id: &str) -> Result<Vec<StoredModel>> {
@@ -340,21 +382,6 @@ impl PluginStateStore {
     pub async fn clear(&self, plugin_id: &str) -> Result<()> {
         self.data.clear(plugin_id).await
     }
-
-    async fn save_resources(
-        &self,
-        plugin_id: &str,
-        resource_type: &str,
-        records: &[ResourceRecord],
-    ) -> Result<()> {
-        self.data
-            .update(
-                plugin_id,
-                &resource_key(resource_type),
-                &serde_json::to_value(records)?,
-            )
-            .await
-    }
 }
 
 pub fn now_ms() -> i64 {
@@ -362,6 +389,13 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or_default()
+}
+
+fn parse_records(value: serde_json::Value) -> Result<Vec<ResourceRecord>> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    Ok(serde_json::from_value(value)?)
 }
 
 fn resource_key(resource_type: &str) -> String {
@@ -436,12 +470,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_persistence_failures_are_propagated() {
+        let (root, store) = store();
+        store
+            .upsert_resources(
+                "dev.example",
+                "account",
+                vec![ResourceDraft {
+                    key: "acct-1".into(),
+                    private_data: serde_json::json!({"token":"one"}),
+                    state: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let record = store
+            .resources("dev.example", "account")
+            .await
+            .unwrap()
+            .remove(0);
+        let plugin_directory = root.path().join("data/dev.example");
+        std::fs::remove_dir_all(&plugin_directory).unwrap();
+        std::fs::write(&plugin_directory, "blocks directory creation").unwrap();
+
+        let result = store
+            .apply_patch(
+                "dev.example",
+                "account",
+                &record.id,
+                ResourcePatch {
+                    private_data: Some(serde_json::json!({"token":"rotated"})),
+                    state: None,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn replaces_model_catalogs() {
         let (_root, store) = store();
         let model = StoredModel::from_definition(&serde_json::json!({
             "id": "gpt-test",
             "displayName": "GPT Test",
             "capabilities": {"images": true},
+            "effortOptions": ["low", "XHIGH", " "],
+            "contextOptions": ["200k", "200K", "1m"],
             "privateData": {"reasoningEfforts": ["low"]},
         }))
         .unwrap();
@@ -452,6 +526,13 @@ mod tests {
         let models = store.models("dev.example", "codex").await.unwrap();
         assert_eq!(models.len(), 1);
         assert!(models[0].images);
+        // 选项按覆盖路径的同一规则归一:小写、去空、保序去重。
+        assert_eq!(models[0].effort_options, vec!["low", "xhigh"]);
+        assert_eq!(models[0].context_options, vec!["200k", "1m"]);
         assert_eq!(models[0].private_data["reasoningEfforts"][0], "low");
+        assert_eq!(
+            models[0].snapshot()["contextOptions"],
+            serde_json::json!(["200k", "1m"])
+        );
     }
 }

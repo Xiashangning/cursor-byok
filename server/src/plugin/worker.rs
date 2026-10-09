@@ -36,6 +36,7 @@ pub enum WorkerStreamItem {
 }
 
 type Pending = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<WorkerStreamItem>>>>;
+type Invocations = Arc<Mutex<HashMap<String, Arc<InvocationState>>>>;
 type StreamLines = Arc<Mutex<mpsc::Receiver<Result<String>>>>;
 
 #[derive(Clone)]
@@ -81,7 +82,7 @@ struct HostContext {
     plugin_id: String,
     network_hosts: Arc<HashSet<String>>,
     store: Store,
-    invocations: Arc<Mutex<HashMap<String, Arc<InvocationState>>>>,
+    invocations: Invocations,
     streams: Arc<Mutex<HashMap<String, StreamLines>>>,
 }
 
@@ -128,8 +129,8 @@ impl PluginWorker {
         params: serde_json::Value,
         cancellation: CancellationToken,
     ) -> Result<serde_json::Value> {
-        let mut items = self
-            .invoke_streaming(method, params, cancellation, None)
+        let (id, mut items) = self
+            .start_invocation(method, params, cancellation, None)
             .await?;
         let result = tokio::time::timeout(INVOCATION_TIMEOUT, async {
             while let Some(item) = items.recv().await {
@@ -145,10 +146,13 @@ impl PluginWorker {
         .await;
         match result {
             Ok(result) => result,
-            Err(_) => Err(Error::Provider(format!(
-                "plugin '{}' invocation timed out",
-                self.inner.plugin_id
-            ))),
+            Err(_) => {
+                cancel_invocation(&self.inner, &id, false).await;
+                Err(Error::Provider(format!(
+                    "plugin '{}' invocation timed out",
+                    self.inner.plugin_id
+                )))
+            }
         }
     }
 
@@ -161,6 +165,18 @@ impl PluginWorker {
         cancellation: CancellationToken,
         recorder: Option<CallRecorder>,
     ) -> Result<mpsc::UnboundedReceiver<WorkerStreamItem>> {
+        self.start_invocation(method, params, cancellation, recorder)
+            .await
+            .map(|(_, receiver)| receiver)
+    }
+
+    async fn start_invocation(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        cancellation: CancellationToken,
+        recorder: Option<CallRecorder>,
+    ) -> Result<(String, mpsc::UnboundedReceiver<WorkerStreamItem>)> {
         let id = uuid::Uuid::new_v4().to_string();
         let request_cancellation = CancellationToken::new();
         self.inner.host.invocations.lock().await.insert(
@@ -199,34 +215,32 @@ impl PluginWorker {
         let inner = self.inner.clone();
         let request_id = id.clone();
         tokio::spawn(async move {
-            tokio::select! {
-                _ = cancellation.cancelled() => {
-                    request_cancellation.cancel();
-                    if let Some(process) = inner.process.lock().await.as_ref() {
-                        let _ = write_message(&process.stdin, &HostMessage::Cancel { id: &request_id }).await;
-                    }
-                    let _ = sender.send(WorkerStreamItem::Result(Err(Error::Cancelled)));
-                    inner.pending.lock().await.remove(&request_id);
-                    inner.host.invocations.lock().await.remove(&request_id);
-                }
-                _ = sender.closed() => {
-                    inner.host.invocations.lock().await.remove(&request_id);
-                }
-            }
+            let report_cancelled = tokio::select! {
+                _ = cancellation.cancelled() => true,
+                _ = sender.closed() => false,
+            };
+            cancel_invocation(&inner, &request_id, report_cancelled).await;
         });
-        Ok(receiver)
+        Ok((id, receiver))
     }
 
     pub async fn stop(&self) {
         if let Some(mut process) = self.inner.process.lock().await.take() {
             let _ = process.child.kill().await;
         }
-        fail_pending(&self.inner.pending, "plugin worker stopped").await;
+        fail_pending(
+            &self.inner.pending,
+            &self.inner.host.invocations,
+            "plugin worker stopped",
+        )
+        .await;
     }
 
     async fn cleanup(&self, id: &str) {
-        self.inner.pending.lock().await.remove(id);
-        self.inner.host.invocations.lock().await.remove(id);
+        let _ = self.inner.pending.lock().await.remove(id);
+        if let Some(state) = self.inner.host.invocations.lock().await.remove(id) {
+            state.cancellation.cancel();
+        }
     }
 
     async fn stdin(&self) -> Result<Arc<Mutex<ChildStdin>>> {
@@ -311,6 +325,65 @@ impl PluginWorker {
     }
 }
 
+async fn take_invocation(
+    pending: &Pending,
+    invocations: &Invocations,
+    id: &str,
+) -> (
+    Option<mpsc::UnboundedSender<WorkerStreamItem>>,
+    Option<Arc<InvocationState>>,
+) {
+    let sender = pending.lock().await.remove(id);
+    let state = invocations.lock().await.remove(id);
+    (sender, state)
+}
+
+async fn cancel_pending_invocation(
+    pending: &Pending,
+    invocations: &Invocations,
+    id: &str,
+    report_cancelled: bool,
+) -> bool {
+    let (sender, state) = take_invocation(pending, invocations, id).await;
+    if sender.is_none() && state.is_none() {
+        return false;
+    }
+    if let Some(state) = state {
+        state.cancellation.cancel();
+    }
+    if report_cancelled {
+        if let Some(sender) = sender {
+            let _ = sender.send(WorkerStreamItem::Result(Err(Error::Cancelled)));
+        }
+    }
+    true
+}
+
+async fn cancel_invocation(inner: &PluginWorkerInner, id: &str, report_cancelled: bool) {
+    if !cancel_pending_invocation(
+        &inner.pending,
+        &inner.host.invocations,
+        id,
+        report_cancelled,
+    )
+    .await
+    {
+        return;
+    }
+    let stdin = inner
+        .process
+        .lock()
+        .await
+        .as_ref()
+        .map(|process| process.stdin.clone());
+    if let Some(stdin) = stdin {
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            let _ = write_message(&stdin, &HostMessage::Cancel { id: &id }).await;
+        });
+    }
+}
+
 fn spawn_stdout_reader(
     plugin_id: String,
     stdout: tokio::process::ChildStdout,
@@ -330,7 +403,9 @@ fn spawn_stdout_reader(
             };
             match message {
                 WorkerMessage::Result { id, result, error } => {
-                    if let Some(sender) = pending.lock().await.remove(&id) {
+                    let sender = pending.lock().await.remove(&id);
+                    host.invocations.lock().await.remove(&id);
+                    if let Some(sender) = sender {
                         let value = match error {
                             Some(error) => {
                                 Err(Error::Provider(format!("plugin '{plugin_id}': {error}")))
@@ -382,7 +457,12 @@ fn spawn_stdout_reader(
                 }
             }
         }
-        fail_pending(&pending, &format!("plugin '{plugin_id}' worker exited")).await;
+        fail_pending(
+            &pending,
+            &host.invocations,
+            &format!("plugin '{plugin_id}' worker exited"),
+        )
+        .await;
     });
 }
 
@@ -410,8 +490,13 @@ async fn write_message(stdin: &Arc<Mutex<ChildStdin>>, message: &HostMessage<'_>
     Ok(())
 }
 
-async fn fail_pending(pending: &Pending, message: &str) {
-    for (_, sender) in std::mem::take(&mut *pending.lock().await) {
+async fn fail_pending(pending: &Pending, invocations: &Invocations, message: &str) {
+    let states = std::mem::take(&mut *invocations.lock().await);
+    let senders = std::mem::take(&mut *pending.lock().await);
+    for (_, state) in states {
+        state.cancellation.cancel();
+    }
+    for (_, sender) in senders {
         let _ = sender.send(WorkerStreamItem::Result(Err(Error::Provider(
             message.into(),
         ))));
@@ -725,6 +810,90 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn resource_actions_keep_worker_cancellation_isolated() {
+        let executable = std::path::PathBuf::from("deno");
+        if std::process::Command::new(&executable)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let entry_path = directory.path().join("main.ts");
+        std::fs::write(&entry_path, include_str!("fixtures/resource_actions.ts")).unwrap();
+        let loader =
+            super::super::definition::PluginDefinitionLoader::for_test(directory.path()).unwrap();
+        let definition = loader
+            .load(&executable, directory.path(), &entry_path)
+            .await
+            .unwrap();
+        assert_eq!(definition.resources[0].actions.len(), 2);
+        let entry = PluginEntry {
+            directory: directory.path().to_owned(), entry: entry_path,
+            manifest: serde_json::from_value(serde_json::json!({
+                "apiVersion": 1, "id": "dev.actions", "name": "Actions", "version": "1.0.0", "icon": "unused.svg", "entry": "main.ts"
+            })).unwrap(), definition, icon: String::new(),
+        };
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let id = "plugin:dev.actions/provider/model";
+        let over = crate::store::PluginModelOverride {
+            display_name: Some("Custom model".into()),
+            ..Default::default()
+        };
+        store
+            .set_plugin_model_override(id, over.clone())
+            .await
+            .unwrap();
+        store
+            .set_disabled_plugin_models(&std::collections::HashSet::from([id.to_owned()]))
+            .await
+            .unwrap();
+        let worker = PluginWorker::new(&entry, executable, loader, store.clone());
+        let params = serde_json::json!({"resourceType": "account", "actionId": "wait", "resource": {"id": "fixture", "type": "account", "key": "fixture", "privateData": {}, "state": {"status": "ready"}}});
+        let cancellation = CancellationToken::new();
+        let mut waiting = worker
+            .invoke_streaming(
+                "resource.action",
+                params.clone(),
+                cancellation.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut details = params;
+        details["actionId"] = "details".into();
+        let value = worker
+            .invoke("resource.action", details.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let result: super::super::descriptor::ResourceActionResult =
+            serde_json::from_value(value).unwrap();
+        assert!(result.patch.is_some());
+        let response = super::super::descriptor::ResourceActionResponse::from(result);
+        assert!(!serde_json::to_string(&response).unwrap().contains("token"));
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), waiting.recv())
+                .await
+                .unwrap(),
+            Some(WorkerStreamItem::Result(Err(Error::Cancelled)))
+        ));
+        assert!(worker.inner.pending.lock().await.is_empty());
+        assert!(worker.inner.host.invocations.lock().await.is_empty());
+        assert!(worker
+            .invoke("resource.action", details, CancellationToken::new())
+            .await
+            .is_ok());
+        assert_eq!(
+            store.plugin_model_overrides().await.unwrap().get(id),
+            Some(&over)
+        );
+        assert!(store.disabled_plugin_models().await.unwrap().contains(id));
+        worker.stop().await;
+    }
+
     async fn recorder(detailed: bool, call_id: &str) -> (tempfile::TempDir, Store, CallRecorder) {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::connect(&format!(
@@ -858,6 +1027,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detailed_failover_rewrites_the_attempt_without_primary_key_errors() {
+        let (_directory, store, recorder) = recorder(true, "detailed-failover").await;
+        let first = host_with_recorder(store.clone(), recorder.clone()).await;
+        let mut first_params = network_params();
+        first_params["body"] = "{\"attempt\":1}".into();
+        assert!(first
+            .request("invocation", &first_params)
+            .await
+            .unwrap()
+            .2
+            .is_some());
+        recorder.response_headers(429).await.unwrap();
+        recorder.response_chunk(b"first-attempt").await.unwrap();
+
+        let second = host_with_recorder(store.clone(), recorder.clone()).await;
+        let mut second_params = network_params();
+        second_params["body"] = "{\"attempt\":2}".into();
+        assert!(second
+            .request("invocation", &second_params)
+            .await
+            .unwrap()
+            .2
+            .is_some());
+        recorder.response_headers(200).await.unwrap();
+        recorder.response_chunk(b"second-attempt").await.unwrap();
+        recorder.completed(FinishReason::Stop).await.unwrap();
+
+        let request = store
+            .llm_call_request("detailed-failover")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.body, serde_json::json!({"attempt": 2}));
+        let chunks = store.llm_call_chunks("detailed-failover").await.unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].data, "second-attempt");
+        assert_eq!(
+            store
+                .llm_call("detailed-failover")
+                .await
+                .unwrap()
+                .unwrap()
+                .http_status,
+            Some(200)
+        );
+    }
+
+    #[tokio::test]
     async fn standard_plugin_network_recording_keeps_metrics_without_payloads() {
         let (_directory, store, recorder) = recorder(false, "standard-plugin").await;
         let host = host_with_recorder(store.clone(), recorder.clone()).await;
@@ -888,5 +1105,30 @@ mod tests {
         assert_eq!(summary.response_bytes, response.len() as i64);
         assert_eq!(summary.stream_event_count, 1);
         assert!(!summary.detailed);
+    }
+
+    #[tokio::test]
+    async fn removing_invocation_cancels_host_requests_and_clears_both_maps() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let invocations = Arc::new(Mutex::new(HashMap::new()));
+        let cancellation = CancellationToken::new();
+        let state = Arc::new(InvocationState {
+            cancellation: cancellation.clone(),
+            recorder: None,
+            recorder_claimed: AtomicBool::new(false),
+        });
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        pending.lock().await.insert("invocation".into(), sender);
+        invocations.lock().await.insert("invocation".into(), state);
+
+        assert!(cancel_pending_invocation(&pending, &invocations, "invocation", true).await);
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(WorkerStreamItem::Result(Err(Error::Cancelled)))
+        ));
+        assert!(cancellation.is_cancelled());
+        assert!(pending.lock().await.is_empty());
+        assert!(invocations.lock().await.is_empty());
     }
 }
