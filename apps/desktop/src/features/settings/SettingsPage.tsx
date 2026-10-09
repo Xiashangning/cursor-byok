@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { api, type ProxySettings, type ProxySettingsInput, type StatisticsStorage, type StatisticsStorageScope, type TabSettings } from "../../shared/api";
+import { api, type ProxySettings, type ProxySettingsInput, type StorageCleanupMode, type StorageStatistics, type TabSettings } from "../../shared/api";
 import { PageContent } from "../../shell/layout/PageContent";
-import { LegacyModelImport } from "../models/LegacyModelImport";
+import { AccessTokenSettingsCard } from "./AccessTokenSettingsCard";
+import { AppApiSettingsCard } from "./AppApiSettingsCard";
 import { AppLifecycleSettingsCard } from "./AppLifecycleSettingsCard";
 import { CommitSettingsCard } from "./CommitSettingsCard";
 import { ProxySettingsCard } from "./ProxySettingsCard";
@@ -26,10 +27,10 @@ export function SettingsPage() {
   const [servicePort, setServicePort] = useState(String(ports.service_port));
   const [editingPorts, setEditingPorts] = useState(false);
   const [savingPorts, setSavingPorts] = useState(false);
-  const [storage, setStorage] = useState<StatisticsStorage | null>(null);
+  const [storage, setStorage] = useState<StorageStatistics | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
-  const [clearScope, setClearScope] = useState<StatisticsStorageScope>("details");
   const [clearing, setClearing] = useState(false);
+  const [cleanupMode, setCleanupMode] = useState<StorageCleanupMode>("cache");
   const [outboundProxy, setOutboundProxy] = useState<ProxySettings | null>(null);
   const [proxyDraft, setProxyDraft] = useState<ProxySettingsInput>({ mode: "default", address: "", auth_enabled: false, username: "", password: "" });
   const [editingProxy, setEditingProxy] = useState(false);
@@ -86,13 +87,14 @@ export function SettingsPage() {
     setServicePort(String(ports.service_port));
     setEditingPorts(false);
   };
-  const clearStorage = async () => {
+  const cleanStorage = async (mode: StorageCleanupMode) => {
     try {
       setClearing(true);
-      setStorage(await api.clearStatisticsStorage(clearScope));
+      const cleaned = await api.cleanStorage(mode);
+      setStorage(cleaned.storage);
       setConfirmClear(false);
       await appStore.refresh();
-      message(clearScope === "all" ? t("全部统计数据已清理") : t("详细记录已清理"));
+      message(t("存储空间已清理，释放 {size}", { size: formatBytes(cleaned.freed_bytes) }));
     } catch (cause) {
       message(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -156,10 +158,8 @@ export function SettingsPage() {
     while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
     return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
   };
-  const clearTitle = clearScope === "all" ? t("确定要清理全部统计数据吗？") : t("确定要清理详细记录吗？");
-  const clearDescription = clearScope === "all"
-    ? t("所有调用汇总、详细内容和追踪记录都会被删除。模型配置、CA 和应用设置不会受到影响，此操作无法撤销。")
-    : t("仅删除请求、响应和追踪附件等详细内容，保留调用汇总、统计指标和配置。");
+  const clearDescription = t("清理详细模式记录的客户端请求、服务端响应与追踪附件，以及不可达的历史数据和无服务端引用的状态缓存，并回收空闲页；同时删除缓存中的 semble 索引、克隆仓库与网页缓存（下次使用时重建）。调用记录、模型配置和应用设置会保留，此操作无法撤销。");
+  const resetDescription = t("在仅清除缓存的基础上，进一步清空所有调用记录与会话数据。保留数据库中的模型配置、应用设置，插件安装、登录账户、启用的插件模型和相关配置，以及用户规则和嵌入模型权重，此操作无法撤销。");
   const content = (
     <div className={styles.page}>
       <TitledCard title={t("调用观测")}>
@@ -228,21 +228,12 @@ export function SettingsPage() {
           </div>
         </div>
       </TitledCard>
+      <AccessTokenSettingsCard />
+      <AppApiSettingsCard servicePort={ports.service_port} />
       <ProxySettingsCard settings={outboundProxy} draft={proxyDraft} editing={editingProxy} saving={savingProxy} onDraftChange={setProxyDraft} onEdit={editProxy} onCancel={cancelProxyEdit} onSave={() => void saveProxy()} />
       <TabSettingsCard settings={tabSettings} draft={tabDraft} editing={editingTab} saving={savingTab} onDraftChange={setTabDraft} onEdit={editTab} onCancel={cancelTabEdit} onSave={() => void saveTab()} />
       <CommitSettingsCard />
       <AppLifecycleSettingsCard />
-      <LegacyModelImport>{({ busy, previewing, open }) => <TitledCard title={t("导入")}>
-        <div className={styles.importRow}>
-          <div>
-            <strong>{t("旧版配置")}</strong>
-            <small>{t("从本机旧版配置读取模型；确认前会显示新增和已存在的模型。")}</small>
-          </div>
-          <Button size="small" disabled={busy} onClick={open}>
-            {previewing ? t("读取中…") : t("查看并导入")}
-          </Button>
-        </div>
-      </TitledCard>}</LegacyModelImport>
       <TitledCard title={t("语言")}>
         <div className={styles.settingRow}>
           <div>
@@ -278,39 +269,61 @@ export function SettingsPage() {
       </TitledCard>
       <TitledCard title={t("存储管理")}>
         <div className={styles.storageRow}>
-          <div>
-            <strong>{t("统计数据")}</strong>
-            <small>{storage ? formatBytes(storage.bytes) : t("计算中…")}</small>
+          <div className={styles.storageStats}>
+            <div>
+              <strong>{t("统计数据")}</strong>
+              <small>{storage ? formatBytes(storage.bytes) : t("计算中…")}</small>
+            </div>
+            <div>
+              <strong>{t("缓存占用")}</strong>
+              <small>{storage ? formatBytes(storage.cache_bytes) : t("计算中…")}</small>
+            </div>
           </div>
-          <button
-            type="button"
-            className={styles.textButton}
-            onClick={() => { setClearScope("details"); setConfirmClear(true); }}
-          >
-            {t("清理存储空间")}
-          </button>
+          <div className={styles.storageActions}>
+            <button
+              type="button"
+              className={styles.textButton}
+              onClick={() => setConfirmClear(true)}
+            >
+              {t("清理存储空间")}
+            </button>
+          </div>
         </div>
       </TitledCard>
       <ConfirmDialog
         open={confirmClear}
-        title={clearTitle}
+        title={t("确定要清理存储空间吗？")}
         busy={clearing}
         cancelLabel={t("取消")}
         confirmLabel={t("确认清理")}
         onCancel={() => setConfirmClear(false)}
-        onConfirm={() => void clearStorage()}
+        onConfirm={() => void cleanStorage(cleanupMode)}
       >
         <div className={styles.confirmContent}>
-          <Select
-            value={clearScope}
-            ariaLabel={t("清理范围")}
-            options={[
-              { value: "details", label: t("仅清理详细记录") },
-              { value: "all", label: t("清理全部统计数据") },
-            ]}
-            onChange={(value) => setClearScope(value as StatisticsStorageScope)}
-          />
-          <small>{clearDescription}</small>
+          <label className={styles.cleanupOption}>
+            <input
+              type="radio"
+              name="cleanup-mode"
+              checked={cleanupMode === "cache"}
+              onChange={() => setCleanupMode("cache")}
+            />
+            <span>
+              <strong>{t("仅清除缓存")}</strong>
+              <small>{clearDescription}</small>
+            </span>
+          </label>
+          <label className={styles.cleanupOption}>
+            <input
+              type="radio"
+              name="cleanup-mode"
+              checked={cleanupMode === "reset"}
+              onChange={() => setCleanupMode("reset")}
+            />
+            <span>
+              <strong>{t("清除缓存和调用记录")}</strong>
+              <small>{resetDescription}</small>
+            </span>
+          </label>
         </div>
       </ConfirmDialog>
     </div>

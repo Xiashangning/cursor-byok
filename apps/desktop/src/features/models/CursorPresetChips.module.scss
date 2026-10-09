@@ -1,3 +1,5 @@
+@use "../../styles/typography" as type;
+
 .wrap {
   display: flex;
   align-items: center;
@@ -6,7 +8,7 @@
 }
 
 .label {
-  font-size: 12px;
+  font-size: type.$font-size-2xs;
   color: var(--vscode-descriptionForeground, rgba(255, 255, 255, 0.7));
 }
 
@@ -26,7 +28,7 @@
   border-radius: 999px;
   background: transparent;
   color: inherit;
-  font-size: 12px;
+  font-size: type.$font-size-2xs;
   cursor: pointer;
 
   &:hover {

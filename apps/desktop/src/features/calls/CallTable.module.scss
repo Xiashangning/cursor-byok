@@ -9,4 +9,4 @@
 }
 
 .completed { color: #56b870; }
-.failed { color: var(--vscode-errorForeground, #f48771); }
+.error, .cancelled { color: var(--vscode-errorForeground, #f48771); }

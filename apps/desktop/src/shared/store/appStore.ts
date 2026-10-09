@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { api, type CursorHarnessStatus, type LlmCall, type Model, type ModelInput, type Overview, type PluginDescriptor, type PluginRuntimeStatus, type PortSettings } from "../api";
+import { api, updateCachedDisabledStates, type CursorHarnessStatus, type LlmCall, type Model, type ModelInput, type Overview, type PluginDescriptor, type PluginRuntimeStatus, type PortSettings } from "../api";
 import { applyTheme, isThemeId, type ThemeId } from "../theme/theme";
 
 export type AppSnapshot = {
@@ -15,6 +15,7 @@ export type AppSnapshot = {
   cursorBusy: boolean;
   pluginRuntime: PluginRuntimeStatus | null;
   plugins: PluginDescriptor[];
+  accessTokenRequired: boolean;
 };
 
 const savedTheme = (): ThemeId => {
@@ -49,6 +50,7 @@ let snapshot: AppSnapshot = {
   cursorBusy: false,
   pluginRuntime: null,
   plugins: [],
+  accessTokenRequired: false,
 };
 
 const listeners = new Set<() => void>();
@@ -74,13 +76,17 @@ export const appStore = {
   },
   getSnapshot: () => snapshot,
 
+  setAccessTokenRequired(required: boolean) {
+    update({ accessTokenRequired: required });
+  },
+
   async refresh() {
     update({ busy: true, error: null });
     try {
       const [models, calls, overview, settings, ports, cursorHarness, pluginRuntime, plugins] = await Promise.all([
         api.models(),
         api.calls(),
-        api.overview(),
+        api.overview({ timezoneOffsetMinutes: new Date().getTimezoneOffset() }),
         api.observability(),
         api.ports(),
         api.cursorHarness(),
@@ -151,16 +157,16 @@ export const appStore = {
   },
   async refreshPlugins() {
     try {
-      update({ plugins: await api.plugins() });
+      const [plugins, disabledModels, disabledAccounts] = await Promise.all([
+        api.plugins(),
+        api.disabledPluginModels(),
+        api.disabledPluginAccounts(),
+      ]);
+      updateCachedDisabledStates(disabledModels, disabledAccounts);
+      update({ plugins });
     } catch (cause) {
       update({ error: cause instanceof Error ? cause.message : String(cause) });
     }
-  },
-  async removePluginConfiguration(pluginId: string) {
-    await perform(async () => {
-      await api.removePluginConfiguration(pluginId);
-      update({ plugins: await api.plugins() });
-    });
   },
   async setCursorEnabled(enabled: boolean) {
     update({ cursorBusy: true, error: null });
@@ -179,23 +185,23 @@ export const appStore = {
       return null;
     } finally { update({ cursorBusy: false }); }
   },
-  async importV0049Models() {
-    update({ cursorBusy: true, error: null });
-    try {
-      const result = await api.importV0049Models();
-      await appStore.refresh();
-      return result;
-    } catch (cause) {
-      update({ error: cause instanceof Error ? cause.message : String(cause) });
-      return null;
-    } finally { update({ cursorBusy: false }); }
-  },
   async updateCursorModel(hash: string, model: ModelInput) {
     update({ cursorBusy: true, error: null });
     try {
       const updated = await api.updateModel(hash, model);
       await appStore.refresh();
       return updated;
+    } catch (cause) {
+      update({ error: cause instanceof Error ? cause.message : String(cause) });
+      return null;
+    } finally { update({ cursorBusy: false }); }
+  },
+  async duplicateCursorModel(hash: string, input: { display_name: string; sort_order: number }) {
+    update({ cursorBusy: true, error: null });
+    try {
+      const created = await api.duplicateModel(hash, input);
+      await appStore.refresh();
+      return created;
     } catch (cause) {
       update({ error: cause instanceof Error ? cause.message : String(cause) });
       return null;

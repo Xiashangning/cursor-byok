@@ -11,18 +11,22 @@
   border-radius: 6px;
   box-shadow: var(--oa-dropdown-shadow);
 
-  button {
+  button,
+  .textItem {
     width: 100%;
     min-height: 30px;
     display: block;
     padding: 5px 8px;
-    color: var(--vscode-dropdown-foreground);
     text-align: left;
-    background: transparent;
     border: 0;
     border-radius: 4px;
     font-size: type.$font-size-xs;
     white-space: nowrap;
+  }
+
+  button {
+    color: var(--vscode-dropdown-foreground);
+    background: transparent;
 
     &:hover:not(:disabled) {
       background: var(--vscode-list-activeSelectionBackground);
@@ -33,6 +37,11 @@
       color: var(--vscode-descriptionForeground);
       cursor: not-allowed;
     }
+  }
+
+  .textItem {
+    color: var(--vscode-descriptionForeground);
+    cursor: default;
   }
 }
 

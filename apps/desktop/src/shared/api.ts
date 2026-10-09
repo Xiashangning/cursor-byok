@@ -1,6 +1,6 @@
-import { invoke } from "@tauri-apps/api/core";
-import type { AdRuntime } from "../shell/ads/types";
 import type { Locale } from "../i18n/runtime";
+import { invoke } from "@tauri-apps/api/core";
+import { appStore } from "./store/appStore";
 
 export type ModelType = "openai" | "anthropic";
 
@@ -15,7 +15,8 @@ export interface Model {
   api_key: string;
   tooltip_data: string;
   model_id: string;
-  reasoning_effort: string | null;
+  default_context: string | null;
+  default_effort: string | null;
   effort_options: string[];
   context_options: string[];
   openai_endpoint: string;
@@ -28,7 +29,6 @@ export interface Model {
   context_window_tokens: number | null;
   max_completion_tokens: number | null;
   anthropic_max_tokens: number | null;
-  anthropic_thinking_effort: string | null;
   thinking_budget_tokens: number | null;
   created_at_ms: number;
   updated_at_ms: number;
@@ -44,7 +44,8 @@ export interface ModelInput {
   api_key: string;
   tooltip_data: string;
   model_id: string;
-  reasoning_effort: string | null;
+  default_context: string | null;
+  default_effort: string | null;
   effort_options: string[];
   context_options: string[];
   openai_endpoint: string;
@@ -57,38 +58,26 @@ export interface ModelInput {
   context_window_tokens: number | null;
   max_completion_tokens: number | null;
   anthropic_max_tokens: number | null;
-  anthropic_thinking_effort: string | null;
   thinking_budget_tokens: number | null;
+}
+
+/** 分组设置整批编辑:仅携带用户编辑的字段;占位符密钥由服务端回填。 */
+export interface ModelGroupEdit {
+  model_hash: string;
+  /** Omitted keeps the current name; an empty string clears it. */
+  group_name?: string;
+  base_url?: string;
+  api_key?: string;
 }
 
 export interface ModelDiscoveryInput {
   type: ModelType;
   base_url: string;
   api_key: string;
+  /** 编辑已有模型时传入:脱敏后的占位符密钥与敏感头由服务端从存储回填,空串表示清除。 */
+  model_hash: string | null;
   custom_headers_enabled: boolean;
   custom_headers: Record<string, string>;
-}
-
-export interface LegacyModelImportPreviewItem {
-  model_hash: string;
-  display_name: string;
-  model_id: string;
-  type: ModelType;
-  existing: boolean;
-}
-
-export interface LegacyModelImportPreview {
-  source: string;
-  total: number;
-  new_models: number;
-  existing_models: number;
-  models: LegacyModelImportPreviewItem[];
-}
-
-export interface LegacyModelImportResult {
-  imported: number;
-  skipped: number;
-  total: number;
 }
 
 export interface ModelConnectivityResult {
@@ -108,6 +97,7 @@ export interface CursorHarnessStatus {
   configured_models: number;
   enabled_models: number;
   integration: IntegrationState;
+  settings_applied: boolean;
   proxy_url: string | null;
   ca_install_command: string | null;
 }
@@ -117,13 +107,21 @@ export interface PortSettings {
   service_port: number;
 }
 
-export interface StatisticsStorage {
-  bytes: number;
-  call_count: number;
-  trace_count: number;
+export interface AppApiSettings {
+  enabled: boolean;
 }
 
-export type StatisticsStorageScope = "details" | "all";
+export interface StorageStatistics {
+  bytes: number;
+  cache_bytes: number;
+}
+
+export interface StorageCleanup {
+  storage: StorageStatistics;
+  freed_bytes: number;
+}
+
+export type StorageCleanupMode = "cache" | "reset";
 
 export type ProxyMode = "default" | "custom";
 
@@ -155,9 +153,17 @@ export interface DesktopSettings {
   show_dock_icon: boolean;
 }
 
+export interface SelectionParameters {
+  context?: string;
+  reasoning?: string;
+  fast?: boolean;
+}
+
 export interface CommitSettings {
   model_id: string;
+  parameters: SelectionParameters;
   prompt: string;
+  prompt_locale: Locale;
 }
 
 export interface CommitSettingsView extends CommitSettings {
@@ -166,6 +172,10 @@ export interface CommitSettingsView extends CommitSettings {
 
 export type PluginRuntimeState = "uninitialized" | "initializing" | "ready" | "failed" | "unsupported";
 export type PluginRuntimePhase = "checking" | "downloading" | "verifying" | "installing" | "validating";
+
+export type PluginInstallResult =
+  | { status: "installed"; id: string; name: string; replaced: boolean }
+  | { status: "exists"; id: string; name: string };
 
 export interface PluginRuntimeStatus {
   state: PluginRuntimeState;
@@ -203,6 +213,8 @@ export interface PluginResourceMetric {
   label: PluginLocalizedText;
   unit: "percent" | "count";
   value: number;
+  /** count 指标的总量;有总量时显示 剩余/总量。 */
+  total?: number;
   resetAtMs?: number | null;
 }
 
@@ -210,16 +222,18 @@ export interface PluginResourceView {
   id: string;
   state: PluginResourceState;
   displayName: string;
-  description: PluginLocalizedText | null;
+  /** 官方订阅档位名(大写);据此渲染档位徽章,缺省时不显示。 */
+  tier?: string;
   metrics: PluginResourceMetric[];
   createdAtMs: number;
 }
 
 export interface PluginAddMethod {
-  type: "oauth2.0";
+  type: "oauth2.0" | "oauth2.authorization-code";
   id: string;
   displayName: PluginLocalizedText;
   description: PluginLocalizedText | null;
+  callback?: { port: number | null; path: string | null };
 }
 
 export interface PluginImportDescriptor {
@@ -229,6 +243,35 @@ export interface PluginImportDescriptor {
   multiple: boolean;
 }
 
+export interface PluginResourceAction {
+  id: string;
+  displayName: PluginLocalizedText;
+  description: PluginLocalizedText | null;
+  target: "resource" | "card";
+  destructive: boolean;
+}
+
+export interface PluginResourceActionField {
+  id: string;
+  label: PluginLocalizedText;
+  value: string;
+}
+
+export interface PluginResourceActionCard {
+  id: string;
+  title: PluginLocalizedText;
+  status: PluginLocalizedText | null;
+  grantedAtMs: number | null;
+  expiresAtMs: number | null;
+  fields: PluginResourceActionField[];
+}
+
+export interface PluginResourceActionResult {
+  title: PluginLocalizedText;
+  description: PluginLocalizedText | null;
+  cards: PluginResourceActionCard[];
+}
+
 export interface PluginResourceDescriptor {
   type: string;
   displayName: PluginLocalizedText;
@@ -236,6 +279,7 @@ export interface PluginResourceDescriptor {
   import: PluginImportDescriptor | null;
   canRefresh: boolean;
   canRemove: boolean;
+  actions: PluginResourceAction[];
   resources: PluginResourceView[];
 }
 
@@ -250,7 +294,23 @@ export interface PluginModelDescriptor {
   icon: string;
   providerType: string;
   maxOutputTokens: number | null;
+  defaultEffort: string | null;
+  defaultContext: string | null;
+  effortOptions: string[];
+  contextOptions: string[];
   images: boolean;
+  enabled: boolean;
+}
+
+export interface PluginModelOverrideInput {
+  id: string;               // 不透明的插件模型 ID,由服务端分配
+  displayName: string;      // "" ⇒ 重置为插件默认
+  tooltip: string;          // "" ⇒ 重置
+  effortOptions: string[];  // [] ⇒ 重置
+  contextOptions: string[]; // [] ⇒ 重置
+  maxOutputTokens: number | null; // null ⇒ 重置
+  defaultEffort: string | null;   // "" ⇒ 重置
+  defaultContext: string | null;  // "" ⇒ 重置
 }
 
 export interface PluginProviderDescriptor {
@@ -277,7 +337,7 @@ export interface PluginDescriptor {
 
 export interface PluginOAuthBegin {
   sessionId: string;
-  userCode: string;
+  userCode: string | null;
   verificationUrl: string;
   verificationUrlComplete: string | null;
   expiresAtMs: number;
@@ -306,16 +366,73 @@ export type ConfiguredModel =
   | { kind: "builtin"; id: string; name: string; builtin: Model }
   | { kind: "plugin"; id: string; name: string; plugin: PluginModelDescriptor };
 
-export function configuredPluginModels(plugins: PluginDescriptor[]): PluginModelDescriptor[] {
-  return plugins.flatMap((plugin) =>
-    plugin.providers.flatMap((provider) => provider.configured ? provider.models : []));
+let cachedDisabledPluginModelIds: Set<string> = new Set();
+let cachedDisabledPluginAccountIds: Set<string> = new Set();
+let modelsLoaded = false;
+let accountsLoaded = false;
+
+export function getDisabledPluginModelIds(): Set<string> {
+  if (!modelsLoaded) {
+    modelsLoaded = true;
+    void api.disabledPluginModels().then((ids) => {
+      cachedDisabledPluginModelIds = new Set(ids);
+      window.dispatchEvent(new CustomEvent("cursor_plugin_models_changed"));
+    }).catch(() => {});
+  }
+  return new Set(cachedDisabledPluginModelIds);
 }
 
-export function configuredModels(models: Model[], plugins: PluginDescriptor[]): ConfiguredModel[] {
-  return [
-    ...models.map((model): ConfiguredModel => ({ kind: "builtin", id: model.model_hash, name: model.display_name, builtin: model })),
-    ...configuredPluginModels(plugins).map((model): ConfiguredModel => ({ kind: "plugin", id: model.id, name: model.displayName, plugin: model })),
-  ];
+export function setMultiplePluginModelsEnabled(modelIds: string[], enabled: boolean): void {
+  if (enabled) {
+    for (const id of modelIds) {
+      cachedDisabledPluginModelIds.delete(id);
+    }
+  } else {
+    for (const id of modelIds) {
+      cachedDisabledPluginModelIds.add(id);
+    }
+  }
+  window.dispatchEvent(new CustomEvent("cursor_plugin_models_changed"));
+  void api.setDisabledPluginModels([...cachedDisabledPluginModelIds]).catch(() => {});
+}
+
+export function getDisabledPluginAccountIds(): Set<string> {
+  if (!accountsLoaded) {
+    accountsLoaded = true;
+    void api.disabledPluginAccounts().then((ids) => {
+      cachedDisabledPluginAccountIds = new Set(ids);
+      window.dispatchEvent(new CustomEvent("cursor_plugin_accounts_changed"));
+    }).catch(() => {});
+  }
+  return new Set(cachedDisabledPluginAccountIds);
+}
+
+export function setPluginAccountEnabled(accountId: string, enabled: boolean): void {
+  if (enabled) {
+    cachedDisabledPluginAccountIds.delete(accountId);
+  } else {
+    cachedDisabledPluginAccountIds.add(accountId);
+  }
+  window.dispatchEvent(new CustomEvent("cursor_plugin_accounts_changed"));
+  void api.setDisabledPluginAccounts([...cachedDisabledPluginAccountIds]).catch(() => {});
+}
+
+export function updateCachedDisabledStates(models: string[], accounts: string[]): void {
+  cachedDisabledPluginModelIds = new Set(models);
+  cachedDisabledPluginAccountIds = new Set(accounts);
+  modelsLoaded = true;
+  accountsLoaded = true;
+  window.dispatchEvent(new CustomEvent("cursor_plugin_models_changed"));
+  window.dispatchEvent(new CustomEvent("cursor_plugin_accounts_changed"));
+}
+
+export function configuredPluginModels(plugins: PluginDescriptor[]): PluginModelDescriptor[] {
+  const disabled = getDisabledPluginModelIds();
+  return plugins.flatMap((plugin) =>
+    plugin.providers.flatMap((provider) =>
+      provider.configured ? provider.models.filter((m) => !disabled.has(m.id)) : []
+    )
+  );
 }
 
 export interface OverviewMetrics {
@@ -347,7 +464,7 @@ export interface Overview {
 }
 
 export interface LlmCall {
-  call_kind: "provider_llm" | "cursor_official";
+  call_kind: "provider_llm" | "cursor_official" | "cursor_transport";
   route: "local_byok" | "cursor_official";
   call_id: string;
   run_id: string;
@@ -402,6 +519,7 @@ export interface CallDetail {
       first_response_at_ms: number | null;
       finished_at_ms: number | null;
       error_message: string | null;
+      detailed: boolean;
     };
     artifacts: Array<{
       seq: number;
@@ -421,16 +539,33 @@ const packagedDesktop = "__TAURI_INTERNALS__" in window
   || window.location.hostname === "tauri.localhost";
 const API_ROOT = "/__byok-api__/api";
 
+export interface AccessTokenInfo {
+  token: string;
+  source: "environment" | "generated";
+}
+
+const ACCESS_TOKEN_STORAGE_KEY = "byok.accessToken";
+
+export function setStoredAccessToken(token: string): void {
+  localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, token);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const accessToken = localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY);
   let response: Response;
   try {
     response = await fetch(`${API_ROOT}${path}`, {
       ...init,
-      headers: init?.body ? { "content-type": "application/json", ...init.headers } : init?.headers,
+      headers: {
+        ...(init?.body ? { "content-type": "application/json" } : {}),
+        ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        ...init?.headers,
+      },
     });
   } catch (cause) {
     throw new Error(t("无法连接本地管理服务"), { cause });
   }
+  if (response.status === 401) appStore.setAccessTokenRequired(true);
   if (!response.ok) {
     const body = await response.text();
     let message = body;
@@ -447,33 +582,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  ads: (disabledAdIds: Iterable<string>, locale: Locale) => {
-    const value = [...disabledAdIds].join(",");
-    return request<AdRuntime>("/ads", {
-      headers: {
-        "accept-language": locale,
-        ...(value ? { "disable-ad-ids": value } : {}),
-      },
-    });
-  },
-  dismissAd: (id: string, reason: string) => request<void>(`/ads/${encodeURIComponent(id)}/dismissals`, { method: "POST", body: JSON.stringify({ reason }) }),
   models: () => request<Model[]>("/models"),
   createModels: (models: ModelInput[]) => request<Model[]>("/models", { method: "POST", body: JSON.stringify({ models }) }),
   reorderModels: (modelHashes: string[]) => request<Model[]>("/models/order", { method: "PUT", body: JSON.stringify({ model_hashes: modelHashes }) }),
   discoverModels: (input: ModelDiscoveryInput) => request<{ models: string[] }>("/models/discover", { method: "POST", body: JSON.stringify(input) }),
-  previewV0049Models: () => request<LegacyModelImportPreview>("/models/import-v0049"),
-  importV0049Models: () => request<LegacyModelImportResult>("/models/import-v0049", { method: "POST" }),
   updateModel: (hash: string, model: ModelInput) => request<Model>(`/models/${hash}`, { method: "PUT", body: JSON.stringify(model) }),
+  updateModelGroup: (edits: ModelGroupEdit[]) => request<Model[]>("/models/group-batch", { method: "PUT", body: JSON.stringify({ edits }) }),
+  duplicateModel: (hash: string, input: { display_name: string; sort_order: number }) => request<Model>(`/models/${encodeURIComponent(hash)}/duplicate`, { method: "POST", body: JSON.stringify(input) }),
   deleteModel: (hash: string) => request<void>(`/models/${hash}`, { method: "DELETE" }),
   testModel: (hash: string, testId: string, signal?: AbortSignal) => request<ModelConnectivityResult>(`/models/${encodeURIComponent(hash)}/test/${encodeURIComponent(testId)}`, { method: "POST", signal }),
   cancelModelTest: (hash: string, testId: string) => request<void>(`/models/${encodeURIComponent(hash)}/test/${encodeURIComponent(testId)}`, { method: "DELETE" }),
-  overview: (filter?: { startMs: number; endMs: number; modelHashes?: string[]; bucketMs?: number }) => {
+  overview: (filter?: { startMs?: number; endMs?: number; modelHashes?: string[]; bucketMs?: number; timezoneOffsetMinutes?: number }) => {
     const params = new URLSearchParams();
     if (filter) {
-      params.set("start_ms", String(filter.startMs));
-      params.set("end_ms", String(filter.endMs));
+      if (filter.startMs !== undefined) params.set("start_ms", String(filter.startMs));
+      if (filter.endMs !== undefined) params.set("end_ms", String(filter.endMs));
       if (filter.modelHashes?.length) params.set("model_hashes", JSON.stringify(filter.modelHashes));
       if (filter.bucketMs) params.set("bucket_ms", String(filter.bucketMs));
+      if (filter.timezoneOffsetMinutes !== undefined) params.set("timezone_offset_minutes", String(filter.timezoneOffsetMinutes));
     }
     const query = params.toString();
     return request<Overview>(`/overview${query ? `?${query}` : ""}`);
@@ -481,14 +607,25 @@ export const api = {
   cursorHarness: () => request<CursorHarnessStatus>("/harness/cursor/status"),
   initializeCursorCa: () => request<CursorHarnessStatus>("/harness/cursor/ca/initialize", { method: "POST" }),
   plugins: () => request<PluginDescriptor[]>("/plugins"),
+  disabledPluginModels: () => request<string[]>("/plugins/disabled-models"),
+  setDisabledPluginModels: (modelIds: string[]) => request<string[]>("/plugins/disabled-models", { method: "PUT", body: JSON.stringify({ modelIds }) }),
+  disabledPluginAccounts: () => request<string[]>("/plugins/disabled-accounts"),
+  setDisabledPluginAccounts: (accountIds: string[]) => request<string[]>("/plugins/disabled-accounts", { method: "PUT", body: JSON.stringify({ accountIds }) }),
+  pickPluginDirectory: async (title: string) => {
+    if (!packagedDesktop) throw new Error(t("请在桌面应用中选择插件目录"));
+    return invoke<string | null>("pick_plugin_directory", { title });
+  },
+  installPlugin: (path: string, replace: boolean) => request<PluginInstallResult>("/plugins/install", { method: "POST", body: JSON.stringify({ path, replace }) }),
   pluginOAuthBegin: (pluginId: string, resourceType: string, methodId: string) => request<PluginOAuthBegin>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/add/${encodeURIComponent(methodId)}/begin`, { method: "POST" }),
   pluginOAuthPoll: (sessionId: string, signal?: AbortSignal) => request<PluginOAuthPoll>(`/plugins/oauth/${encodeURIComponent(sessionId)}/poll`, { method: "POST", signal }),
   importPluginResources: (pluginId: string, resourceType: string, files: PluginImportFile[]) => request<PluginImportResult>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/import`, { method: "POST", body: JSON.stringify(files) }),
   refreshPluginResource: (pluginId: string, resourceType: string, resourceId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}/refresh`, { method: "POST" }),
+  pluginResourceAction: (pluginId: string, resourceType: string, resourceId: string, actionId: string, input: unknown = {}) => request<PluginResourceActionResult>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}/actions/${encodeURIComponent(actionId)}`, { method: "POST", body: JSON.stringify(input) }),
   deletePluginResource: (pluginId: string, resourceType: string, resourceId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}`, { method: "DELETE" }),
   syncPluginModels: (pluginId: string, providerId: string) => request<{ models: number }>(`/plugins/${encodeURIComponent(pluginId)}/providers/${encodeURIComponent(providerId)}/models/sync`, { method: "POST" }),
+  setPluginModelOverride: (input: PluginModelOverrideInput) => request<void>("/plugins/model-overrides", { method: "PUT", body: JSON.stringify(input) }),
   pluginResourceExportUrl: (servicePort: number, pluginId: string, resourceType: string) => `http://127.0.0.1:${servicePort}${API_ROOT}/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/export`,
-  removePluginConfiguration: (pluginId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}`, { method: "DELETE" }),
+  clearPluginData: (pluginId: string) => request<void>(`/plugins/${encodeURIComponent(pluginId)}/data`, { method: "DELETE" }),
   pluginRuntime: () => request<PluginRuntimeStatus>("/plugins/runtime"),
   initializePluginRuntime: () => request<PluginRuntimeStatus>("/plugins/runtime", { method: "POST" }),
   cancelPluginRuntimeInitialization: () => request<PluginRuntimeStatus>("/plugins/runtime", { method: "DELETE" }),
@@ -514,14 +651,18 @@ export const api = {
   setObservability: (detailed: boolean) => request<{ detailed: boolean }>("/settings/observability", { method: "PUT", body: JSON.stringify({ detailed }) }),
   ports: () => request<PortSettings>("/settings/ports"),
   setPorts: (settings: PortSettings) => request<PortSettings>("/settings/ports", { method: "PUT", body: JSON.stringify(settings) }),
-  statisticsStorage: () => request<StatisticsStorage>("/settings/storage/statistics"),
-  clearStatisticsStorage: (scope: StatisticsStorageScope) => request<StatisticsStorage>("/settings/storage/statistics", { method: "DELETE", body: JSON.stringify({ scope }) }),
+  statisticsStorage: () => request<StorageStatistics>("/settings/storage/statistics"),
+  cleanStorage: (mode: StorageCleanupMode) => request<StorageCleanup>("/settings/storage/cleanup", { method: "POST", body: JSON.stringify({ mode }) }),
   proxySettings: () => request<ProxySettings>("/settings/proxy"),
   setProxySettings: (settings: ProxySettingsInput) => request<ProxySettings>("/settings/proxy", { method: "PUT", body: JSON.stringify(settings) }),
   tabSettings: () => request<TabSettings>("/settings/tab"),
   setTabSettings: (settings: TabSettings) => request<TabSettings>("/settings/tab", { method: "PUT", body: JSON.stringify(settings) }),
   desktopSettings: () => request<DesktopSettings>("/settings/desktop"),
   setDesktopSettings: (settings: DesktopSettings) => request<DesktopSettings>("/settings/desktop", { method: "PUT", body: JSON.stringify(settings) }),
-  commitSettings: () => request<CommitSettingsView>("/settings/commit"),
+  commitSettings: (locale: Locale) => request<CommitSettingsView>("/settings/commit", { headers: { "accept-language": locale } }),
   setCommitSettings: (settings: CommitSettings) => request<CommitSettingsView>("/settings/commit", { method: "PUT", body: JSON.stringify(settings) }),
+  accessToken: () => request<AccessTokenInfo>("/settings/access-token"),
+  regenerateAccessToken: () => request<AccessTokenInfo>("/settings/access-token/regenerate", { method: "POST" }),
+  appApiSettings: () => request<AppApiSettings>("/settings/app-api"),
+  setAppApiSettings: (settings: AppApiSettings) => request<AppApiSettings>("/settings/app-api", { method: "PUT", body: JSON.stringify(settings) }),
 };

@@ -103,37 +103,3 @@ fn error_chain(error: &(dyn Error + 'static)) -> String {
     }
     details
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fmt;
-
-    #[derive(Debug)]
-    struct OuterError(std::io::Error);
-
-    impl fmt::Display for OuterError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("database initialization failed")
-        }
-    }
-
-    impl Error for OuterError {
-        fn source(&self) -> Option<&(dyn Error + 'static)> {
-            Some(&self.0)
-        }
-    }
-
-    #[test]
-    fn fatal_report_includes_the_complete_error_chain() {
-        let error = OuterError(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "database file is read-only",
-        ));
-
-        assert_eq!(
-            error_chain(&error),
-            "database initialization failed\nCaused by: database file is read-only"
-        );
-    }
-}

@@ -1,13 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { api, pluginText, type PluginDescriptor, type PluginImportFile, type PluginRuntimePhase, type PluginRuntimeStatus } from "../../shared/api";
+import { api, getDisabledPluginModelIds, pluginText, type PluginDescriptor, type PluginImportFile, type PluginRuntimePhase, type PluginRuntimeStatus } from "../../shared/api";
 import { useI18n } from "../../i18n/store";
 import { PageContent } from "../../shell/layout/PageContent";
+import { PageActions } from "../../shell/PageActions";
 import { appStore, useAppStore } from "../../shared/store/appStore";
-import { ActionMenu } from "../../shared/ui/ActionMenu";
+import { ActionMenu, type ActionMenuItem } from "../../shared/ui/ActionMenu";
 import { Button } from "../../shared/ui/Button";
 import { Card } from "../../shared/ui/Card";
+import { ConfirmDialog } from "../../shared/ui/ConfirmDialog";
+import controls from "../../shared/ui/Controls.module.scss";
+import { Icon } from "../../shared/ui/Icon";
+import { addIcon } from "../../shared/ui/icons";
 import { Modal } from "../../shared/ui/Modal";
 import { useMessage } from "../../shared/ui/message";
+import { TooltipTrigger } from "../../shared/ui/TooltipTrigger";
 import { TruncatedButton } from "../../shared/ui/TruncatedButton";
 import { PluginAddPanel, PluginSettingsPanel } from "./PluginResourcePanels";
 import styles from "./PluginManagementPage.module.scss";
@@ -17,7 +23,12 @@ export function PluginManagementPage() {
   const [progressOpen, setProgressOpen] = useState(false);
   const [starting, setStarting] = useState(false);
   const [selected, setSelected] = useState<{ pluginId: string; mode: "add" | "settings" } | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [replaceTarget, setReplaceTarget] = useState<{ path: string; name: string } | null>(null);
   const cancelRequested = useRef(false);
+  const message = useMessage();
+  const runtimeReady = pluginRuntime?.state === "ready";
+  const canInstall = runtimeReady && !installing && replaceTarget === null;
   const selectedPlugin = selected ? plugins.find((plugin) => plugin.id === selected.pluginId) ?? null : null;
 
   useEffect(() => {
@@ -53,6 +64,42 @@ export function PluginManagementPage() {
     }
   };
 
+  const choosePlugin = async () => {
+    if (!canInstall) return;
+    setInstalling(true);
+    try {
+      const path = await api.pickPluginDirectory(t("选择插件目录"));
+      if (!path) return;
+      const result = await api.installPlugin(path, false);
+      if (result.status === "exists") {
+        setReplaceTarget({ path, name: result.name });
+        return;
+      }
+      await appStore.refreshPlugins();
+      message(t("插件已添加"));
+    } catch (cause) {
+      message(cause instanceof Error ? cause.message : String(cause), { duration: 5000 });
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  const confirmReplace = async () => {
+    if (!replaceTarget) return;
+    setInstalling(true);
+    try {
+      const result = await api.installPlugin(replaceTarget.path, true);
+      if (result.status === "exists") return;
+      await appStore.refreshPlugins();
+      message(t("插件已替换"));
+      setReplaceTarget(null);
+    } catch (cause) {
+      message(cause instanceof Error ? cause.message : String(cause), { duration: 5000 });
+    } finally {
+      setInstalling(false);
+    }
+  };
+
   const content = pluginRuntime?.state === "ready"
     ? <PluginCards plugins={plugins} onOpen={(pluginId, mode) => setSelected({ pluginId, mode })} />
     : <RuntimeGate status={pluginRuntime} starting={starting} onInitialize={() => void initialize()} />;
@@ -61,10 +108,27 @@ export function PluginManagementPage() {
     : 320;
 
   return <>
+    <PageActions>
+      <TooltipTrigger label={runtimeReady ? t("添加插件") : t("需要先初始化插件运行时")}>
+        <button className={controls.iconButton} aria-label={t("添加插件")} disabled={!canInstall} onClick={() => void choosePlugin()}>
+          <Icon icon={addIcon} size="1.1em" />
+        </button>
+      </TooltipTrigger>
+    </PageActions>
     <PageContent
       title={t("插件配置")}
       sections={[{ key: "installed-plugins", estimatedHeight, content }]}
     />
+    <ConfirmDialog
+      open={replaceTarget !== null}
+      title={t("替换已安装的插件")}
+      busy={installing}
+      confirmLabel={t("替换")}
+      onCancel={() => setReplaceTarget(null)}
+      onConfirm={() => void confirmReplace()}
+    >
+      {t("已安装 {name}。替换插件文件并保留已保存的账号？", { name: replaceTarget?.name ?? "" })}
+    </ConfirmDialog>
     <RuntimeProgressModal
       open={progressOpen}
       status={pluginRuntime}
@@ -78,6 +142,8 @@ export function PluginManagementPage() {
         ? t("{name} 账号管理", { name: selectedPlugin?.name ?? "" })
         : t("添加 {name} 账号", { name: selectedPlugin?.name ?? "" })}
       onClose={() => setSelected(null)}
+      onSubmit={() => setSelected(null)}
+      submitLabel={t("确定")}
     >
       {selected?.mode === "add" && selectedPlugin && <PluginAddPanel plugin={selectedPlugin} onConfigured={() => setSelected(null)} />}
       {selected?.mode === "settings" && selectedPlugin && <PluginSettingsPanel plugin={selectedPlugin} />}
@@ -136,9 +202,21 @@ function PluginCard({ plugin, onOpen }: {
   const message = useMessage();
   const importInput = useRef<HTMLInputElement>(null);
   const [importing, setImporting] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [clearOpen, setClearOpen] = useState(false);
   const configured = plugin.providers.some((provider) => provider.configured);
   const accountCount = plugin.resources.reduce((count, resource) => count + resource.resources.length, 0);
-  const modelCount = plugin.providers.reduce((count, provider) => count + provider.models.length, 0);
+  const [disabledModelIds, setDisabledModelIds] = useState<Set<string>>(() => getDisabledPluginModelIds());
+  useEffect(() => {
+    const handleUpdate = () => setDisabledModelIds(getDisabledPluginModelIds());
+    window.addEventListener("cursor_plugin_models_changed", handleUpdate);
+    return () => window.removeEventListener("cursor_plugin_models_changed", handleUpdate);
+  }, []);
+
+  const modelCount = plugin.providers.reduce(
+    (count, provider) => count + provider.models.filter((m) => !disabledModelIds.has(m.id)).length,
+    0,
+  );
   const subtitle = plugin.providers.map((provider) => pluginText(provider.displayName, locale)).join(" · ") || plugin.id;
   const importResource = plugin.resources.find((resource) => resource.import);
   const exportResource = plugin.resources.find((resource) => resource.resources.length > 0);
@@ -161,14 +239,67 @@ function PluginCard({ plugin, onOpen }: {
         message(summary);
       }
     } catch (cause) {
-      message(cause instanceof Error ? cause.message : String(cause), { duration: 5000 });
+      message(errorText(cause), { duration: 5000 });
     } finally {
       setImporting(false);
       if (importInput.current) importInput.current.value = "";
     }
   };
 
-  return (
+  // 清空后等同于刚安装插件:账号、模型目录与模型设置全部删除,插件本身保留。
+  const clearData = async () => {
+    setClearing(true);
+    try {
+      await api.clearPluginData(plugin.id);
+      await appStore.refreshPlugins();
+      message(t("已清空 {name} 的插件数据", { name: plugin.name }));
+    } catch (cause) {
+      message(errorText(cause), { duration: 5000 });
+    } finally {
+      setClearing(false);
+      setClearOpen(false);
+    }
+  };
+
+  const moreItems: ActionMenuItem[] = [
+    ...(importResource
+      ? [
+          {
+            id: "import",
+            label: importing ? t("正在导入…") : t("批量导入"),
+            disabled: importing,
+            onSelect: () => importInput.current?.click(),
+          },
+        ]
+      : []),
+    ...(exportResource
+      ? [
+          {
+            id: "export",
+            label: t("批量导出"),
+            onSelect: () =>
+              void api.openExternalUrl(
+                api.pluginResourceExportUrl(
+                  ports.service_port,
+                  plugin.id,
+                  exportResource.type,
+                ),
+              ),
+          },
+        ]
+      : []),
+    {
+      id: "clear-data",
+      label: t("清空插件数据"),
+      disabled: clearing,
+      onSelect: () => setClearOpen(true),
+    },
+    ...(plugin.version
+      ? [{ id: "version", type: "text" as const, label: `v${plugin.version}` }]
+      : []),
+  ];
+
+  return <>
     <Card className={styles.pluginCard}>
       <div className={styles.pluginCardTop}>
         <img className={styles.pluginIcon} src={plugin.icon} />
@@ -189,9 +320,9 @@ function PluginCard({ plugin, onOpen }: {
             models: modelCount,
           })}
         </span>
-        <span className={styles.pluginAuthor}>
-          {[`v${plugin.version}`, plugin.author].filter(Boolean).join(" · ")}
-        </span>
+        {plugin.author && (
+          <span className={styles.pluginAuthor}>{plugin.author}</span>
+        )}
       </div>
       <div className={styles.cardActions}>
         <TruncatedButton
@@ -200,46 +331,16 @@ function PluginCard({ plugin, onOpen }: {
           label={t("添加账号")}
           onClick={() => onOpen(plugin.id, "add")}
         />
-        {configured && (
+        {(configured || accountCount > 0) && (
           <TruncatedButton
             size="small"
             label={t("账号管理")}
             onClick={() => onOpen(plugin.id, "settings")}
           />
         )}
-        {(importResource || exportResource) && (
+        {moreItems.length > 0 && (
           <span className={styles.moreAction}>
-            <ActionMenu
-              label={t("更多")}
-              items={[
-                ...(importResource
-                  ? [
-                      {
-                        id: "import",
-                        label: importing ? t("正在导入…") : t("批量导入"),
-                        disabled: importing,
-                        onSelect: () => importInput.current?.click(),
-                      },
-                    ]
-                  : []),
-                ...(exportResource
-                  ? [
-                      {
-                        id: "export",
-                        label: t("批量导出"),
-                        onSelect: () =>
-                          void api.openExternalUrl(
-                            api.pluginResourceExportUrl(
-                              ports.service_port,
-                              plugin.id,
-                              exportResource.type,
-                            ),
-                          ),
-                      },
-                    ]
-                  : []),
-              ]}
-            />
+            <ActionMenu label={t("更多")} items={moreItems} />
           </span>
         )}
         {importResource && (
@@ -254,7 +355,18 @@ function PluginCard({ plugin, onOpen }: {
         )}
       </div>
     </Card>
-  );
+    {clearOpen && <ConfirmDialog
+      open
+      busy={clearing}
+      title={t("清空插件数据")}
+      confirmLabel={t("清空")}
+      onCancel={() => setClearOpen(false)}
+      onConfirm={() => void clearData()}
+    >
+      <p>{t("将删除 {name} 在本机保存的全部数据：账号、模型列表与模型设置，此操作不可撤销。", { name: plugin.name })}</p>
+      <p>{t("插件本身会保留，重新添加账号后会重新同步模型。")}</p>
+    </ConfirmDialog>}
+  </>;
 }
 
 function RuntimeProgressModal({ open, status, starting, onClose }: { open: boolean; status: PluginRuntimeStatus | null; starting: boolean; onClose: () => void }) {
@@ -321,4 +433,8 @@ function formatBytes(bytes: number) {
     unit += 1;
   }
   return `${value < 10 ? value.toFixed(1) : value.toFixed(0)} ${units[unit]}`;
+}
+
+function errorText(cause: unknown) {
+  return cause instanceof Error ? cause.message : String(cause);
 }

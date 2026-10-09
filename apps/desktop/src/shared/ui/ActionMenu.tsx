@@ -6,12 +6,19 @@ import { Icon } from "./Icon";
 import { chevronDownIcon } from "./icons";
 import styles from "./ActionMenu.module.scss";
 
-export type ActionMenuItem = {
-  id: string;
-  label: string;
-  disabled?: boolean;
-  onSelect: () => void;
-};
+export type ActionMenuItem =
+  | {
+      id: string;
+      label: string;
+      type?: "action";
+      disabled?: boolean;
+      onSelect: () => void;
+    }
+  | {
+      id: string;
+      label: string;
+      type: "text";
+    };
 
 /** 触发器 + 动作列表的下拉菜单,用于容纳卡片上的次要操作。 */
 export function ActionMenu({ label, items, disabled }: {
@@ -73,6 +80,7 @@ export function ActionMenu({ label, items, disabled }: {
         className={styles.menu}
         role="menu"
         style={{ left: position.left, top: position.top }}
+        onPointerDown={(event) => event.stopPropagation()}
         onKeyDown={(event) => {
           if (event.key === "Escape") {
             event.preventDefault();
@@ -80,18 +88,24 @@ export function ActionMenu({ label, items, disabled }: {
           }
         }}
       >
-        {items.map((item) => <button
-          key={item.id}
-          type="button"
-          role="menuitem"
-          disabled={item.disabled}
-          onClick={() => {
-            setOpen(false);
-            item.onSelect();
-          }}
-        >
-          {item.label}
-        </button>)}
+        {items.map((item) => item.type === "text" ? (
+          <span key={item.id} className={styles.textItem}>
+            {item.label}
+          </span>
+        ) : (
+          <button
+            key={item.id}
+            type="button"
+            role="menuitem"
+            disabled={item.disabled}
+            onClick={() => {
+              setOpen(false);
+              item.onSelect();
+            }}
+          >
+            {item.label}
+          </button>
+        ))}
       </div>,
       document.body,
     )}

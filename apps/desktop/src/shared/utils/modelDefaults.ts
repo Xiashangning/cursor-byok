@@ -9,6 +9,15 @@ export const defaultEffortOptions = ["low", "medium", "high", "xhigh", "max"];
 
 export const defaultContextOptions = ["200k", "356k", "800k", "1m"];
 
+export function parseOptions(value: string): string[] {
+  return [...new Set(value.split(",").map((item) => item.trim()).filter(Boolean))];
+}
+
+/** 默认档位归一:当前值落在轴上则保留,否则取轴第一项;轴空为 ""。 */
+export function axisDefault(options: string[], current: string): string {
+  return options.includes(current) ? current : options[0] ?? "";
+}
+
 /** 与 server 端 parse_token_count 一致：支持 200k / 1m / 裸数字。 */
 export function parseTokenCount(value: string): number | null {
   const match = /^(\d+)([km])?$/i.exec(value.trim());

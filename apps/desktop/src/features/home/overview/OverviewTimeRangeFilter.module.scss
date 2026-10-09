@@ -77,23 +77,18 @@
   gap: 6px;
 }
 
-.quickPresets {
-  display: flex;
-  gap: 6px;
+.granularityButton {
+  height: 25px;
+  padding: 0 10px;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-button-secondaryBackground, var(--vscode-sideBar-background));
+  border: 1px solid var(--vscode-sideBar-border);
+  border-radius: 5px;
+  font-size: type.$font-size-xs;
+  white-space: nowrap;
 
-  button {
-    height: 26px;
-    padding: 0 10px;
-    color: var(--vscode-descriptionForeground);
-    background: var(--vscode-button-secondaryBackground, var(--vscode-sideBar-background));
-    border: 1px solid var(--vscode-sideBar-border);
-    border-radius: 4px;
-    font-size: type.$font-size-xs;
-    white-space: nowrap;
-
-    &:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
-    &[aria-pressed="true"] { color: var(--vscode-list-activeSelectionForeground); background: var(--vscode-list-activeSelectionBackground); border-color: transparent; }
-  }
+  &:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+  &[aria-expanded="true"] { color: var(--vscode-list-activeSelectionForeground); background: var(--vscode-list-activeSelectionBackground); border-color: transparent; }
 }
 
 .granularityMenu {

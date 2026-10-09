@@ -5,6 +5,20 @@
   gap: 16px;
 }
 
+.takeoverActions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.takeoverStatus {
+  min-width: 39px;
+  color: var(--vscode-descriptionForeground);
+  font-size: type.$font-size-xs;
+  text-align: right;
+  white-space: nowrap;
+}
+
 .groupActions {
   display: flex;
   align-items: center;
@@ -79,6 +93,9 @@
   gap: 8px;
 }
 .groupSettings {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   padding: 4px 2px;
   color: var(--vscode-descriptionForeground);
   background: none;
@@ -289,10 +306,37 @@
   width: 100%;
   grid-column: 1 / -1;
 }
+// 默认 Effort / 默认 Context / 输出 Token 的整行布局：1/4、1/4、1/2。
+.defaultsRow {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 1fr 1fr 2fr;
+  gap: 12px;
+}
+// 右侧 2/3 区域内再分两列：Anthropic 的最大输出与思考预算各占一半。
+.defaultsOutput {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
 .discoverButton {
   min-height: 34px;
   height: 34px;
   flex: 0 0 auto;
+}
+// 只读展示值:外形与输入框一致,但不可编辑。
+.staticValue {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 0 10px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 5px;
 }
 .urlField {
   min-width: 0;
@@ -336,5 +380,9 @@
   }
   .fullWidth {
     grid-column: auto;
+  }
+  .defaultsRow,
+  .defaultsOutput {
+    grid-template-columns: 1fr;
   }
 }
