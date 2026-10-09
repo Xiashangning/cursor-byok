@@ -1,32 +1,35 @@
 //! Verifies BreakMessages, cancellation, shutdown, and Finalizing races.
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use cursor_server::{
-    cursor::prompting::{PromptAssets, PromptCompiler},
     cursor::protocol::{connect, proto::agent::v1 as pb},
-    cursor::{TransportCommand, TransportRegistry},
+    cursor::TransportCommand,
     model::{
-        CanonicalMessage, ConversationId, ModelConfigInput, ModelSpec, ModelType, Origin,
-        PreparedRun, PromptSpec, Role, RunAction, RunId, RunKind, Usage, OPENAI_CHAT_ENDPOINT,
+        CanonicalMessage, CheckpointId, ConversationId, ModelSpec, Origin, PreparedRun, PromptSpec,
+        Role, RunAction, RunId, RunKind,
     },
     provider::{FinishReason, ModelEvent},
     run::{self, CommandResult, CommitCause, RunEngine, RunEvent, RunOutcome, RunPhase},
     store::RunStatus,
 };
 use prost::Message;
+use support::{
+    acknowledge_kv, drive, kv_ack, official_model_not_found_payload, openai_model_input,
+    read_success, registry, run_request, subagent_result_error,
+    subagent_result_success_with_message, temp_store, text_of, text_response,
+    text_response_with_usage, tool_response, user_message_action, wait_for_provider_requests,
+    FakeProvider,
+};
 
 #[tokio::test]
 async fn finalizing_rejects_late_messages_for_the_next_run() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let conversation_id = ConversationId::new("finalizing-conversation");
     let base_checkpoint_id = store.ensure_conversation(&conversation_id).await.unwrap();
-    let provider = fake_provider::FakeProvider::default();
+    let provider = FakeProvider::default();
     provider.push(vec![
         ModelEvent::Start {
             model_call_id: "final-call".into(),
@@ -51,6 +54,7 @@ async fn finalizing_rejects_late_messages_for_the_next_run() {
             pending_tool_round: None,
         },
         base_checkpoint_id,
+        background_follow_up: false,
     };
     let (port, mut session, handle) = run::channel(prepared.run_id.clone(), 32);
     let cancellation = handle.cancellation();
@@ -92,12 +96,17 @@ async fn finalizing_rejects_late_messages_for_the_next_run() {
 
 #[tokio::test]
 async fn break_messages_emits_one_cycle_boundary_before_the_runtime_commit() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let conversation_id = ConversationId::new("cycle-boundary-conversation");
     let base_checkpoint_id = store.ensure_conversation(&conversation_id).await.unwrap();
-    let provider = fake_provider::FakeProvider::default();
+    let provider = FakeProvider::default();
     provider.push_pending();
-    provider.push(text_response("continued"));
+    provider.push(text_response_with_usage(
+        "call-continued",
+        "continued",
+        1,
+        1,
+    ));
     let prepared = PreparedRun {
         run_id: RunId::new("cycle-boundary-run"),
         cursor_request_id: None,
@@ -113,6 +122,7 @@ async fn break_messages_emits_one_cycle_boundary_before_the_runtime_commit() {
             pending_tool_round: None,
         },
         base_checkpoint_id,
+        background_follow_up: false,
     };
     let (port, mut session, handle) = run::channel(prepared.run_id.clone(), 32);
     let cancellation = handle.cancellation();
@@ -172,7 +182,7 @@ async fn break_messages_emits_one_cycle_boundary_before_the_runtime_commit() {
 
 #[tokio::test]
 async fn a_replaced_run_cannot_overwrite_its_cancelled_status() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let conversation_id = ConversationId::new("conversation");
     let base_checkpoint_id = store.ensure_conversation(&conversation_id).await.unwrap();
     let prepared = |run_id: &str| PreparedRun {
@@ -190,6 +200,7 @@ async fn a_replaced_run_cannot_overwrite_its_cancelled_status() {
             pending_tool_round: None,
         },
         base_checkpoint_id,
+        background_follow_up: false,
     };
     let first = prepared("first");
     let second = prepared("second");
@@ -214,7 +225,7 @@ async fn a_replaced_run_cannot_overwrite_its_cancelled_status() {
     .unwrap();
     store.claim_run(&second).await.unwrap();
     assert!(!store
-        .finish_run(&first.run_id, RunStatus::Completed, None, None,)
+        .finish_run(&first.run_id, RunStatus::Completed, None)
         .await
         .unwrap());
 
@@ -242,21 +253,214 @@ async fn a_replaced_run_cannot_overwrite_its_cancelled_status() {
 }
 
 #[tokio::test]
-async fn registry_shutdown_cancels_runs_and_closes_run_sse_outputs() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(fake_provider::FakeProvider::default()),
-        PromptCompiler::new(assets),
+async fn finalizing_window_duplicate_batch_does_not_reactivate_the_model() {
+    let (_directory, store) = temp_store().await;
+    let conversation_id = ConversationId::new("finalizing-duplicate-conversation");
+    let base_checkpoint_id = store.ensure_conversation(&conversation_id).await.unwrap();
+    let provider = FakeProvider::default();
+    let release = provider.push_gated(text_response_with_usage("call-final", "done", 1, 1));
+    provider.push(text_response_with_usage(
+        "call-unexpected",
+        "unexpected second activation",
+        1,
+        1,
+    ));
+    let mut notification = CanonicalMessage::text(
+        "finalizing-duplicate-message",
+        Role::User,
+        Origin::Runtime,
+        "background notification",
     );
+    notification.runtime_event_id = Some("background-completed:dup".into());
+    let prepared = PreparedRun {
+        run_id: RunId::new("finalizing-duplicate-run"),
+        cursor_request_id: None,
+        conversation_id,
+        kind: RunKind::Root,
+        model: ModelSpec::new("model"),
+        prompt: PromptSpec {
+            instructions: String::new(),
+            tools: Vec::new(),
+        },
+        initial_messages: vec![notification.clone()],
+        action: RunAction::Start,
+        base_checkpoint_id,
+        background_follow_up: false,
+    };
+    let (port, mut session, handle) = run::channel(prepared.run_id.clone(), 32);
+    let cancellation = handle.cancellation();
+    let engine_store = store.clone();
+    let engine_provider = provider.clone();
+    let engine = tokio::spawn(async move {
+        RunEngine::new(engine_store, Arc::new(engine_provider))
+            .run(prepared, port, cancellation)
+            .await
+    });
+
+    // 初始消息提交后引擎进入模型循环。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while provider.request_count() < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "model cycle did not start"
+        );
+        if let Ok(Some(RunEvent::MessagesCommitted(committed))) =
+            tokio::time::timeout(std::time::Duration::from_millis(20), session.events.recv()).await
+        {
+            committed.barrier.complete(Ok(()));
+        }
+    }
+
+    // 用 SQLite 写锁把引擎钉在 finalize 窗口(assistant 提交)里,
+    // 此时注入的重复批只能由收尾 drain 拾取。
+    let lock = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    release.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let duplicate = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            handle
+                .insert_messages("background-completed:dup".into(), vec![notification])
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    lock.rollback().await.unwrap();
+
+    let mut final_turns = 0;
+    loop {
+        match session.events.recv().await.unwrap() {
+            RunEvent::MessagesCommitted(committed) => {
+                if committed.cause == CommitCause::FinalTurn {
+                    final_turns += 1;
+                }
+                committed.barrier.complete(Ok(()));
+            }
+            RunEvent::Ended(outcome) => {
+                assert_eq!(outcome, RunOutcome::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(engine.await.unwrap(), RunOutcome::Completed);
+    assert_eq!(duplicate.await.unwrap(), CommandResult::Duplicate);
+    assert_eq!(final_turns, 1);
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a duplicate batch in the finalizing window must not reactivate the model"
+    );
+}
+
+#[tokio::test]
+async fn background_follow_up_with_committed_initial_messages_finishes_without_the_model() {
+    let (_directory, store) = temp_store().await;
+    let conversation_id = ConversationId::new("background-backstop-conversation");
+    let base_checkpoint_id = store.ensure_conversation(&conversation_id).await.unwrap();
+    let provider = FakeProvider::default();
+    provider.push(text_response_with_usage("call-summary", "summary", 1, 1));
+    provider.push(text_response_with_usage(
+        "call-unexpected",
+        "unexpected second activation",
+        1,
+        1,
+    ));
+    let mut notification = CanonicalMessage::text(
+        "background-backstop-message",
+        Role::User,
+        Origin::Runtime,
+        "background notification",
+    );
+    notification.runtime_event_id = Some("background-completed:dup".into());
+    let prepared = {
+        let conversation_id = conversation_id.clone();
+        move |run_id: &str, base_checkpoint_id: CheckpointId| PreparedRun {
+            run_id: RunId::new(run_id),
+            cursor_request_id: None,
+            conversation_id: conversation_id.clone(),
+            kind: RunKind::Root,
+            model: ModelSpec::new("model"),
+            prompt: PromptSpec {
+                instructions: String::new(),
+                tools: Vec::new(),
+            },
+            initial_messages: vec![notification.clone()],
+            action: RunAction::Start,
+            base_checkpoint_id,
+            background_follow_up: true,
+        }
+    };
+
+    // 第一个 Run 提交通知与总结。
+    let first_prepared = prepared("backstop-run-1", base_checkpoint_id);
+    let (port, mut session, handle) = run::channel(RunId::new("backstop-run-1"), 32);
+    let cancellation = handle.cancellation();
+    let engine_store = store.clone();
+    let engine_provider = provider.clone();
+    let first = tokio::spawn(async move {
+        RunEngine::new(engine_store, Arc::new(engine_provider))
+            .run(first_prepared, port, cancellation)
+            .await
+    });
+    loop {
+        match session.events.recv().await.unwrap() {
+            RunEvent::MessagesCommitted(committed) => committed.barrier.complete(Ok(())),
+            RunEvent::Ended(outcome) => {
+                assert_eq!(outcome, RunOutcome::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(first.await.unwrap(), RunOutcome::Completed);
+
+    // 并发重投兜底:初始消息全部已提交,零写入直接完成,不再激活模型。
+    let current = store.ensure_conversation(&conversation_id).await.unwrap();
+    let second_prepared = prepared("backstop-run-2", current);
+    let (port, mut session, handle) = run::channel(RunId::new("backstop-run-2"), 32);
+    let cancellation = handle.cancellation();
+    let engine_store = store.clone();
+    let engine_provider = provider.clone();
+    let second = tokio::spawn(async move {
+        RunEngine::new(engine_store, Arc::new(engine_provider))
+            .run(second_prepared, port, cancellation)
+            .await
+    });
+    let mut commits = 0;
+    loop {
+        match session.events.recv().await.unwrap() {
+            RunEvent::MessagesCommitted(committed) => {
+                commits += 1;
+                committed.barrier.complete(Ok(()));
+            }
+            RunEvent::Ended(outcome) => {
+                assert_eq!(outcome, RunOutcome::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(second.await.unwrap(), RunOutcome::Completed);
+    assert_eq!(commits, 0, "a skipped Run must not commit any checkpoint");
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a fully duplicate background follow-up must not activate the model"
+    );
+    assert_eq!(
+        store.ensure_conversation(&conversation_id).await.unwrap(),
+        current,
+        "a skipped Run must leave the conversation checkpoint unchanged"
+    );
+}
+
+#[tokio::test]
+async fn registry_shutdown_cancels_runs_and_closes_run_sse_outputs() {
+    let (_directory, store) = temp_store().await;
+    let registry = registry(store, FakeProvider::default());
     let handle = registry.get_or_create("active-run").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
 
     registry.shutdown().await;
 
@@ -270,20 +474,10 @@ async fn registry_shutdown_cancels_runs_and_closes_run_sse_outputs() {
 
 #[tokio::test]
 async fn client_heartbeat_returns_a_server_protocol_heartbeat() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(fake_provider::FakeProvider::default()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let registry = registry(store, FakeProvider::default());
     let handle = registry.get_or_create("heartbeat-run").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
 
     cursor_server::api::cursor::bidi::append(
         &registry,
@@ -291,6 +485,8 @@ async fn client_heartbeat_returns_a_server_protocol_heartbeat() {
             request_id: "heartbeat-run".into(),
             // A transport heartbeat must not wait for missing application messages.
             seqno: 1,
+            rewritten: false,
+            encoding: cursor_server::api::cursor::bidi::AppendEncoding::Hex,
             message: pb::AgentClientMessage {
                 message: Some(pb::agent_client_message::Message::ClientHeartbeat(
                     pb::ClientHeartbeat {},
@@ -322,8 +518,8 @@ async fn client_heartbeat_returns_a_server_protocol_heartbeat() {
 
 #[tokio::test]
 async fn runtime_cancel_action_aborts_active_exec_before_canceled_end_stream() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     provider.push(vec![
         ModelEvent::Start {
             model_call_id: "ignored".into(),
@@ -340,19 +536,19 @@ async fn runtime_cancel_action_aborts_active_exec_before_canceled_end_stream() {
         ModelEvent::ToolCallEnd { index: 0 },
         ModelEvent::Done(FinishReason::ToolUse),
     ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(store, Arc::new(provider), PromptCompiler::new(assets));
+    let registry = registry(store, provider);
     let handle = registry.get_or_create("cancel-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run()),
+            message: Box::new(run_request(
+                "cancel-conversation",
+                "cancel-request",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
+            )),
         })
         .await
         .unwrap();
@@ -424,29 +620,32 @@ async fn runtime_cancel_action_aborts_active_exec_before_canceled_end_stream() {
 
 #[tokio::test]
 async fn queued_user_message_after_turn_ended_starts_the_next_turn() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(text_response("first turn"));
-    provider.push(text_response("queued turn"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(text_response_with_usage(
+        "call-first turn",
+        "first turn",
+        1,
+        1,
+    ));
+    provider.push(text_response_with_usage(
+        "call-queued turn",
+        "queued turn",
+        1,
+        1,
+    ));
+    let registry = registry(store, provider.clone());
     let handle = registry.get_or_create("queued-after-turn").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run_for(
-                "queued-after-turn",
+            message: Box::new(run_request(
                 "queued-after-turn-conversation",
+                "queued-after-turn",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
             )),
         })
         .await
@@ -461,6 +660,8 @@ async fn queued_user_message_after_turn_ended_starts_the_next_turn() {
         cursor_server::api::cursor::bidi::DecodedAppend {
             request_id: "queued-after-turn".into(),
             seqno: append_seqno,
+            rewritten: false,
+            encoding: cursor_server::api::cursor::bidi::AppendEncoding::Hex,
             message: runtime_user_message(),
         },
         None,
@@ -469,25 +670,9 @@ async fn queued_user_message_after_turn_ended_starts_the_next_turn() {
     .unwrap();
     append_seqno += 1;
 
-    let mut text = String::new();
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .expect("queued turn closed without EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(payload.as_ref(), b"{}");
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        if let Some(pb::agent_server_message::Message::InteractionUpdate(update)) = server.message {
-            if let Some(pb::interaction_update::Message::TextDelta(delta)) = update.message {
-                text.push_str(&delta.text);
-            }
-        }
-        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-    }
+    let out = drive(&handle, &mut output, &mut append_seqno, |_| vec![]).await;
+    assert_eq!(out.terminal, serde_json::json!({}));
+    let text = text_of(&out);
 
     assert!(text.contains("queued turn"));
     let requests = provider.requests();
@@ -502,140 +687,43 @@ async fn queued_user_message_after_turn_ended_starts_the_next_turn() {
 }
 
 #[tokio::test]
-async fn runtime_user_message_action_interrupts_and_continues_with_new_message() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push_pending();
-    provider.push(text_response("continued after user interruption"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
-    let handle = registry
-        .get_or_create("user-message-request")
-        .await
-        .unwrap();
-    let mut output = handle.subscribe();
-    handle
-        .command(TransportCommand::Append {
-            seqno: 0,
-            message: Box::new(client_run_for(
-                "user-message-request",
-                "user-message-conversation",
-            )),
-        })
-        .await
-        .unwrap();
-
-    let mut append_seqno = 1;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while provider.requests().is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "provider did not start"
-        );
-        if let Ok(Some(frame)) =
-            tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await
-        {
-            let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-            if flags & connect::END_STREAM_FLAG != 0 {
-                panic!("initial run ended: {}", String::from_utf8_lossy(&payload));
-            }
-            acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-        }
-    }
-    handle
-        .command(TransportCommand::Append {
-            seqno: append_seqno,
-            message: Box::new(runtime_user_message()),
-        })
-        .await
-        .unwrap();
-
-    let mut saw_continued = false;
-    let mut append_seqno = append_seqno + 1;
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .expect("RunSSE closed before successful EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(payload.as_ref(), b"{}");
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        if let Some(pb::agent_server_message::Message::InteractionUpdate(update)) = server.message {
-            if let Some(pb::interaction_update::Message::TextDelta(delta)) = update.message {
-                saw_continued |= delta.text.contains("continued after user interruption");
-            }
-        }
-        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-    }
-    assert!(saw_continued);
-    assert_eq!(provider.requests().len(), 2);
-    let history = serde_json::to_string(&provider.requests()[1].history).unwrap();
-    assert!(history.contains("queued follow-up"));
-}
-
-#[tokio::test]
 async fn runtime_user_message_reports_delivered_and_appended() {
     // A runtime user message is queued into `pending_injections` under a
     // `user-message:{id}` key, but the commit correlation only handled the
     // `inject-context:` prefix, so the entry was never cleared: the client
     // never saw Delivered/UserMessageAppended and every later tool round was
     // detached (a hang). This asserts the full delivery sequence.
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     provider.push_pending();
-    provider.push(text_response("continued after user interruption"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    provider.push(text_response_with_usage(
+        "call-continued after user interruption",
+        "continued after user interruption",
+        1,
+        1,
+    ));
+    let registry = registry(store, provider.clone());
     let handle = registry
         .get_or_create("user-message-events-request")
         .await
         .unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run_for(
-                "user-message-events-request",
+            message: Box::new(run_request(
                 "user-message-events-conversation",
+                "user-message-events-request",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
             )),
         })
         .await
         .unwrap();
 
     let mut append_seqno = 1;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while provider.requests().is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "provider did not start"
-        );
-        if let Ok(Some(frame)) =
-            tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await
-        {
-            acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-        }
-    }
+    wait_for_provider_requests(&provider, &handle, &mut output, &mut append_seqno, 1).await;
     handle
         .command(TransportCommand::Append {
             seqno: append_seqno,
@@ -645,50 +733,16 @@ async fn runtime_user_message_reports_delivered_and_appended() {
         .unwrap();
     append_seqno += 1;
 
-    let mut protocol_events = Vec::new();
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .expect("RunSSE closed before successful EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(payload.as_ref(), b"{}");
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        if let Some(pb::agent_server_message::Message::InteractionUpdate(update)) = server.message {
-            match update.message {
-                Some(pb::interaction_update::Message::ContextInjectionState(update)) => {
-                    assert_eq!(update.injection_id, "user-message:queued-user");
-                    match update.state.and_then(|state| state.state) {
-                        Some(pb::context_injection_state::State::Queued(_)) => {
-                            protocol_events.push("queued")
-                        }
-                        Some(pb::context_injection_state::State::Delivered(delivered)) => {
-                            assert!(!delivered.delivery_batch_id.is_empty());
-                            assert!(delivered.delivered_at_ms > 0);
-                            protocol_events.push("delivered");
-                        }
-                        _ => {}
-                    }
-                }
-                Some(pb::interaction_update::Message::UserMessageAppended(update)) => {
-                    let user = update.user_message.expect("appended user message");
-                    assert_eq!(user.message_id, "queued-user");
-                    assert_eq!(user.text, "queued follow-up");
-                    protocol_events.push("user_message_appended");
-                }
-                Some(pb::interaction_update::Message::TextDelta(update))
-                    if update.text.contains("continued after user interruption") =>
-                {
-                    protocol_events.push("continued_output");
-                }
-                _ => {}
-            }
-        }
-        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-    }
+    let protocol_events = collect_injection_lifecycle(
+        &handle,
+        &mut output,
+        &mut append_seqno,
+        "user-message:queued-user",
+        "queued-user",
+        "queued follow-up",
+        "continued after user interruption",
+    )
+    .await;
 
     assert_eq!(
         protocol_events,
@@ -699,6 +753,10 @@ async fn runtime_user_message_reports_delivered_and_appended() {
             "continued_output"
         ]
     );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let history = serde_json::to_string(&requests[1].history).unwrap();
+    assert!(history.contains("queued follow-up"));
 }
 
 #[tokio::test]
@@ -706,67 +764,54 @@ async fn tool_call_with_empty_arguments_does_not_fail_the_run() {
     // A tool call that carries no arguments streams no argument text. Parsing it
     // as JSON must yield an empty object (as the model cycle already does), not
     // fail the run with `EOF while parsing a value`.
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(tool_response("call-1", "UpdateCurrentStep", ""));
-    provider.push(text_response("done after empty-argument tool"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(tool_response(
+        "call-call-1",
+        "call-1",
+        "UpdateCurrentStep",
+        "",
+    ));
+    provider.push(text_response_with_usage(
+        "call-done after empty-argument tool",
+        "done after empty-argument tool",
+        1,
+        1,
+    ));
+    let registry = registry(store, provider.clone());
     let handle = registry.get_or_create("empty-args-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run_for(
-                "empty-args-request",
+            message: Box::new(run_request(
                 "empty-args-conversation",
+                "empty-args-request",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
             )),
         })
         .await
         .unwrap();
 
     let mut append_seqno = 1;
-    let mut saw_done = false;
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .expect("RunSSE closed before successful EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(
-                payload.as_ref(),
-                b"{}",
-                "run failed: {}",
-                String::from_utf8_lossy(&payload)
-            );
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        if let Some(pb::agent_server_message::Message::InteractionUpdate(update)) = server.message {
-            if let Some(pb::interaction_update::Message::TextDelta(delta)) = update.message {
-                saw_done |= delta.text.contains("done after empty-argument tool");
-            }
-        }
-        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-    }
+    let out = drive(&handle, &mut output, &mut append_seqno, |_| vec![]).await;
+    assert_eq!(
+        out.terminal,
+        serde_json::json!({}),
+        "run failed: {}",
+        out.terminal
+    );
+    let saw_done = text_of(&out).contains("done after empty-argument tool");
     assert!(saw_done);
     assert_eq!(provider.requests().len(), 2);
 }
 
 #[tokio::test]
 async fn injected_user_context_restarts_only_the_active_model_cycle() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     provider.push_pending();
     provider.push(vec![
         ModelEvent::Start {
@@ -777,93 +822,46 @@ async fn injected_user_context_restarts_only_the_active_model_cycle() {
         ModelEvent::TextEnd,
         ModelEvent::Done(FinishReason::Stop),
     ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let registry = registry(store, provider.clone());
     let handle = registry.get_or_create("inject-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run_for("inject-request", "inject-conversation")),
+            message: Box::new(run_request(
+                "inject-conversation",
+                // The client's stable run id is distinct from the transport
+                // request id; injections address the run id, not the attempt id.
+                "client-run-identity",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
+            )),
         })
         .await
         .unwrap();
 
     let mut append_seqno = 1;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while provider.requests().is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "provider did not start"
-        );
-        if let Ok(Some(frame)) =
-            tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await
-        {
-            acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-        }
-    }
+    wait_for_provider_requests(&provider, &handle, &mut output, &mut append_seqno, 1).await;
     handle
         .command(TransportCommand::Append {
             seqno: append_seqno,
-            message: Box::new(runtime_injection()),
+            message: Box::new(runtime_injection_for("injection-1", "client-run-identity")),
         })
         .await
         .unwrap();
     append_seqno += 1;
 
-    let mut protocol_events = Vec::new();
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .expect("RunSSE closed before successful EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(payload.as_ref(), b"{}");
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        if let Some(pb::agent_server_message::Message::InteractionUpdate(update)) = server.message {
-            match update.message {
-                Some(pb::interaction_update::Message::ContextInjectionState(update)) => {
-                    assert_eq!(update.injection_id, "injection-1");
-                    match update.state.and_then(|state| state.state) {
-                        Some(pb::context_injection_state::State::Queued(_)) => {
-                            protocol_events.push("queued")
-                        }
-                        Some(pb::context_injection_state::State::Delivered(delivered)) => {
-                            assert!(!delivered.delivery_batch_id.is_empty());
-                            assert!(delivered.delivered_at_ms > 0);
-                            protocol_events.push("delivered");
-                        }
-                        _ => {}
-                    }
-                }
-                Some(pb::interaction_update::Message::UserMessageAppended(update)) => {
-                    let user = update.user_message.expect("appended user message");
-                    assert_eq!(user.message_id, "injected-user");
-                    assert_eq!(user.text, "injected follow-up");
-                    protocol_events.push("user_message_appended");
-                }
-                Some(pb::interaction_update::Message::TextDelta(update))
-                    if update.text.contains("continued after injection") =>
-                {
-                    protocol_events.push("continued_output");
-                }
-                _ => {}
-            }
-        }
-        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-    }
+    let protocol_events = collect_injection_lifecycle(
+        &handle,
+        &mut output,
+        &mut append_seqno,
+        "injection-1",
+        "injected-user",
+        "injected follow-up",
+        "continued after injection",
+    )
+    .await;
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
@@ -882,32 +880,35 @@ async fn injected_user_context_restarts_only_the_active_model_cycle() {
 
 #[tokio::test]
 async fn injected_user_context_aborts_pending_tools_and_ignores_late_results() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(tool_response("call-1", "Read", "{\"path\":\"/tmp/a\"}"));
-    let release = provider.push_gated(text_response("continued after tool interruption"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push(tool_response(
+        "call-call-1",
+        "call-1",
+        "Read",
+        "{\"path\":\"/tmp/a\"}",
+    ));
+    let release = provider.push_gated(text_response_with_usage(
+        "call-continued after tool interruption",
+        "continued after tool interruption",
+        1,
+        1,
+    ));
+    let registry = registry(store, provider.clone());
     let handle = registry
         .get_or_create("interrupt-tool-request")
         .await
         .unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run_for(
-                "interrupt-tool-request",
+            message: Box::new(run_request(
                 "interrupt-tool-conversation",
+                "interrupt-tool-run",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
             )),
         })
         .await
@@ -920,7 +921,7 @@ async fn injected_user_context_aborts_pending_tools_and_ignores_late_results() {
             seqno: append_seqno,
             message: Box::new(runtime_injection_for(
                 "tool-injection",
-                "interrupt-tool-request",
+                "interrupt-tool-run",
             )),
         })
         .await
@@ -956,14 +957,15 @@ async fn injected_user_context_aborts_pending_tools_and_ignores_late_results() {
     handle
         .command(TransportCommand::Append {
             seqno: append_seqno,
-            message: Box::new(read_success(exec_id)),
+            message: Box::new(read_success(exec_id, "/tmp/a", "late")),
         })
         .await
         .unwrap();
     append_seqno += 1;
     release.notify_one();
 
-    drain_successfully(&handle, &mut output, &mut append_seqno).await;
+    let out = drive(&handle, &mut output, &mut append_seqno, |_| vec![]).await;
+    assert_eq!(out.terminal, serde_json::json!({}));
 
     let requests = provider.requests();
     assert_eq!(
@@ -982,42 +984,92 @@ async fn injected_user_context_aborts_pending_tools_and_ignores_late_results() {
 
 #[tokio::test]
 async fn injected_user_context_detaches_subagents_without_cancelling_them() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(tool_response(
+    detached_task_result_case(false, false, false, false).await;
+}
+
+#[tokio::test]
+async fn detached_task_result_after_parent_ends_survives_idle_timeout() {
+    detached_task_result_case(true, false, false, false).await;
+}
+
+#[tokio::test]
+async fn cancelled_detached_task_does_not_restart_parent() {
+    detached_task_result_case(true, true, false, false).await;
+}
+
+#[tokio::test]
+async fn steer_preserves_task_and_aborts_read_in_the_same_round() {
+    detached_task_result_case(false, false, true, false).await;
+}
+
+#[tokio::test]
+async fn official_failure_after_detach_completes_once_and_keeps_prefix() {
+    detached_task_result_case(true, false, false, true).await;
+}
+
+#[tokio::test]
+async fn cancelled_official_child_failure_does_not_restart_parent() {
+    detached_task_result_case(true, true, false, true).await;
+}
+
+async fn detached_task_result_case(after_parent: bool, cancel: bool, mixed: bool, official: bool) {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    let mut first_response = tool_response(
+        "call-task-call",
         "task-call",
         "Task",
         &serde_json::json!({
             "description": "Inspect protocol",
+            "model": if official { "DETACHED_TASK_RESULT_MARKER" } else { "inherit" },
             "prompt": "Inspect the protocol",
             "subagent_type": "generalPurpose",
             "run_in_background": false
         })
         .to_string(),
-    ));
-    let release = provider.push_gated(text_response("continued while subagent runs"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
     );
+    if mixed {
+        first_response.pop();
+        first_response.extend([
+            ModelEvent::ToolCallStart {
+                index: 1,
+                call_id: "read-call".into(),
+                name: "Read".into(),
+            },
+            ModelEvent::ToolCallArgumentsDelta {
+                index: 1,
+                delta: serde_json::json!({"path":"/tmp/a"}).to_string(),
+            },
+            ModelEvent::ToolCallEnd { index: 1 },
+            ModelEvent::Done(FinishReason::ToolUse),
+        ]);
+    }
+    provider.push(first_response);
+    let release = provider.push_gated(text_response_with_usage(
+        "call-continued while subagent runs",
+        "continued while subagent runs",
+        1,
+        1,
+    ));
+    provider.push(text_response(
+        "call-received detached result",
+        "received detached result",
+    ));
+    let registry = registry(store.clone(), provider.clone());
     let handle = registry
         .get_or_create("detach-subagent-request")
         .await
         .unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run_for(
-                "detach-subagent-request",
+            message: Box::new(run_request(
                 "detach-subagent-conversation",
+                "detach-subagent-run",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
             )),
         })
         .await
@@ -1025,12 +1077,39 @@ async fn injected_user_context_detaches_subagents_without_cancelling_them() {
 
     let mut append_seqno = 1;
     let exec_id = wait_for_exec(&handle, &mut output, &mut append_seqno, "Task").await;
+    let upstream_generation = if official {
+        registry.mark_upstream("official-detached-child").await;
+        registry
+            .associate_upstream_task(
+                "official-detached-child",
+                cursor_server::cursor::TransportParent {
+                    request_id: "detach-subagent-request".into(),
+                    tool_call_id: "task-call".into(),
+                },
+                "DETACHED_TASK_RESULT_MARKER".into(),
+            )
+            .await;
+        let cursor_server::cursor::TransportRoute::Upstream(generation) =
+            registry.wait_route("official-detached-child").await
+        else {
+            panic!()
+        };
+        Some(generation)
+    } else {
+        None
+    };
+    let read_id = if mixed {
+        Some(wait_for_exec(&handle, &mut output, &mut append_seqno, "Read").await)
+    } else {
+        None
+    };
+    let mut read_aborted = false;
     handle
         .command(TransportCommand::Append {
             seqno: append_seqno,
             message: Box::new(runtime_injection_for(
                 "subagent-injection",
-                "detach-subagent-request",
+                "detach-subagent-run",
             )),
         })
         .await
@@ -1055,99 +1134,529 @@ async fn injected_user_context_detaches_subagents_without_cancelling_them() {
                     control.message
                 {
                     assert_ne!(abort.id, exec_id, "Task must not be aborted by injection");
+                    read_aborted |= Some(abort.id) == read_id;
                 }
             }
             acknowledge_kv(&handle, &mut append_seqno, &frame).await;
         }
     }
 
+    if let Some(id) = read_id {
+        assert!(read_aborted, "ordinary Read must be aborted");
+        handle
+            .command(TransportCommand::Append {
+                seqno: append_seqno,
+                message: Box::new(read_success(id, "/tmp/a", "late")),
+            })
+            .await
+            .unwrap();
+        append_seqno += 1;
+    }
+    if after_parent {
+        release.notify_one();
+        wait_for_text(
+            &handle,
+            &mut output,
+            &mut append_seqno,
+            "continued while subagent runs",
+        )
+        .await;
+        // Drain checkpoint acknowledgements too, so this covers the actor's
+        // idle timeout after output really finishes, rather than a blocked publish.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2300);
+        loop {
+            match tokio::time::timeout_at(deadline, output.recv()).await {
+                Ok(Some(frame)) => {
+                    let (flags, _) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+                    assert_eq!(
+                        flags & connect::END_STREAM_FLAG,
+                        0,
+                        "pending Task lost its receiver"
+                    );
+                    let (_, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+                    let server = pb::AgentServerMessage::decode(payload).unwrap();
+                    assert!(
+                        !matches!(
+                            server.message,
+                            Some(pb::agent_server_message::Message::InteractionUpdate(
+                                pb::InteractionUpdate {
+                                    message: Some(pb::interaction_update::Message::TurnEnded(_))
+                                }
+                            ))
+                        ),
+                        "Cursor turn ended while original Task still runs"
+                    );
+                    acknowledge_kv(&handle, &mut append_seqno, &frame).await;
+                }
+                Ok(None) => panic!("pending Task transport closed"),
+                Err(_) => break,
+            }
+        }
+    }
+    if cancel {
+        handle
+            .command(TransportCommand::Append {
+                seqno: append_seqno,
+                message: Box::new(runtime_cancel_action()),
+            })
+            .await
+            .unwrap();
+        append_seqno += 1;
+    }
+    if let Some(generation) = upstream_generation {
+        let error = cursor_server::cursor::services::official_error::extract_end_stream(
+            &official_model_not_found_payload(),
+        )
+        .unwrap();
+        registry
+            .fail_upstream_task("official-detached-child", generation, &error)
+            .await;
+        registry
+            .fail_upstream_task("official-detached-child", generation, &error)
+            .await;
+    }
     handle
         .command(TransportCommand::Append {
             seqno: append_seqno,
-            message: Box::new(subagent_success(exec_id)),
+            message: Box::new(subagent_result_success_with_message(
+                exec_id,
+                "detached-child",
+                Some("DETACHED_TASK_RESULT_MARKER"),
+            )),
         })
         .await
         .unwrap();
     append_seqno += 1;
-    release.notify_one();
+    // Cursor can replay a terminal result; it must not create a second event.
+    handle
+        .command(TransportCommand::Append {
+            seqno: append_seqno,
+            message: Box::new(subagent_result_success_with_message(
+                exec_id,
+                "detached-child",
+                Some("DETACHED_TASK_RESULT_MARKER"),
+            )),
+        })
+        .await
+        .unwrap();
+    append_seqno += 1;
+    if !after_parent {
+        release.notify_one();
+    }
 
-    drain_successfully(&handle, &mut output, &mut append_seqno).await;
+    let out = drive(&handle, &mut output, &mut append_seqno, |_| vec![]).await;
+    assert_eq!(out.terminal, serde_json::json!({}));
+    let turn_ends = out
+        .interactions
+        .iter()
+        .filter(|update| {
+            matches!(
+                update.message,
+                Some(pb::interaction_update::Message::TurnEnded(_))
+            )
+        })
+        .count();
+    let tool_completions = out
+        .interactions
+        .iter()
+        .filter(|update| {
+            matches!(
+                &update.message,
+                Some(pb::interaction_update::Message::ToolCallCompleted(call))
+                    if call.call_id == "task-call"
+            )
+        })
+        .count();
+    if !cancel {
+        assert_eq!(
+            turn_ends, 1,
+            "Cursor interaction ends exactly once after all results"
+        );
+        assert_eq!(
+            tool_completions, 1,
+            "original Task emits one real completion"
+        );
+    }
+    let checkpoint = out.checkpoints.last().cloned();
 
+    if cancel {
+        assert_eq!(
+            provider.requests().len(),
+            2,
+            "explicit stop must not schedule a continuation"
+        );
+        let history = store
+            .load_current_messages(&ConversationId::new("detach-subagent-conversation"))
+            .await
+            .unwrap();
+        if official {
+            assert!(!history.iter().any(|message| message
+                .runtime_event_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("task-completed:"))));
+        } else {
+            assert!(!serde_json::to_string(&history)
+                .unwrap()
+                .contains("DETACHED_TASK_RESULT_MARKER"));
+        }
+        return;
+    }
+    let requests = provider.requests();
+    assert_eq!(
+        requests[1].history,
+        requests[2].history[..requests[1].history.len()]
+    );
+    assert_eq!(requests[1].prompt, requests[2].prompt);
+    let saved = store
+        .load_current_messages(&ConversationId::new("detach-subagent-conversation"))
+        .await
+        .unwrap();
+    let events = saved
+        .iter()
+        .filter(|message| {
+            message
+                .runtime_event_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("task-completed:"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    if official {
+        let result = serde_json::to_string(events[0]).unwrap();
+        assert!(result.contains("available model ID"));
+        assert!(result.contains("Model ID: DETACHED_TASK_RESULT_MARKER"));
+    }
+    assert!(serde_json::to_string(events[0])
+        .unwrap()
+        .contains("DETACHED_TASK_RESULT_MARKER"));
+    let sync = cursor_server::cursor::services::blob_sync::BlobSynchronizer::new(
+        "hydrate-task-test".into(),
+        store.clone(),
+        handle.clone(),
+    );
+    let builder = cursor_server::cursor::checkpoint::CheckpointBuilder::new(
+        store.clone(),
+        ConversationId::new("detach-subagent-conversation"),
+        sync,
+        None,
+        None,
+    );
+    let cursor_state = checkpoint.as_ref().expect("final Cursor checkpoint");
+    assert!(
+        !cursor_state.turns.is_empty(),
+        "late reply lost its Cursor turn"
+    );
+    let mut visible_replies = Vec::new();
+    let mut task_steps = 0;
+    for turn_id in &cursor_state.turns {
+        let bytes = store
+            .get_blob(&cursor_server::store::BlobId::from_bytes(turn_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let wrapper = pb::ConversationTurnStructure::decode(bytes.as_slice()).unwrap();
+        if let Some(pb::conversation_turn_structure::Turn::AgentConversationTurn(turn)) =
+            wrapper.turn
+        {
+            for step_id in turn.steps {
+                let bytes = store
+                    .get_blob(&cursor_server::store::BlobId::from_bytes(&step_id).unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match pb::ConversationStep::decode(bytes.as_slice())
+                    .unwrap()
+                    .message
+                {
+                    Some(pb::conversation_step::Message::AssistantMessage(message)) => {
+                        visible_replies.push(message.text)
+                    }
+                    Some(pb::conversation_step::Message::ToolCall(pb::ToolCall {
+                        tool: Some(pb::tool_call::Tool::TaskToolCall(task)),
+                        ..
+                    })) => {
+                        if official {
+                            assert!(matches!(
+                                task.result.and_then(|r| r.result),
+                                Some(pb::task_result::Result::Error(_))
+                            ));
+                        } else {
+                            assert!(matches!(
+                                task.result.and_then(|r| r.result),
+                                Some(pb::task_result::Result::Success(_))
+                            ));
+                        }
+                        task_steps += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(
+        task_steps, 1,
+        "original Task must have exactly one completed UI step"
+    );
+    assert!(
+        visible_replies
+            .iter()
+            .any(|text| text == "received detached result"),
+        "late reply missing from Cursor presentation: {visible_replies:?}"
+    );
+    assert!(
+        visible_replies
+            .iter()
+            .any(|text| text == "continued while subagent runs"),
+        "previous reply missing from Cursor presentation: {visible_replies:?}"
+    );
+    let hydrated = builder.hydrate_messages(checkpoint.as_ref()).await.unwrap();
+    let restored = hydrated
+        .iter()
+        .find(|message| message.runtime_event_id == events[0].runtime_event_id)
+        .expect("completion identity survived checkpoint hydration");
+    assert_eq!(restored.content, events[0].content);
     let history = serde_json::to_string(&provider.requests()[1].history).unwrap();
-    assert!(history.contains("Tool execution was interrupted by a newer user message."));
+    assert_eq!(
+        history.contains("Tool execution was interrupted by a newer user message."),
+        mixed
+    );
+    for message in &saved {
+        if let cursor_server::model::MessageContent::ToolResult(result) = &message.content {
+            if result.call_id == "task-call" {
+                assert!(!result.is_error);
+            }
+            if result.call_id == "read-call" {
+                assert!(result.is_error);
+                assert!(!result.content.contains("late"));
+            }
+        }
+    }
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "late Task output must reach a model request"
+    );
+    let final_history = serde_json::to_string(&provider.requests()[2].history).unwrap();
+    if official {
+        assert_eq!(
+            final_history
+                .matches("Ask the parent agent to retry")
+                .count(),
+            1
+        );
+    } else {
+        assert_eq!(
+            final_history.matches("DETACHED_TASK_RESULT_MARKER").count(),
+            1
+        );
+    }
     assert!(history.contains("injected follow-up"));
 }
 
 #[tokio::test]
-async fn injected_user_context_interrupts_automatic_compaction() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let model = store
-        .create_model(&ModelConfigInput {
-            sort_order: 0,
-            display_name: "Test Model".into(),
-            group_name: None,
-            model_type: ModelType::OpenAi,
-            base_url: "https://example.com/v1/chat/completions".into(),
-            use_full_url: true,
-            api_key: "test-key".into(),
-            tooltip_data: "Test Model".into(),
-            model_id: "test-model".into(),
-            reasoning_effort: None,
-            effort_options: Vec::new(),
-            context_options: Vec::new(),
-            openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
-            openai_extra_params_enabled: false,
-            openai_extra_params: serde_json::json!({}),
-            custom_headers_enabled: false,
-            custom_headers: serde_json::json!({}),
-            anthropic_extra_params_enabled: false,
-            anthropic_extra_params: serde_json::json!({}),
-            context_window_tokens: Some(100_000),
-            max_completion_tokens: None,
-            anthropic_max_tokens: None,
-            anthropic_thinking_effort: None,
-            thinking_budget_tokens: None,
+async fn detached_tasks_keep_original_round_identity_when_call_ids_are_reused() {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    let arguments = serde_json::json!({
+        "description": "Inspect protocol", "prompt": "Inspect protocol",
+        "subagent_type": "generalPurpose", "run_in_background": false
+    })
+    .to_string();
+    provider.push(tool_response(
+        "call-reused-task-1",
+        "reused-task",
+        "Task",
+        &arguments,
+    ));
+    provider.push(tool_response(
+        "call-reused-task-2",
+        "reused-task",
+        "Task",
+        &arguments,
+    ));
+    let release = provider.push_gated(text_response(
+        "call-both-tasks-running",
+        "both tasks are still running",
+    ));
+    provider.push(text_response("call-first-received", "first task received"));
+    provider.push(text_response(
+        "call-second-received",
+        "second task received",
+    ));
+    let registry = registry(store.clone(), provider.clone());
+    let handle = registry.get_or_create("two-tasks").await.unwrap();
+    let mut output = handle.subscribe().unwrap();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(run_request(
+                "two-tasks",
+                "two-tasks-run",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
+            )),
         })
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
-    let seed_answer = "x".repeat(400_000);
-    provider.push(text_response(&seed_answer));
-    provider.push_pending();
-    provider.push(text_response("continued after compacting injection"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
-
-    run_to_end(
-        &registry,
-        "seed-request",
-        client_run_for_model(
-            "seed-request",
-            "compaction-injection-conversation",
-            &model.model_hash,
-        ),
+    let mut seq = 1;
+    let first = wait_for_exec(&handle, &mut output, &mut seq, "Task").await;
+    handle
+        .command(TransportCommand::Append {
+            seqno: seq,
+            message: Box::new(runtime_injection_for("first-steer", "two-tasks-run")),
+        })
+        .await
+        .unwrap();
+    seq += 1;
+    let second = wait_for_exec(&handle, &mut output, &mut seq, "Task").await;
+    assert_ne!(first, second);
+    handle
+        .command(TransportCommand::Append {
+            seqno: seq,
+            message: Box::new(runtime_injection_for("second-steer", "two-tasks-run")),
+        })
+        .await
+        .unwrap();
+    seq += 1;
+    // Observe the second injection's delivery before resolving either execution.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while provider.requests().len() < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "second injection was not delivered"
+        );
+        let Ok(Some(frame)) =
+            tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await
+        else {
+            continue;
+        };
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        assert_eq!(flags & connect::END_STREAM_FLAG, 0);
+        let server = pb::AgentServerMessage::decode(payload).unwrap();
+        if let Some(pb::agent_server_message::Message::ExecServerControlMessage(control)) =
+            server.message
+        {
+            if let Some(pb::exec_server_control_message::Message::Abort(abort)) = control.message {
+                assert!(
+                    abort.id != first && abort.id != second,
+                    "Steer must retain both Tasks"
+                );
+            }
+        }
+        acknowledge_kv(&handle, &mut seq, &frame).await;
+    }
+    // Let the parent end first. Each original Task must survive the other Task's
+    // completion-driven parent generation, even though their call IDs are equal.
+    release.notify_one();
+    wait_for_text(
+        &handle,
+        &mut output,
+        &mut seq,
+        "both tasks are still running",
     )
     .await;
+    assert_transport_remains_open(&handle, &mut output, &mut seq).await;
+    handle
+        .command(TransportCommand::Append {
+            seqno: seq,
+            message: Box::new(subagent_success(first)),
+        })
+        .await
+        .unwrap();
+    seq += 1;
+    wait_for_text(&handle, &mut output, &mut seq, "first task received").await;
+    assert_transport_remains_open(&handle, &mut output, &mut seq).await;
+    handle
+        .command(TransportCommand::Append {
+            seqno: seq,
+            message: Box::new(subagent_success(second)),
+        })
+        .await
+        .unwrap();
+    seq += 1;
+    drain_successfully(&handle, &mut output, &mut seq).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 5);
+    for pair in requests.windows(2) {
+        assert_eq!(pair[0].history, pair[1].history[..pair[0].history.len()]);
+    }
+    let history = store
+        .load_current_messages(&ConversationId::new("two-tasks"))
+        .await
+        .unwrap();
+    let events = history
+        .iter()
+        .filter_map(|message| message.runtime_event_id.as_ref())
+        .filter(|id| id.starts_with("task-completed:"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert_ne!(events[0], events[1]);
+    assert_eq!(
+        serde_json::to_string(&history)
+            .unwrap()
+            .matches("DETACHED_TASK_RESULT_MARKER")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn injected_user_context_interrupts_automatic_compaction() {
+    let (_directory, store) = temp_store().await;
+    let model = store
+        .create_model(&openai_model_input("test-model", Some(100_000)))
+        .await
+        .unwrap();
+    let provider = FakeProvider::default();
+    let seed_answer = "x".repeat(400_000);
+    provider.push(text_response_with_usage(
+        &format!("call-{seed_answer}"),
+        &seed_answer,
+        1,
+        1,
+    ));
+    provider.push_pending();
+    provider.push(text_response_with_usage(
+        "call-continued after compacting injection",
+        "continued after compacting injection",
+        1,
+        1,
+    ));
+    let registry = registry(store, provider.clone());
+
+    let handle = registry.get_or_create("seed-request").await.unwrap();
+    let mut output = handle.subscribe().unwrap();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(run_request(
+                "compaction-injection-conversation",
+                "seed-request",
+                &model.model_hash,
+                None,
+                user_message_action("read", "cancel-user", None),
+            )),
+        })
+        .await
+        .unwrap();
+    let mut append_seqno = 1;
+    let mut out = drive(&handle, &mut output, &mut append_seqno, |_| vec![]).await;
+    out.checkpoints
+        .pop()
+        .expect("Run ended without a checkpoint");
 
     let handle = registry
         .get_or_create("inject-during-compaction")
         .await
         .unwrap();
-    let mut output = handle.subscribe();
-    let mut compacting_request = client_run_for_model_with_state(
-        "inject-during-compaction",
+    let mut output = handle.subscribe().unwrap();
+    let mut compacting_request = run_request(
         "compaction-injection-conversation",
+        "inject-during-compaction-run",
         &model.model_hash,
         None,
+        user_message_action("read", "cancel-user", None),
     );
     let Some(pb::agent_client_message::Message::RunRequest(request)) =
         compacting_request.message.as_mut()
@@ -1177,49 +1686,22 @@ async fn injected_user_context_interrupts_automatic_compaction() {
         .unwrap();
 
     let mut append_seqno = 1;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while provider.requests().len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "automatic compaction did not start"
-        );
-        if let Ok(Some(frame)) =
-            tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await
-        {
-            acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-        }
-    }
+    wait_for_provider_requests(&provider, &handle, &mut output, &mut append_seqno, 2).await;
     handle
         .command(TransportCommand::Append {
             seqno: append_seqno,
             message: Box::new(runtime_injection_for(
                 "compaction-injection",
-                "inject-during-compaction",
+                "inject-during-compaction-run",
             )),
         })
         .await
         .unwrap();
     append_seqno += 1;
 
-    let mut saw_continued = false;
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .expect("RunSSE closed before successful EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(payload.as_ref(), b"{}");
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        if let Some(pb::agent_server_message::Message::InteractionUpdate(update)) = server.message {
-            if let Some(pb::interaction_update::Message::TextDelta(delta)) = update.message {
-                saw_continued |= delta.text.contains("continued after compacting injection");
-            }
-        }
-        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-    }
+    let out = drive(&handle, &mut output, &mut append_seqno, |_| vec![]).await;
+    assert_eq!(out.terminal, serde_json::json!({}));
+    let saw_continued = text_of(&out).contains("continued after compacting injection");
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
@@ -1243,8 +1725,8 @@ async fn injected_user_context_interrupts_automatic_compaction() {
 
 #[tokio::test]
 async fn stale_context_injection_is_rejected_without_failing_the_active_run() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     let release = provider.push_gated(vec![
         ModelEvent::Start {
             model_call_id: "active-cycle".into(),
@@ -1254,47 +1736,31 @@ async fn stale_context_injection_is_rejected_without_failing_the_active_run() {
         ModelEvent::TextEnd,
         ModelEvent::Done(FinishReason::Stop),
     ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let registry = registry(store, provider.clone());
     let handle = registry.get_or_create("active-request").await.unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run_for(
-                "active-request",
+            message: Box::new(run_request(
                 "stale-injection-conversation",
+                // Distinct stable run id: a stale injection must be rejected by
+                // run identity, not by transport attempt id.
+                "active-client-run",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
             )),
         })
         .await
         .unwrap();
 
     let mut append_seqno = 1;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while provider.requests().is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "provider did not start"
-        );
-        if let Ok(Some(frame)) =
-            tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await
-        {
-            acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-        }
-    }
+    wait_for_provider_requests(&provider, &handle, &mut output, &mut append_seqno, 1).await;
     handle
         .command(TransportCommand::Append {
             seqno: append_seqno,
-            message: Box::new(runtime_injection_for("stale-injection", "replaced-request")),
+            message: Box::new(runtime_injection_for("stale-injection", "replaced-run")),
         })
         .await
         .unwrap();
@@ -1302,7 +1768,7 @@ async fn stale_context_injection_is_rejected_without_failing_the_active_run() {
     handle
         .command(TransportCommand::Append {
             seqno: append_seqno,
-            message: Box::new(runtime_injection_for("stale-injection", "replaced-request")),
+            message: Box::new(runtime_injection_for("stale-injection", "replaced-run")),
         })
         .await
         .unwrap();
@@ -1338,7 +1804,7 @@ async fn stale_context_injection_is_rejected_without_failing_the_active_run() {
             })) if injection_id == "stale-injection" => {
                 assert_eq!(
                     rejected.reason,
-                    "InjectContextAction expected run replaced-request, active run is active-request"
+                    "InjectContextAction expected run replaced-run, active run is active-client-run"
                 );
                 true
             }
@@ -1360,50 +1826,162 @@ async fn stale_context_injection_is_rejected_without_failing_the_active_run() {
 }
 
 #[tokio::test]
-async fn unsupported_runtime_action_is_ignored_without_failing_the_active_run() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
-    let release = provider.push_gated(text_response("active run completed"));
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+async fn injection_targeting_uses_the_stable_run_id_across_reconnect_attempts() {
+    // L-1 regression: `expected_run_id` addresses the client's stable run id
+    // (AgentRunRequest.run_id / generationUUID), never the per-attempt transport
+    // request id. A stream-drop retry reconnects with a fresh x-request-id while
+    // the run id is unchanged; injections must keep being admitted.
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    provider.push_pending();
+    provider.push(text_response_with_usage(
+        "call-reconnect-injection",
+        "continued after reconnect injection",
+        1,
+        1,
+    ));
+    let registry = registry(store, provider.clone());
+    // Reconnect attempt: the transport request id differs from the run id.
     let handle = registry
-        .get_or_create("unsupported-action-request")
+        .get_or_create("reconnect-attempt-request")
         .await
         .unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run_for(
-                "unsupported-action-request",
-                "unsupported-action-conversation",
+            message: Box::new(run_request(
+                "reconnect-injection-conversation",
+                "original-client-run",
+                "test-model",
+                None,
+                user_message_action("read", "reconnect-user", None),
             )),
         })
         .await
         .unwrap();
 
     let mut append_seqno = 1;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while provider.requests().is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "provider did not start"
-        );
-        if let Ok(Some(frame)) =
-            tokio::time::timeout(std::time::Duration::from_millis(20), output.recv()).await
-        {
-            acknowledge_kv(&handle, &mut append_seqno, &frame).await;
-        }
+    wait_for_provider_requests(&provider, &handle, &mut output, &mut append_seqno, 1).await;
+
+    // Case 1 — reconnect attempt: expected_run_id == run id != request id → accepted.
+    // Case 2 — the client's attempt id is NOT the run identity → rejected.
+    // Case 3 — stale run id → rejected.
+    // Case 4 — interleaved duplicates of the accepted id stay no-ops (dedup).
+    for (injection_id, expected_run_id) in [
+        ("reconnect-injection", "original-client-run"),
+        ("attempt-id-injection", "reconnect-attempt-request"),
+        ("stale-run-injection", "some-retired-run"),
+        ("reconnect-injection", "original-client-run"),
+    ] {
+        handle
+            .command(TransportCommand::Append {
+                seqno: append_seqno,
+                message: Box::new(runtime_injection_for(injection_id, expected_run_id)),
+            })
+            .await
+            .unwrap();
+        append_seqno += 1;
     }
+
+    let mut verdicts: Vec<(String, &'static str)> = Vec::new();
+    let mut saw_continued = false;
+    let mut ended = false;
+    while !ended {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
+            .await
+            .unwrap()
+            .expect("RunSSE closed before EndStream");
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        if flags & connect::END_STREAM_FLAG != 0 {
+            assert_eq!(payload.as_ref(), b"{}", "run must not fail from rejections");
+            ended = true;
+            continue;
+        }
+        let server = pb::AgentServerMessage::decode(payload).unwrap();
+        let mut text = String::new();
+        if let Some(pb::agent_server_message::Message::InteractionUpdate(update)) = server.message {
+            match update.message {
+                Some(pb::interaction_update::Message::ContextInjectionState(
+                    pb::ContextInjectionStateUpdate {
+                        injection_id,
+                        state: Some(pb::ContextInjectionState { state: Some(state) }),
+                    },
+                )) => {
+                    let verdict = match state {
+                        pb::context_injection_state::State::Queued(_) => "queued",
+                        pb::context_injection_state::State::Delivered(_) => "delivered",
+                        pb::context_injection_state::State::Rejected(_) => "rejected",
+                        _ => "other",
+                    };
+                    verdicts.push((injection_id, verdict));
+                }
+                Some(pb::interaction_update::Message::TextDelta(delta)) => {
+                    text.push_str(&delta.text)
+                }
+                _ => {}
+            }
+        }
+        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
+        saw_continued |= text.contains("continued after reconnect injection");
+    }
+
+    assert!(
+        saw_continued,
+        "injected message must restart the model cycle"
+    );
+
+    verdicts.sort();
+    assert_eq!(
+        verdicts,
+        [
+            ("attempt-id-injection".to_string(), "rejected"),
+            ("reconnect-injection".to_string(), "delivered"),
+            ("reconnect-injection".to_string(), "queued"),
+            ("stale-run-injection".to_string(), "rejected"),
+        ],
+        "exactly one accepted injection (queued then delivered) and two rejections; \
+         the duplicate id must be a silent no-op"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(serde_json::to_string(&requests[1].history)
+        .unwrap()
+        .contains("injected follow-up"));
+}
+
+#[tokio::test]
+async fn unsupported_runtime_action_returns_invalid_argument_for_the_active_run() {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    let _release = provider.push_gated(text_response_with_usage(
+        "call-active run completed",
+        "active run completed",
+        1,
+        1,
+    ));
+    let registry = registry(store, provider.clone());
+    let handle = registry
+        .get_or_create("unsupported-action-request")
+        .await
+        .unwrap();
+    let mut output = handle.subscribe().unwrap();
+    handle
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(run_request(
+                "unsupported-action-conversation",
+                "unsupported-action-request",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
+            )),
+        })
+        .await
+        .unwrap();
+
+    let mut append_seqno = 1;
+    wait_for_provider_requests(&provider, &handle, &mut output, &mut append_seqno, 1).await;
 
     handle
         .command(TransportCommand::Append {
@@ -1413,17 +1991,30 @@ async fn unsupported_runtime_action_is_ignored_without_failing_the_active_run() 
         .await
         .unwrap();
     append_seqno += 1;
-    tokio::task::yield_now().await;
-    release.notify_one();
+    let error = loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
+            .await
+            .unwrap()
+            .expect("RunSSE closed before Error EndStream");
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        if flags & connect::END_STREAM_FLAG != 0 {
+            break serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+        }
+        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
+    };
 
-    drain_successfully(&handle, &mut output, &mut append_seqno).await;
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert_eq!(
+        error["error"]["message"],
+        "runtime ConversationAction does not support ResumeAction"
+    );
     assert_eq!(provider.requests().len(), 1);
 }
 
 #[tokio::test]
 async fn cancel_subagent_action_aborts_the_target_task_and_keeps_the_parent_running() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let provider = fake_provider::FakeProvider::default();
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
     provider.push(vec![
         ModelEvent::Start {
             model_call_id: "task-cycle".into(),
@@ -1455,28 +2046,21 @@ async fn cancel_subagent_action_aborts_the_target_task_and_keeps_the_parent_runn
         ModelEvent::TextEnd,
         ModelEvent::Done(FinishReason::Stop),
     ]);
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(provider.clone()),
-        PromptCompiler::new(assets),
-    );
+    let registry = registry(store, provider.clone());
     let handle = registry
         .get_or_create("cancel-subagent-request")
         .await
         .unwrap();
-    let mut output = handle.subscribe();
+    let mut output = handle.subscribe().unwrap();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run_for(
-                "cancel-subagent-request",
+            message: Box::new(run_request(
                 "cancel-subagent-conversation",
+                "cancel-subagent-request",
+                "test-model",
+                None,
+                user_message_action("read", "cancel-user", None),
             )),
         })
         .await
@@ -1557,141 +2141,72 @@ async fn cancel_subagent_action_aborts_the_target_task_and_keeps_the_parent_runn
     handle
         .command(TransportCommand::Append {
             seqno: append_seqno,
-            message: Box::new(subagent_aborted(exec_id)),
+            message: Box::new(subagent_result_error(
+                exec_id,
+                "Subagent was aborted by the user",
+            )),
         })
         .await
         .unwrap();
     append_seqno += 1;
 
-    let mut saw_continued = false;
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .expect("RunSSE closed before successful EndStream");
-        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            assert_eq!(payload.as_ref(), b"{}");
-            break;
-        }
-        let server = pb::AgentServerMessage::decode(payload).unwrap();
-        match server.message {
-            Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
-                handle
-                    .command(TransportCommand::Append {
-                        seqno: append_seqno,
-                        message: Box::new(kv_ack(kv.id)),
-                    })
-                    .await
-                    .unwrap();
-                append_seqno += 1;
-            }
-            Some(pb::agent_server_message::Message::InteractionUpdate(update)) => {
-                if let Some(pb::interaction_update::Message::TextDelta(delta)) = update.message {
-                    saw_continued |= delta.text.contains("continued after subagent cancellation");
-                }
-            }
-            _ => {}
-        }
-    }
+    let out = drive(&handle, &mut output, &mut append_seqno, |_| vec![]).await;
+    assert_eq!(out.terminal, serde_json::json!({}));
+    let saw_continued = text_of(&out).contains("continued after subagent cancellation");
 
     assert!(saw_continued);
     assert_eq!(provider.requests().len(), 2);
 }
 
-fn client_run() -> pb::AgentClientMessage {
-    client_run_for("cancel-request", "cancel-conversation")
-}
+async fn collect_injection_lifecycle(
+    handle: &cursor_server::cursor::TransportHandle,
+    output: &mut tokio::sync::mpsc::Receiver<Bytes>,
+    append_seqno: &mut i64,
+    injection_id: &str,
+    message_id: &str,
+    text: &str,
+    continued_text: &str,
+) -> Vec<&'static str> {
+    let out = drive(handle, output, append_seqno, |_| vec![]).await;
+    assert_eq!(out.terminal, serde_json::json!({}));
 
-fn client_run_for(request_id: &str, conversation_id: &str) -> pb::AgentClientMessage {
-    client_run_for_model(request_id, conversation_id, "test-model")
-}
-
-fn client_run_for_model(
-    request_id: &str,
-    conversation_id: &str,
-    model_id: &str,
-) -> pb::AgentClientMessage {
-    client_run_for_model_with_state(request_id, conversation_id, model_id, None)
-}
-
-fn client_run_for_model_with_state(
-    request_id: &str,
-    conversation_id: &str,
-    model_id: &str,
-    state: Option<pb::ConversationStateStructure>,
-) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::RunRequest(
-            pb::AgentRunRequest {
-                action: Some(pb::ConversationAction {
-                    action: Some(pb::conversation_action::Action::UserMessageAction(
-                        pb::UserMessageAction {
-                            user_message: Some(pb::UserMessage {
-                                text: "read".into(),
-                                message_id: "cancel-user".into(),
-                                mode: pb::AgentMode::Agent as i32,
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                }),
-                conversation_id: Some(conversation_id.into()),
-                run_id: Some(request_id.into()),
-                requested_model: Some(pb::RequestedModel {
-                    model_id: model_id.into(),
-                    ..Default::default()
-                }),
-                conversation_state: state,
-                ..Default::default()
-            },
-        )),
+    let mut protocol_events = Vec::new();
+    for update in out.interactions {
+        match update.message {
+            Some(pb::interaction_update::Message::ContextInjectionState(update)) => {
+                assert_eq!(update.injection_id, injection_id);
+                match update.state.and_then(|state| state.state) {
+                    Some(pb::context_injection_state::State::Queued(_)) => {
+                        protocol_events.push("queued")
+                    }
+                    Some(pb::context_injection_state::State::Delivered(delivered)) => {
+                        assert!(!delivered.delivery_batch_id.is_empty());
+                        assert!(delivered.delivered_at_ms > 0);
+                        protocol_events.push("delivered");
+                    }
+                    _ => {}
+                }
+            }
+            Some(pb::interaction_update::Message::UserMessageAppended(update)) => {
+                let user = update.user_message.expect("appended user message");
+                assert_eq!(user.message_id, message_id);
+                assert_eq!(user.text, text);
+                protocol_events.push("user_message_appended");
+            }
+            Some(pb::interaction_update::Message::TextDelta(update))
+                if update.text.contains(continued_text) =>
+            {
+                protocol_events.push("continued_output");
+            }
+            _ => {}
+        }
     }
-}
-
-fn text_response(text: &str) -> Vec<ModelEvent> {
-    vec![
-        ModelEvent::Start {
-            model_call_id: format!("call-{text}"),
-        },
-        ModelEvent::TextStart,
-        ModelEvent::TextDelta(text.into()),
-        ModelEvent::TextEnd,
-        ModelEvent::Usage(Usage {
-            input_tokens: Some(1),
-            context_input_tokens: Some(1),
-            output_tokens: Some(1),
-            total_tokens: Some(2),
-            ..Default::default()
-        }),
-        ModelEvent::Done(FinishReason::Stop),
-    ]
-}
-
-fn tool_response(call_id: &str, name: &str, arguments: &str) -> Vec<ModelEvent> {
-    vec![
-        ModelEvent::Start {
-            model_call_id: format!("call-{call_id}"),
-        },
-        ModelEvent::ToolCallStart {
-            index: 0,
-            call_id: call_id.into(),
-            name: name.into(),
-        },
-        ModelEvent::ToolCallArgumentsDelta {
-            index: 0,
-            delta: arguments.into(),
-        },
-        ModelEvent::ToolCallEnd { index: 0 },
-        ModelEvent::Done(FinishReason::ToolUse),
-    ]
+    protocol_events
 }
 
 async fn wait_for_exec(
     handle: &cursor_server::cursor::TransportHandle,
-    output: &mut tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    output: &mut tokio::sync::mpsc::Receiver<Bytes>,
     append_seqno: &mut i64,
     tool: &str,
 ) -> u32 {
@@ -1719,9 +2234,10 @@ async fn wait_for_exec(
 
 async fn drain_successfully(
     handle: &cursor_server::cursor::TransportHandle,
-    output: &mut tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    output: &mut tokio::sync::mpsc::Receiver<Bytes>,
     append_seqno: &mut i64,
-) {
+) -> Option<pb::ConversationStateStructure> {
+    let mut checkpoint = None;
     loop {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
             .await
@@ -1730,31 +2246,14 @@ async fn drain_successfully(
         let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
         if flags & connect::END_STREAM_FLAG != 0 {
             assert_eq!(payload.as_ref(), b"{}");
-            return;
+            return checkpoint;
+        }
+        if let Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(state)) =
+            pb::AgentServerMessage::decode(payload).unwrap().message
+        {
+            checkpoint = Some(state);
         }
         acknowledge_kv(handle, append_seqno, &frame).await;
-    }
-}
-
-fn read_success(id: u32) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::ExecClientMessage(
-            pb::ExecClientMessage {
-                id,
-                message: Some(pb::exec_client_message::Message::ReadResult(
-                    pb::ReadResult {
-                        result: Some(pb::read_result::Result::Success(pb::ReadSuccess {
-                            path: "/tmp/a".into(),
-                            total_lines: 1,
-                            file_size: 1,
-                            output: Some(pb::read_success::Output::Content("late".into())),
-                            ..Default::default()
-                        })),
-                    },
-                )),
-                ..Default::default()
-            },
-        )),
     }
 }
 
@@ -1767,6 +2266,7 @@ fn subagent_success(id: u32) -> pb::AgentClientMessage {
                     pb::SubagentResult {
                         result: Some(pb::subagent_result::Result::Success(pb::SubagentSuccess {
                             agent_id: "detached-child".into(),
+                            final_message: Some("DETACHED_TASK_RESULT_MARKER".into()),
                             ..Default::default()
                         })),
                     },
@@ -1777,45 +2277,31 @@ fn subagent_success(id: u32) -> pb::AgentClientMessage {
     }
 }
 
-async fn run_to_end(
-    registry: &TransportRegistry,
-    request_id: &str,
-    request: pb::AgentClientMessage,
-) -> pb::ConversationStateStructure {
-    let handle = registry.get_or_create(request_id).await.unwrap();
-    let mut output = handle.subscribe();
-    handle
-        .command(TransportCommand::Append {
-            seqno: 0,
-            message: Box::new(request),
-        })
-        .await
-        .unwrap();
-    let mut append_seqno = 1;
-    let mut state = None;
+async fn wait_for_text(
+    handle: &cursor_server::cursor::TransportHandle,
+    output: &mut tokio::sync::mpsc::Receiver<Bytes>,
+    seq: &mut i64,
+    expected: &str,
+) {
     loop {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
             .await
             .unwrap()
-            .expect("RunSSE closed before EndStream");
-        let (flags, _) = connect::decode_frames(&frame).unwrap().pop().unwrap();
-        if flags & connect::END_STREAM_FLAG != 0 {
-            return state.expect("Run ended without a checkpoint");
-        }
-        let (_, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+            .unwrap();
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        assert_eq!(flags & connect::END_STREAM_FLAG, 0);
         let server = pb::AgentServerMessage::decode(payload).unwrap();
-        if let Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(update)) =
-            server.message
-        {
-            state = Some(update);
+        let found = matches!(server.message, Some(pb::agent_server_message::Message::InteractionUpdate(pb::InteractionUpdate { message: Some(pb::interaction_update::Message::TextDelta(ref text)) })) if text.text == expected);
+        acknowledge_kv(handle, seq, &frame).await;
+        if found {
+            return;
         }
-        acknowledge_kv(&handle, &mut append_seqno, &frame).await;
     }
 }
 
 async fn wait_for_turn_ended(
     handle: &cursor_server::cursor::TransportHandle,
-    output: &mut tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    output: &mut tokio::sync::mpsc::Receiver<Bytes>,
     append_seqno: &mut i64,
 ) {
     loop {
@@ -1843,7 +2329,7 @@ async fn wait_for_turn_ended(
 
 async fn assert_transport_remains_open(
     handle: &cursor_server::cursor::TransportHandle,
-    output: &mut tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    output: &mut tokio::sync::mpsc::Receiver<Bytes>,
     append_seqno: &mut i64,
 ) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
@@ -1859,41 +2345,6 @@ async fn assert_transport_remains_open(
             "turnEnded closed the transport before the queued action arrived"
         );
         acknowledge_kv(handle, append_seqno, &frame).await;
-    }
-}
-
-async fn acknowledge_kv(
-    handle: &cursor_server::cursor::TransportHandle,
-    append_seqno: &mut i64,
-    frame: &[u8],
-) {
-    let (flags, payload) = connect::decode_frames(frame).unwrap().pop().unwrap();
-    if flags & connect::END_STREAM_FLAG != 0 {
-        return;
-    }
-    let server = pb::AgentServerMessage::decode(payload).unwrap();
-    if let Some(pb::agent_server_message::Message::KvServerMessage(kv)) = server.message {
-        handle
-            .command(TransportCommand::Append {
-                seqno: *append_seqno,
-                message: Box::new(kv_ack(kv.id)),
-            })
-            .await
-            .unwrap();
-        *append_seqno += 1;
-    }
-}
-
-fn kv_ack(id: u32) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::KvClientMessage(
-            pb::KvClientMessage {
-                id,
-                message: Some(pb::kv_client_message::Message::SetBlobResult(
-                    pb::SetBlobResult { error: None },
-                )),
-            },
-        )),
     }
 }
 
@@ -1944,10 +2395,6 @@ fn runtime_user_message() -> pb::AgentClientMessage {
     }
 }
 
-fn runtime_injection() -> pb::AgentClientMessage {
-    runtime_injection_for("injection-1", "inject-request")
-}
-
 fn runtime_injection_for(injection_id: &str, expected_run_id: &str) -> pb::AgentClientMessage {
     pb::AgentClientMessage {
         message: Some(pb::agent_client_message::Message::ConversationAction(
@@ -1981,25 +2428,6 @@ fn runtime_cancel_subagent(tool_call_id: &str) -> pb::AgentClientMessage {
                 action: Some(pb::conversation_action::Action::CancelSubagentAction(
                     pb::CancelSubagentAction {
                         subagent_id: tool_call_id.into(),
-                    },
-                )),
-                ..Default::default()
-            },
-        )),
-    }
-}
-
-fn subagent_aborted(id: u32) -> pb::AgentClientMessage {
-    pb::AgentClientMessage {
-        message: Some(pb::agent_client_message::Message::ExecClientMessage(
-            pb::ExecClientMessage {
-                id,
-                message: Some(pb::exec_client_message::Message::SubagentResult(
-                    pb::SubagentResult {
-                        result: Some(pb::subagent_result::Result::Error(pb::SubagentError {
-                            agent_id: None,
-                            error: "Subagent was aborted by the user".into(),
-                        })),
                     },
                 )),
                 ..Default::default()

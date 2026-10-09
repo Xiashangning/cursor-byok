@@ -1,12 +1,7 @@
 //! Verifies captured Cursor Connect framing and protobuf compatibility.
-#[path = "support/fake_cursor.rs"]
-mod fake_cursor;
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
-use std::{io::Write, sync::Arc};
+use std::io::Write;
 
 use axum::{
     body::{to_bytes, Body},
@@ -15,16 +10,15 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use cursor_server::{
     api::cursor,
-    cursor::prompting::{PromptAssets, PromptCompiler},
     cursor::protocol::{
         connect,
         proto::{agent::v1 as pb, aiserver::v1 as ai},
     },
-    cursor::transport::TransportRegistry,
     network::NetworkClients,
 };
 use flate2::{write::GzEncoder, Compression};
 use prost::Message;
+use support::{decode_single, registry, temp_store, FakeProvider};
 use tower::ServiceExt;
 
 #[test]
@@ -34,7 +28,7 @@ fn connect_envelope_is_flag_plus_big_endian_length_plus_protobuf() {
     };
     let frame = connect::encode_message(&message).unwrap();
     assert_eq!(&frame[..5], &[0, 0, 0, 0, 5]);
-    let decoded: pb::BidiRequestId = fake_cursor::decode_single(&frame).unwrap();
+    let decoded: pb::BidiRequestId = decode_single(&frame).unwrap();
     assert_eq!(decoded.request_id, "abc");
 }
 
@@ -96,19 +90,9 @@ fn captured_kv_ack_hex_decodes_as_agent_client_message() {
 
 #[tokio::test]
 async fn bidi_append_gzip_body_is_decompressed_before_protobuf_decode() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let (_directory, store) = temp_store().await;
     let clients = NetworkClients::new(store.clone());
-    let registry = TransportRegistry::new(
-        store,
-        Arc::new(fake_provider::FakeProvider::default()),
-        PromptCompiler::new(assets),
-    );
+    let registry = registry(store, FakeProvider::default());
     let wire = ai::BidiAppendRequest {
         request_id: Some(ai::BidiRequestId {
             request_id: "gzip-request".into(),

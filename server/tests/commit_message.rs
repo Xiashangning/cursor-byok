@@ -1,10 +1,9 @@
 //! Verifies the local WriteGitCommitMessage engine end to end on the wire.
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
 use std::sync::Arc;
+
+use support::{prompt_assets, temp_store, FakeProvider};
 
 use axum::{
     body::{to_bytes, Body},
@@ -13,27 +12,19 @@ use axum::{
 use cursor_server::{
     api::cursor,
     cursor::{
-        prompting::{PromptAssets, PromptCompiler},
+        prompting::PromptCompiler,
         protocol::{connect, proto::aiserver::v1 as ai},
         transport::TransportRegistry,
     },
     model::{ContentPart, ModelConfigInput, ModelType, ProjectedContent, OPENAI_CHAT_ENDPOINT},
     network::NetworkClients,
     provider::{FinishReason, ModelEvent},
-    store::{CommitSettings, DEFAULT_COMMIT_PROMPT},
+    store::{CommitPromptLocale, CommitSettings, DEFAULT_COMMIT_PROMPT_ZH_CN},
 };
 use tower::ServiceExt;
 
-async fn commit_router(
-    store: cursor_server::store::Store,
-    provider: fake_provider::FakeProvider,
-) -> axum::Router {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+async fn commit_router(store: cursor_server::store::Store, provider: FakeProvider) -> axum::Router {
+    let assets = prompt_assets();
     let clients = NetworkClients::new(store.clone());
     let registry = TransportRegistry::new(store, Arc::new(provider), PromptCompiler::new(assets));
     cursor::router(registry, clients).unwrap()
@@ -50,7 +41,8 @@ fn model_input(model_id: &str) -> ModelConfigInput {
         api_key: "test-key".into(),
         tooltip_data: "模型介绍".into(),
         model_id: model_id.into(),
-        reasoning_effort: None,
+        default_context: None,
+        default_effort: None,
         effort_options: Vec::new(),
         context_options: Vec::new(),
         openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
@@ -63,7 +55,6 @@ fn model_input(model_id: &str) -> ModelConfigInput {
         context_window_tokens: None,
         max_completion_tokens: None,
         anthropic_max_tokens: None,
-        anthropic_thinking_effort: None,
         thinking_budget_tokens: None,
     }
 }
@@ -94,19 +85,21 @@ fn diff_request(diff: &str) -> ai::WriteGitCommitMessageRequest {
 
 #[tokio::test]
 async fn commit_message_is_generated_through_configured_model() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let created = store
         .create_model(&model_input("qwen/qwen3-flash"))
         .await
         .unwrap();
     store
         .set_commit_settings(CommitSettings {
+            parameters: Default::default(),
             model_id: created.model_hash.clone(),
             prompt: String::new(),
+            prompt_locale: CommitPromptLocale::ZhCn,
         })
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
+    let provider = FakeProvider::default();
     provider.push(vec![
         ModelEvent::TextStart,
         ModelEvent::TextDelta("```\nCommit message: feat: 新增提交引擎\n```".into()),
@@ -126,7 +119,7 @@ async fn commit_message_is_generated_through_configured_model() {
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].prompt.instructions,
-        DEFAULT_COMMIT_PROMPT.trim()
+        DEFAULT_COMMIT_PROMPT_ZH_CN.trim()
     );
     let ProjectedContent::Parts(parts) = &requests[0].history[0].content else {
         panic!("expected user text parts");
@@ -140,19 +133,21 @@ async fn commit_message_is_generated_through_configured_model() {
 
 #[tokio::test]
 async fn custom_prompt_and_model_from_commit_settings_are_used() {
-    let (_directory, store) = fixtures::temp_store().await;
+    let (_directory, store) = temp_store().await;
     let created = store
         .create_model(&model_input("qwen/qwen3-coder"))
         .await
         .unwrap();
     store
         .set_commit_settings(CommitSettings {
+            parameters: Default::default(),
             model_id: created.model_hash,
             prompt: "自定义提交提示词".into(),
+            prompt_locale: CommitPromptLocale::ZhCn,
         })
         .await
         .unwrap();
-    let provider = fake_provider::FakeProvider::default();
+    let provider = FakeProvider::default();
     provider.push(vec![
         ModelEvent::TextDelta("chore: 清理旧代码".into()),
         ModelEvent::Done(FinishReason::Stop),
@@ -172,77 +167,63 @@ async fn custom_prompt_and_model_from_commit_settings_are_used() {
 }
 
 #[tokio::test]
-async fn empty_diffs_are_rejected_when_generating() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let created = store
-        .create_model(&model_input("qwen/qwen3-flash"))
-        .await
-        .unwrap();
-    store
-        .set_commit_settings(CommitSettings {
-            model_id: created.model_hash,
-            prompt: String::new(),
-        })
-        .await
-        .unwrap();
-    let provider = fake_provider::FakeProvider::default();
-    let router = commit_router(store, provider).await;
-
-    let response = post_commit_message(router, ai::WriteGitCommitMessageRequest::default()).await;
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = to_bytes(response.into_body(), 4096).await.unwrap();
-    let text = std::str::from_utf8(&body).unwrap();
-    assert!(text.contains("diffs are required"));
-}
-
-#[tokio::test]
-async fn tool_call_events_are_rejected() {
-    let (_directory, store) = fixtures::temp_store().await;
-    let created = store
-        .create_model(&model_input("qwen/qwen3-flash"))
-        .await
-        .unwrap();
-    store
-        .set_commit_settings(CommitSettings {
-            model_id: created.model_hash,
-            prompt: String::new(),
-        })
-        .await
-        .unwrap();
-    let provider = fake_provider::FakeProvider::default();
-    provider.push(vec![ModelEvent::ToolCallStart {
-        index: 0,
-        call_id: "call-1".into(),
-        name: "shell".into(),
-    }]);
-    let router = commit_router(store, provider).await;
-
-    let response = post_commit_message(router, diff_request("diff --git a/x.rs")).await;
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = to_bytes(response.into_body(), 4096).await.unwrap();
-    let text = std::str::from_utf8(&body).unwrap();
-    assert!(text.contains("must not invoke tools"));
-}
-
-#[tokio::test]
-async fn unconfigured_model_is_rejected() {
-    let (_directory, store) = fixtures::temp_store().await;
-    store
-        .set_commit_settings(CommitSettings {
-            model_id: "missing-hash".into(),
-            prompt: String::new(),
-        })
-        .await
-        .unwrap();
-    let provider = fake_provider::FakeProvider::default();
-    let router = commit_router(store, provider).await;
-
-    let response = post_commit_message(router, diff_request("diff --git a/x.rs")).await;
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = to_bytes(response.into_body(), 4096).await.unwrap();
-    let text = std::str::from_utf8(&body).unwrap();
-    assert!(text.contains("missing-hash"));
+async fn commit_message_errors_map_to_status_and_payload() {
+    for (case, configured_model, events, request, status, expected) in [
+        (
+            "empty diffs",
+            true,
+            vec![],
+            ai::WriteGitCommitMessageRequest::default(),
+            StatusCode::BAD_REQUEST,
+            "diffs are required",
+        ),
+        (
+            "tool call",
+            true,
+            vec![ModelEvent::ToolCallStart {
+                index: 0,
+                call_id: "call-1".into(),
+                name: "shell".into(),
+            }],
+            diff_request("diff --git a/x.rs"),
+            StatusCode::BAD_GATEWAY,
+            "must not invoke tools",
+        ),
+        (
+            "missing model",
+            false,
+            vec![],
+            diff_request("diff --git a/x.rs"),
+            StatusCode::BAD_GATEWAY,
+            "not configured",
+        ),
+    ] {
+        let (_directory, store) = temp_store().await;
+        let model_id = store
+            .create_model(&model_input("qwen/qwen3-flash"))
+            .await
+            .unwrap()
+            .model_hash;
+        store
+            .set_commit_settings(CommitSettings {
+                parameters: Default::default(),
+                model_id: model_id.clone(),
+                prompt: String::new(),
+                prompt_locale: CommitPromptLocale::ZhCn,
+            })
+            .await
+            .unwrap();
+        if !configured_model {
+            store.delete_model(&model_id).await.unwrap();
+        }
+        let provider = FakeProvider::default();
+        if !events.is_empty() {
+            provider.push(events);
+        }
+        let response = post_commit_message(commit_router(store, provider).await, request).await;
+        assert_eq!(response.status(), status, "{case}");
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains(expected), "{case}: {text}");
+    }
 }

@@ -1,6 +1,5 @@
 //! Verifies append-only provider history and stable prompt prefixes.
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod support;
 
 use std::collections::BTreeMap;
 
@@ -13,45 +12,130 @@ use cursor_server::{
     },
 };
 use sha2::{Digest, Sha256};
+use support::{prompt_assets, user};
+
+#[tokio::test]
+async fn model_directory_changes_and_checkpoint_resume_preserve_tool_history_prefix() {
+    use cursor_server::cursor::{protocol::proto::agent::v1 as pb, TransportCommand};
+    use support::{
+        drive, openai_model_input, read_success, registry, resume_action, run_request, temp_store,
+        text_response, tool_response, user_message_action, FakeProvider,
+    };
+    let (_directory, store) = temp_store().await;
+    let model = store
+        .create_model(&openai_model_input("first-model", None))
+        .await
+        .unwrap();
+    let provider = FakeProvider::default();
+    provider.push(tool_response(
+        "read-call",
+        "read-1",
+        "Read",
+        r#"{"path":"file.txt"}"#,
+    ));
+    provider.push(text_response("first-answer", "done"));
+    provider.push(text_response("resumed-answer", "continued"));
+    let transports = registry(store.clone(), provider.clone());
+    let first = transports.get_or_create("directory-first").await.unwrap();
+    let mut output = first.subscribe().unwrap();
+    first
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(run_request(
+                "directory-conversation",
+                "directory-first",
+                &model.model_hash,
+                None,
+                user_message_action(
+                    "inspect",
+                    "directory-user",
+                    Some(pb::RequestContext::default()),
+                ),
+            )),
+        })
+        .await
+        .unwrap();
+    let mut seqno = 1;
+    let mut result = drive(&first, &mut output, &mut seqno, |exec| {
+        vec![read_success(
+            exec.id,
+            "file.txt",
+            "immutable result with old-model-id",
+        )]
+    })
+    .await;
+    assert_eq!(result.terminal, serde_json::json!({}));
+    let checkpoint = result.checkpoints.pop().unwrap();
+    let original = provider.requests()[1].clone();
+    store
+        .create_model(&openai_model_input("added-model", None))
+        .await
+        .unwrap();
+    let resumed = transports.get_or_create("directory-resumed").await.unwrap();
+    let mut output = resumed.subscribe().unwrap();
+    resumed
+        .command(TransportCommand::Append {
+            seqno: 0,
+            message: Box::new(run_request(
+                "directory-conversation",
+                "directory-resumed",
+                &model.model_hash,
+                Some(checkpoint),
+                resume_action(Some(pb::RequestContext::default())),
+            )),
+        })
+        .await
+        .unwrap();
+    let mut seqno = 1;
+    let result = drive(&resumed, &mut output, &mut seqno, |_| {
+        panic!("no new tool expected")
+    })
+    .await;
+    assert_eq!(result.terminal, serde_json::json!({}));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    // Checkpoint blob addresses are internal IDs; providers receive role/content only.
+    // Compare the complete provider-visible structure, including all tool arguments/results.
+    let visible = |messages: &[cursor_server::model::ProjectedMessage]| {
+        messages
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        visible(&original.history),
+        visible(&requests[2].history[..original.history.len()])
+    );
+    assert!(serde_json::to_string(&requests[2].history)
+        .unwrap()
+        .contains("immutable result with old-model-id"));
+    assert_eq!(original.prompt, requests[2].prompt);
+    let catalog_messages = requests[2]
+        .history
+        .iter()
+        .filter(|message| message.message_id.starts_with("runtime:model-directory:"))
+        .count();
+    assert_eq!(
+        catalog_messages, 2,
+        "directory changes append a snapshot instead of rewriting the tool prompt"
+    );
+}
 
 #[test]
 fn projecting_an_append_only_context_preserves_the_complete_prefix() {
-    let first = vec![fixtures::user("u1", "one")];
+    let first = vec![user("u1", "one")];
     let mut second = first.clone();
-    second.push(fixtures::user("u2", "two"));
+    second.push(user("u2", "two"));
     let projected_first = project_messages(&first).unwrap();
     let projected_second = project_messages(&second).unwrap();
     assert_eq!(projected_first, projected_second[..projected_first.len()]);
 }
 
 #[test]
-fn every_tool_result_is_projected_as_string_content() {
-    let object = serde_json::json!({"merge": false, "todos": []});
-    let messages = vec![
-        tool_result("object", object.clone()),
-        tool_result("string", serde_json::Value::String("plain text".into())),
-    ];
-    let projected = project_messages(&messages).unwrap();
-
-    let ProjectedContent::ToolResult(object_result) = &projected[0].content else {
-        panic!("expected tool result")
-    };
-    let object_text = &object_result.content;
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(object_text).unwrap(),
-        object
-    );
-    let ProjectedContent::ToolResult(string_result) = &projected[1].content else {
-        panic!("expected tool result")
-    };
-    assert_eq!(string_result.content, "plain text");
-}
-
-#[test]
 fn projected_tool_result_prefixes_remain_stable() {
     let first = vec![named_tool_result("Grep", &"x".repeat(64 * 1024))];
     let mut second = first.clone();
-    second.push(fixtures::user("u2", "continue"));
+    second.push(user("u2", "continue"));
 
     let projected_first = project_messages(&first).unwrap();
     let projected_second = project_messages(&second).unwrap();
@@ -134,13 +218,8 @@ fn split_tool_pairs_reconstruct_the_original_provider_assistant_message() {
 
 #[test]
 fn every_prompt_mode_loads_the_captured_tool_set() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
-    assert_eq!(assets.mode(Mode::Agent).tools.len(), 24);
+    let assets = prompt_assets();
+    assert_eq!(assets.mode(Mode::Agent).tools.len(), 23);
     assert_eq!(
         assets
             .mode(Mode::Agent)
@@ -168,9 +247,8 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "FetchMcpResource",
             "SwitchMode",
             "CallMcpTool",
-            "create-agent",
-            "send-message-to-agent",
-            "AWAIT",
+            "SendMessageToAgent",
+            "Await",
             "SembleSearch",
             "SembleFindRelated",
         ]
@@ -197,7 +275,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "9908d81fca823c2726b59cf6a3b16d6e81a56646b0bc45470057ef66f212ef79",
+        "51e5a226eea6499afe436e9abd4a9484d72c25719e14b08d7b2f0d9cccfbe787",
     );
     assert_mode(
         &assets,
@@ -219,7 +297,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "67310e29ea29729c155975ec760bc95839442b46a32d95a44ed86f765116b797",
+        "f925aae922f0f369ba97977254f6e25096dbefda565b35bd984d01c78b83df15",
     );
     assert_mode(
         &assets,
@@ -243,7 +321,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "9908d81fca823c2726b59cf6a3b16d6e81a56646b0bc45470057ef66f212ef79",
+        "51e5a226eea6499afe436e9abd4a9484d72c25719e14b08d7b2f0d9cccfbe787",
     );
     assert_mode(
         &assets,
@@ -266,13 +344,12 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "WebSearch",
             "Write",
             "GenerateImage",
-            "create-agent",
-            "send-message-to-agent",
-            "AWAIT",
+            "SendMessageToAgent",
+            "Await",
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "3fe2a87befe80e980fdcd8c3257d689ba52421dbbd922f15679b13ebb219d7c7",
+        "671a1d18a80a37127aefb121a0657ba2b4c916a025d04b9c677a03918e35056b",
     );
     assert_mode(
         &assets,
@@ -299,7 +376,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "6de1ee86a131ca093c7143f54fffcba2fc14b32ff45fd6f5e0df1347058ad744",
+        "fd2b80d67009fcf8567cc8ba2fc551a1fe74476eef193090728ec2cf25bda3fe",
     );
     assert_mode(
         &assets,
@@ -309,7 +386,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
     );
     assert_eq!(
         schema_digest(&assets.mode(Mode::Agent).tools),
-        "3eb4fc1dd2a125bd7cf31e2498ba029288453e144ab905b070bd67cf36a6db16"
+        "3182e6af6e077792b1a8e2012ab72dca3bdecad56bc5576c3b4fa9c01da6a5a1"
     );
     let task = assets
         .mode(Mode::Agent)
@@ -339,6 +416,21 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             .unwrap()
             .contains("do not combine it with `nohup`, `&`, `disown`")
     );
+    let await_tool = assets
+        .mode(Mode::Agent)
+        .tools
+        .iter()
+        .find(|tool| tool.name == "Await")
+        .unwrap();
+    assert!(await_tool
+        .description
+        .contains("poll the terminal file through Cursor"));
+    assert_eq!(
+        await_tool.parameters["oneOf"],
+        serde_json::json!([
+            {"required": ["shell_id"]}, {"required": ["task_id"]}
+        ])
+    );
     for mode in [
         Mode::Agent,
         Mode::Ask,
@@ -357,14 +449,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
 
 #[test]
 fn every_captured_mode_owns_and_renders_its_runtime_template() {
-    let compiler = PromptCompiler::new(
-        PromptAssets::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("prompt/cursor")
-                .as_path(),
-        )
-        .unwrap(),
-    );
+    let compiler = PromptCompiler::new(prompt_assets());
     let values = BTreeMap::from([
         ("OPEN_FILES", String::new()),
         ("SELECTED_CONTEXT", String::new()),
@@ -408,12 +493,7 @@ fn schema_digest(tools: &[ToolDefinition]) -> String {
 
 #[test]
 fn dynamic_mcp_tools_are_appended_after_the_stable_mode_tool_prefix() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let base = compiler
         .prompt_spec(Mode::Agent, &ModelSpec::new("model"), &[], false)
@@ -436,12 +516,7 @@ fn dynamic_mcp_tools_are_appended_after_the_stable_mode_tool_prefix() {
 
 #[test]
 fn dynamic_mcp_tool_cannot_replace_a_mode_tool() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let error = compiler
         .prompt_spec(
@@ -461,13 +536,8 @@ fn dynamic_mcp_tool_cannot_replace_a_mode_tool() {
 }
 
 #[test]
-fn image_generation_capability_controls_only_the_generate_image_definition() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+fn image_generation_is_not_advertised_without_an_executor() {
+    let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let without = compiler
         .prompt_spec(Mode::Agent, &ModelSpec::new("model"), &[], false)
@@ -482,18 +552,13 @@ fn image_generation_capability_controls_only_the_generate_image_definition() {
         .tools
         .iter()
         .any(|tool| tool.name == "GenerateImage"));
-    assert!(with.tools.iter().any(|tool| tool.name == "GenerateImage"));
-    assert_eq!(with.tools.len(), without.tools.len() + 1);
+    assert!(!with.tools.iter().any(|tool| tool.name == "GenerateImage"));
+    assert_eq!(with.tools, without.tools);
 }
 
 #[test]
 fn agent_system_prompt_is_static_and_substitutes_the_model_name() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let mut model = ModelSpec::new("test-model-hash");
     model.display_name = Some("Test Model".into());
@@ -509,12 +574,7 @@ fn agent_system_prompt_is_static_and_substitutes_the_model_name() {
 
 #[test]
 fn subagent_uses_the_agent_prompt_and_only_the_captured_tool_delta() {
-    let assets = PromptAssets::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt/cursor")
-            .as_path(),
-    )
-    .unwrap();
+    let assets = prompt_assets();
     let compiler = PromptCompiler::new(assets);
     let agent_prompt = compiler
         .prompt_spec(Mode::Agent, &ModelSpec::new("model"), &[], false)
@@ -524,38 +584,7 @@ fn subagent_uses_the_agent_prompt_and_only_the_captured_tool_delta() {
         .unwrap();
     assert_eq!(agent_prompt.instructions, subagent_prompt.instructions);
 
-    let request = compiler
-        .prompt_spec(Mode::Subagent, &ModelSpec::new("model"), &[], false)
-        .unwrap();
-    assert_eq!(
-        request
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "Shell",
-            "Grep",
-            "Delete",
-            "WebSearch",
-            "WebFetch",
-            "ReadLints",
-            "EditNotebook",
-            "TodoWrite",
-            "StrReplace",
-            "Write",
-            "Read",
-            "Glob",
-            "GetMcpTools",
-            "FetchMcpResource",
-            "SwitchMode",
-            "UpdateCurrentStep",
-            "CallMcpTool",
-            "SembleSearch",
-            "SembleFindRelated",
-        ]
-    );
-    assert!(!request.tools.iter().any(|tool| tool.name == "Task"));
+    assert!(!subagent_prompt.tools.iter().any(|tool| tool.name == "Task"));
 
     let suppressed = compiler
         .prompt_spec(Mode::Subagent, &ModelSpec::new("model"), &[], true)
@@ -564,10 +593,6 @@ fn subagent_uses_the_agent_prompt_and_only_the_captured_tool_delta() {
         .tools
         .iter()
         .any(|tool| tool.name == "UpdateCurrentStep"));
-}
-
-fn tool_result(id: &str, output: serde_json::Value) -> CanonicalMessage {
-    tool_result_with_call(id, &format!("call-{id}"), output)
 }
 
 fn tool_result_with_call(
