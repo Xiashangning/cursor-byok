@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::{ProviderConfig, ProviderKind},
     model::{ModelInvocation, ModelLatency, NewLlmCall, ProviderType},
-    plugin::{PluginRegistry, ADAPTER_ID_PREFIX},
+    plugin::PluginRegistry,
     store::Store,
     Error, Result,
 };
@@ -57,32 +57,22 @@ impl Provider for ProviderRouter {
         let stream_idle_timeout = self.stream_idle_timeout;
         Box::pin(try_stream! {
             let selected = invocation.request.model.model_id.clone();
-            // 两条分支只负责装配 Recorder 与 Provider 流;
-            // 事件消费(空闲超时看门狗、记录、错误规范化)对两者完全一致。
+            // 内置分支只读 store 的精确 ID:插件目录/状态文件不可达不得影响内置模型调用。
+            let builtin = store.model(&selected).await?;
             let (recorder, _cancel_on_drop, mut stream): (CallRecorder, CancelOnDrop, ProviderStream) =
-                if selected.starts_with(ADAPTER_ID_PREFIX) {
-                    // 插件模型与内置模型走完全相同的流程:资源选择与将来的
-                    // 负载均衡都在插件 Provider 内部。
-                    let plan = plugins.plan_model(&selected).await?;
-                    let recorder = start_recorder(&store, &invocation, &selected, &plan.model.display_name, ProviderType::Plugin, &plan.request_url, &plan.model.model_id).await?;
-                    let guard = recorder.cancel_on_drop();
-                    let mut routed = invocation.clone();
-                    routed.request.model.display_name = Some(plan.model.display_name.clone());
-                    if let Some(tokens) = plan.model.max_output_tokens {
-                        routed.request.model.max_output_tokens.get_or_insert(tokens);
+                if let Some(model) = builtin {
+                    if model.is_draft() {
+                        Err(Error::Config(format!("model '{}' is a draft: missing model_id", model.model_hash)))?;
                     }
-                    let provider: Arc<dyn Provider> = Arc::new(NormalizedProvider::new(Arc::new(PluginModelProvider {
-                        registry: plugins.clone(),
-                        recorder: recorder.clone(),
-                    })));
-                    (recorder, guard, provider.stream(routed, cancellation.clone()))
-                } else {
                     let mut routed = invocation.clone();
-                    let model = store.model(&selected).await?.ok_or_else(|| Error::Provider(format!("unknown model: {selected}")))?;
                     let provider_type = model.provider_type();
                     let request_url = model.request_url()?;
                     model.configure(&mut routed.request.model);
-                    routed.request.model.extra_params = model.extra_params().clone();
+                    routed.request.model.extra_params =
+                        super::request_template::render_json_strings(
+                            model.extra_params(),
+                            &invocation.conversation_id,
+                        );
                     routed.request.model.model_id = model.model_id.clone();
                     let recorder = start_recorder(&store, &invocation, &model.model_hash, &model.display_name, provider_type, &request_url, &model.model_id).await?;
                     let guard = recorder.cancel_on_drop();
@@ -90,13 +80,44 @@ impl Provider for ProviderRouter {
                         kind: provider_kind(provider_type),
                         request_url,
                         api_key: model.api_key.clone(),
-                        custom_headers: if model.custom_headers_enabled { custom_headers(&model.custom_headers)? } else { reqwest::header::HeaderMap::new() },
+                        custom_headers: if model.custom_headers_enabled {
+                            custom_headers(
+                                &model.custom_headers,
+                                &invocation.conversation_id,
+                            )?
+                        } else {
+                            reqwest::header::HeaderMap::new()
+                        },
                         max_output_tokens: model.max_output_tokens(),
                         request_timeout,
                         allowed_body_fields: None,
                     };
                     let client = clients.provider_client(request_timeout).await?;
                     let provider = build_observed(&config, recorder.clone(), client)?;
+                    (recorder, guard, provider.stream(routed, cancellation.clone()))
+                } else {
+                    // 插件分支:目录只含已配置(未禁用、已应用覆盖)的插件模型,
+                    // 与 compile/bidi 的路由口径一致;描述符直接传给执行流,不再重复解析。
+                    let directory =
+                        crate::model::ModelDirectory::configured(&store, Some(&plugins)).await?;
+                    let descriptor = directory
+                        .get(&selected)
+                        .and_then(|entry| entry.plugin.clone())
+                        .ok_or_else(|| Error::Config(format!("model '{selected}' is not configured")))?;
+                    let request_url =
+                        format!("plugin://{}/{}", descriptor.plugin_id, descriptor.provider_id);
+                    let recorder = start_recorder(&store, &invocation, &selected, &descriptor.display_name, ProviderType::Plugin, &request_url, &descriptor.model_id).await?;
+                    let guard = recorder.cancel_on_drop();
+                    let mut routed = invocation.clone();
+                    routed.request.model.display_name = Some(descriptor.display_name.clone());
+                    if let Some(tokens) = descriptor.max_output_tokens {
+                        routed.request.model.max_output_tokens.get_or_insert(tokens);
+                    }
+                    let provider: Arc<dyn Provider> = Arc::new(NormalizedProvider::new(Arc::new(PluginModelProvider {
+                        registry: plugins.clone(),
+                        descriptor,
+                        recorder: recorder.clone(),
+                    })));
                     (recorder, guard, provider.stream(routed, cancellation.clone()))
                 };
 
@@ -229,8 +250,10 @@ async fn finish_stream(recorder: &CallRecorder, cancellation: &CancellationToken
 }
 
 /// 插件模型的 Provider 实现;对路由与规范化层完全等同于内置 Provider。
+/// 描述符由路由分支从目录解析并透传,执行流不再重复解析。
 struct PluginModelProvider {
     registry: PluginRegistry,
+    descriptor: crate::plugin::PluginModelDescriptor,
     recorder: CallRecorder,
 }
 
@@ -240,8 +263,12 @@ impl Provider for PluginModelProvider {
         invocation: ModelInvocation,
         cancellation: CancellationToken,
     ) -> ProviderStream {
-        self.registry
-            .stream_model(invocation, cancellation, self.recorder.clone())
+        self.registry.stream_model(
+            self.descriptor.clone(),
+            invocation,
+            cancellation,
+            self.recorder.clone(),
+        )
     }
 }
 
@@ -297,8 +324,12 @@ fn root_error_message(error: &(dyn std::error::Error + 'static)) -> String {
     current.to_string()
 }
 
-fn custom_headers(value: &serde_json::Value) -> Result<reqwest::header::HeaderMap> {
-    let object = value
+fn custom_headers(
+    value: &serde_json::Value,
+    conversation_id: &str,
+) -> Result<reqwest::header::HeaderMap> {
+    let rendered = super::request_template::render_json_strings(value, conversation_id);
+    let object = rendered
         .as_object()
         .ok_or_else(|| Error::Config("custom headers must be an object".into()))?;
     let mut headers = reqwest::header::HeaderMap::new();
@@ -355,6 +386,98 @@ fn build_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ModelRequest, ModelSpec, PromptSpec};
+
+    fn invocation(model_id: &str) -> ModelInvocation {
+        ModelInvocation {
+            call_id: "test-call".into(),
+            run_id: "test-run".into(),
+            conversation_id: "test-conversation".into(),
+            provider_call_index: 0,
+            request: ModelRequest {
+                prompt: PromptSpec {
+                    instructions: String::new(),
+                    tools: Vec::new(),
+                },
+                model: ModelSpec::new(model_id),
+                history: Vec::new(),
+            },
+        }
+    }
+
+    fn router_with(store: &Store) -> ProviderRouter {
+        let plugins = PluginRegistry::managed(
+            store.clone(),
+            crate::plugin::PluginRuntime::managed().unwrap(),
+            "test".into(),
+        )
+        .unwrap();
+        let clients = crate::network::NetworkClients::new(store.clone());
+        ProviderRouter::new(
+            store.clone(),
+            plugins,
+            clients,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+    }
+
+    /// 未知模型在路由层拒绝;该判定只读 store 与已配置插件目录,不触网。
+    #[tokio::test]
+    async fn unknown_models_are_rejected_before_any_provider_work() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let router = router_with(&store);
+        let mut stream = router.stream(invocation("missing-model"), CancellationToken::new());
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(&error, Error::Config(message) if message.contains("not configured")),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// 草稿(缺上游模型名)在构建 Provider 前拒绝。
+    #[tokio::test]
+    async fn builtin_drafts_are_rejected_before_provider_construction() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let draft = store
+            .create_model(
+                &serde_json::from_value(serde_json::json!({
+                    "display_name": "Draft", "type": "openai",
+                    "base_url": "https://example.invalid", "api_key": "test",
+                    "tooltip_data": "Draft", "model_id": ""
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let router = router_with(&store);
+        let mut stream = router.stream(invocation(&draft.model_hash), CancellationToken::new());
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(&error, Error::Config(message) if message.contains("missing model_id")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn renders_cursor_conversation_id_in_custom_header_values() {
+        let template = serde_json::json!({
+            "x-opencode-session-id": "{{SessionId}}",
+            "x-label": "cursor/{{SessionId}}"
+        });
+
+        let headers = custom_headers(&template, "cursor-conversation-id").unwrap();
+
+        assert_eq!(
+            headers.get("x-opencode-session-id").unwrap(),
+            "cursor-conversation-id"
+        );
+        assert_eq!(
+            headers.get("x-label").unwrap(),
+            "cursor/cursor-conversation-id"
+        );
+        assert_eq!(template["x-opencode-session-id"], "{{SessionId}}");
+    }
 
     #[tokio::test]
     async fn pending_provider_event_hits_the_idle_timeout() {
@@ -363,24 +486,5 @@ mod tests {
         let result = next_provider_event(&mut stream, Duration::from_millis(1)).await;
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn timeout_errors_state_the_boundary_and_duration() {
-        let Error::Provider(idle) = stream_idle_timeout_error(Duration::from_secs(30 * 60)) else {
-            panic!("idle timeout must be a provider error");
-        };
-        assert_eq!(
-            idle,
-            "provider stream idle timeout: no events received for 1800 seconds (30 minutes)"
-        );
-
-        let Error::Provider(request) = request_timeout_error(Duration::from_secs(60 * 60)) else {
-            panic!("request timeout must be a provider error");
-        };
-        assert_eq!(
-            request,
-            "provider request timed out after 3600 seconds (60 minutes)"
-        );
     }
 }

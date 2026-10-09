@@ -6,6 +6,7 @@ mod normalize;
 mod openai_chat;
 mod openai_responses;
 mod recorder;
+mod request_template;
 mod router;
 
 use std::pin::Pin;
@@ -135,6 +136,37 @@ fn apply_openai_prompt_cache_key(body: &mut serde_json::Value, model_id: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_params_override_effort_without_axis_validation() {
+        for (field, original, replacement) in [
+            (
+                "reasoning_effort",
+                serde_json::json!("low"),
+                serde_json::json!("turbo"),
+            ),
+            (
+                "reasoning",
+                serde_json::json!({"effort":"low"}),
+                serde_json::json!({"effort":"turbo"}),
+            ),
+            (
+                "output_config",
+                serde_json::json!({"effort":"low"}),
+                serde_json::json!({"effort":"turbo"}),
+            ),
+        ] {
+            let mut body = serde_json::json!({"model":"model"});
+            body[field] = original;
+            let mut extra = serde_json::json!({});
+            extra[field] = replacement.clone();
+            merge_extra_params(&mut body, &extra).unwrap();
+            assert_eq!(body[field], replacement);
+            assert_eq!(body["model"], "model");
+        }
+        let mut body = serde_json::json!({"model":"model"});
+        assert!(merge_extra_params(&mut body, &serde_json::json!({"model":"other"})).is_err());
+    }
 
     #[test]
     fn sse_transport_errors_are_not_relabelled_as_parse_errors() {

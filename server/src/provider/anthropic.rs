@@ -119,6 +119,7 @@ impl Provider for AnthropicProvider {
             let mut thinking_signatures = std::collections::HashMap::<usize, String>::new();
             let mut thinking_blocks = Vec::new();
             let mut finish = None;
+            let mut refused = false;
             let mut saw_tool = false;
             let mut terminal = false;
             let mut final_usage = None::<Usage>;
@@ -208,7 +209,9 @@ impl Provider for AnthropicProvider {
                         if let Some(usage) = value.get("usage") {
                             merge_usage(final_usage.get_or_insert_default(), anthropic_usage(usage));
                         }
-                        finish = match value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                        let stop_reason = value.pointer("/delta/stop_reason").and_then(Value::as_str);
+                        refused |= stop_reason == Some("refusal");
+                        finish = match stop_reason {
                             Some("tool_use") => Some(FinishReason::ToolUse),
                             Some("max_tokens" | "model_context_window_exceeded") => Some(FinishReason::Length),
                             Some("end_turn" | "stop_sequence" | "pause_turn" | "refusal") => Some(FinishReason::Stop),
@@ -234,13 +237,7 @@ impl Provider for AnthropicProvider {
                         if let Some(usage) = final_usage {
                             yield ModelEvent::Usage(usage);
                         }
-                        let finish = match finish {
-                            Some(FinishReason::Length) => FinishReason::Length,
-                            _ if saw_tool => FinishReason::ToolUse,
-                            Some(finish) => finish,
-                            None => FinishReason::Stop,
-                        };
-                        yield ModelEvent::Done(finish);
+                        yield ModelEvent::Done(collapse_anthropic_finish(finish, saw_tool, refused)?);
                     }
                     _ => {}
                 }
@@ -259,13 +256,7 @@ impl Provider for AnthropicProvider {
                 }
                 if let Some(usage) = final_usage { yield ModelEvent::Usage(usage); }
                 terminal = true;
-                let finish = match finish {
-                    Some(FinishReason::Length) => FinishReason::Length,
-                    _ if saw_tool => FinishReason::ToolUse,
-                    Some(finish) => finish,
-                    None => FinishReason::Stop,
-                };
-                yield ModelEvent::Done(finish);
+                yield ModelEvent::Done(collapse_anthropic_finish(finish, saw_tool, refused)?);
             }
             if !terminal {
                 Err(Error::Provider("Anthropic stream ended without message_stop".into()))?;
@@ -300,11 +291,30 @@ fn close_anthropic_block(
     }
 }
 
+/// Anthropic 要求 budget_tokens ≥1024 且严格小于 max_tokens。
+const MIN_THINKING_BUDGET_TOKENS: u64 = 1024;
+
 fn apply_model(body: &mut Value, model: &crate::model::ModelSpec) -> Result<()> {
     let object = body
         .as_object_mut()
         .ok_or_else(|| Error::Provider("Anthropic request body is not an object".into()))?;
     if model.reasoning.enabled {
+        if let Some(budget) = model.thinking_budget_tokens {
+            // 显式预算优先于 effort 轴:固定 budget_tokens 时不再下发 output_config。
+            let budget = budget.max(MIN_THINKING_BUDGET_TOKENS);
+            object.insert(
+                "thinking".into(),
+                json!({"type":"enabled", "budget_tokens": budget, "display":"summarized"}),
+            );
+            let max_tokens = object
+                .get("max_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            if max_tokens <= budget {
+                object.insert("max_tokens".into(), json!(budget + 1));
+            }
+            return Ok(());
+        }
         object.insert(
             "thinking".into(),
             json!({"type":"adaptive", "display":"summarized"}),
@@ -502,9 +512,162 @@ fn anthropic_usage(value: &Value) -> Usage {
     }
 }
 
+/// Collapses the reported stop reason against the blocks actually streamed.
+///
+/// Observed tool calls outrank an ordinary stop, because Anthropic reports
+/// `end_turn` alongside `tool_use` blocks and those calls are meant to run. A
+/// refusal is the exception: the model declined the turn, so any tool blocks it
+/// streamed alongside the refusal must not be executed. Return a typed refusal
+/// so the run terminates instead of retrying a protocol disagreement.
+fn collapse_anthropic_finish(
+    finish: Option<FinishReason>,
+    saw_tool: bool,
+    refused: bool,
+) -> Result<FinishReason> {
+    Ok(match finish {
+        Some(FinishReason::Length) => FinishReason::Length,
+        _ if refused && saw_tool => {
+            return Err(Error::ProviderRefusal(
+                "Anthropic refused to execute tool calls".into(),
+            ));
+        }
+        _ if refused => FinishReason::Stop,
+        _ if saw_tool => FinishReason::ToolUse,
+        Some(finish) => finish,
+        None => FinishReason::Stop,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelSpec;
+
+    fn thinking_model() -> ModelSpec {
+        let mut model = ModelSpec::new("claude-test");
+        model.reasoning.enabled = true;
+        model
+    }
+
+    #[test]
+    fn without_a_budget_thinking_stays_adaptive_and_effort_is_sent() {
+        let mut model = thinking_model();
+        model.reasoning.effort = Some("high".into());
+        let mut body = json!({"max_tokens": 65_000});
+
+        apply_model(&mut body, &model).unwrap();
+
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
+        assert_eq!(body["max_tokens"], json!(65_000));
+    }
+
+    #[test]
+    fn an_explicit_budget_replaces_adaptive_and_wins_over_effort() {
+        let mut model = thinking_model();
+        model.reasoning.effort = Some("high".into());
+        model.thinking_budget_tokens = Some(8_000);
+        let mut body = json!({"max_tokens": 65_000});
+
+        apply_model(&mut body, &model).unwrap();
+
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 8_000, "display": "summarized"})
+        );
+        assert!(body.get("output_config").is_none());
+        assert_eq!(body["max_tokens"], json!(65_000));
+    }
+
+    #[test]
+    fn a_budget_is_clamped_to_the_api_minimum() {
+        let mut model = thinking_model();
+        model.thinking_budget_tokens = Some(10);
+        let mut body = json!({"max_tokens": 65_000});
+
+        apply_model(&mut body, &model).unwrap();
+
+        assert_eq!(body["thinking"]["budget_tokens"], json!(1024));
+    }
+
+    #[test]
+    fn max_tokens_is_raised_above_a_larger_budget() {
+        let mut model = thinking_model();
+        model.thinking_budget_tokens = Some(70_000);
+        let mut body = json!({"max_tokens": 65_000});
+
+        apply_model(&mut body, &model).unwrap();
+
+        assert_eq!(body["thinking"]["budget_tokens"], json!(70_000));
+        assert_eq!(body["max_tokens"], json!(70_001));
+    }
+
+    #[test]
+    fn disabled_reasoning_sends_no_thinking_even_with_a_budget() {
+        let mut model = ModelSpec::new("claude-test");
+        model.thinking_budget_tokens = Some(8_000);
+        let mut body = json!({"max_tokens": 65_000});
+
+        apply_model(&mut body, &model).unwrap();
+
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], json!(65_000));
+    }
+
+    #[test]
+    fn a_refusal_never_executes_the_tool_blocks_it_streamed() {
+        assert!(matches!(
+            collapse_anthropic_finish(Some(FinishReason::Stop), true, true),
+            Err(Error::ProviderRefusal(_))
+        ));
+        assert!(matches!(
+            collapse_anthropic_finish(None, true, true),
+            Err(Error::ProviderRefusal(_))
+        ));
+    }
+
+    #[test]
+    fn observed_tool_blocks_still_outrank_an_ordinary_stop() {
+        assert_eq!(
+            collapse_anthropic_finish(Some(FinishReason::Stop), true, false).unwrap(),
+            FinishReason::ToolUse
+        );
+        assert_eq!(
+            collapse_anthropic_finish(None, true, false).unwrap(),
+            FinishReason::ToolUse
+        );
+        assert_eq!(
+            collapse_anthropic_finish(Some(FinishReason::ToolUse), true, false).unwrap(),
+            FinishReason::ToolUse
+        );
+    }
+
+    #[test]
+    fn a_truncated_response_stays_truncated() {
+        assert_eq!(
+            collapse_anthropic_finish(Some(FinishReason::Length), true, false).unwrap(),
+            FinishReason::Length
+        );
+        assert_eq!(
+            collapse_anthropic_finish(Some(FinishReason::Length), true, true).unwrap(),
+            FinishReason::Length
+        );
+    }
+
+    #[test]
+    fn a_stop_without_tool_blocks_is_unchanged() {
+        assert_eq!(
+            collapse_anthropic_finish(Some(FinishReason::Stop), false, false).unwrap(),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            collapse_anthropic_finish(None, false, false).unwrap(),
+            FinishReason::Stop
+        );
+    }
 
     #[test]
     fn cached_tokens_are_included_once_in_anthropic_context_input() {

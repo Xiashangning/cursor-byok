@@ -112,7 +112,8 @@ impl Provider for OpenAiResponsesProvider {
             let source = chunks.eventsource();
             futures_util::pin_mut!(source);
             let mut text_open = false;
-            let mut text = String::new();
+            let mut texts = std::collections::BTreeMap::new();
+            let mut text_index = None;
             let mut thinking_open = false;
             let mut tools = std::collections::BTreeMap::<usize, ResponseToolState>::new();
             let mut reasoning_items = Vec::new();
@@ -134,6 +135,7 @@ impl Provider for OpenAiResponsesProvider {
                 let kind = value.get("type").and_then(Value::as_str).unwrap_or(&event.event);
                 match kind {
                     "response.output_text.delta" => {
+                        let text = enter_response_text_item(&value, &mut text_index, &mut texts);
                         if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                         if !text_open { text_open = true; yield ModelEvent::TextStart; }
                         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
@@ -142,8 +144,9 @@ impl Provider for OpenAiResponsesProvider {
                         }
                     }
                     "response.output_text.done" => {
+                        let text = enter_response_text_item(&value, &mut text_index, &mut texts);
                         if let Some(final_text) = value.get("text").and_then(Value::as_str) {
-                            for event in reconcile_response_text(&mut text_open, &mut text, final_text) { yield event; }
+                            for event in reconcile_response_text(&mut text_open, text, final_text) { yield event; }
                         }
                         if text_open { text_open = false; yield ModelEvent::TextEnd; }
                     }
@@ -170,8 +173,9 @@ impl Provider for OpenAiResponsesProvider {
                             }
                             Some("message") => {
                                 saw_completed_item = true;
+                                let text = enter_response_text_item(&value, &mut text_index, &mut texts);
                                 if let Some(final_text) = response_item_text(item) {
-                                    for event in reconcile_response_text(&mut text_open, &mut text, &final_text) { yield event; }
+                                    for event in reconcile_response_text(&mut text_open, text, &final_text) { yield event; }
                                 }
                                 if text_open { text_open = false; yield ModelEvent::TextEnd; }
                             }
@@ -282,6 +286,30 @@ fn response_item_text(item: &Value) -> Option<String> {
         .filter_map(|part| part.get("text").and_then(Value::as_str))
         .collect::<String>();
     Some(text)
+}
+
+/// Scopes the streamed text accumulator to a single output item.
+///
+/// `response.output_text.done` and `response.output_item.done` report the final
+/// text of one item, so reconciliation is only meaningful against the deltas of
+/// that same item. Each item keeps its own baseline: interleaved items and late
+/// terminal reports for an earlier item must still see the deltas they are
+/// reconciling against, otherwise the whole text replays as a delta.
+fn enter_response_text_item<'a>(
+    value: &Value,
+    current: &mut Option<u64>,
+    streamed: &'a mut std::collections::BTreeMap<Option<u64>, String>,
+) -> &'a mut String {
+    if let Some(index) = value.get("output_index").and_then(Value::as_u64) {
+        // The first explicit index identifies any prefix that arrived unindexed.
+        if current.is_none() {
+            if let Some(prefix) = streamed.remove(&None) {
+                streamed.insert(Some(index), prefix);
+            }
+        }
+        *current = Some(index);
+    }
+    streamed.entry(*current).or_default()
 }
 
 fn reconcile_response_text(
@@ -580,5 +608,105 @@ mod tests {
                 "encrypted_content": "opaque"
             })]
         );
+    }
+
+    #[test]
+    fn a_later_output_item_reconciles_against_its_own_text() {
+        let mut open = false;
+        let mut index = None;
+        let mut texts = std::collections::BTreeMap::new();
+
+        let text = enter_response_text_item(&json!({"output_index": 0}), &mut index, &mut texts);
+        assert_eq!(
+            reconcile_response_text(&mut open, text, "checking the file"),
+            vec![
+                ModelEvent::TextStart,
+                ModelEvent::TextDelta("checking the file".into())
+            ]
+        );
+        open = false;
+
+        let text = enter_response_text_item(&json!({"output_index": 2}), &mut index, &mut texts);
+        assert_eq!(
+            reconcile_response_text(&mut open, text, "the file looks fine"),
+            vec![
+                ModelEvent::TextStart,
+                ModelEvent::TextDelta("the file looks fine".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_later_output_item_still_repairs_a_truncated_delta_stream() {
+        let mut open = true;
+        let mut index = None;
+        let mut texts = std::collections::BTreeMap::new();
+
+        enter_response_text_item(&json!({"output_index": 0}), &mut index, &mut texts)
+            .push_str("checking the file");
+        enter_response_text_item(&json!({"output_index": 3}), &mut index, &mut texts)
+            .push_str("the file ");
+        let text = enter_response_text_item(&json!({"output_index": 3}), &mut index, &mut texts);
+
+        assert_eq!(
+            reconcile_response_text(&mut open, text, "the file looks fine"),
+            vec![ModelEvent::TextDelta("looks fine".into())]
+        );
+    }
+
+    /// Each item keeps its own baseline until its terminal report.
+    #[test]
+    fn an_interleaved_item_keeps_its_baseline_until_its_terminal_report() {
+        let mut open = false;
+        let mut index = None;
+        let mut texts = std::collections::BTreeMap::new();
+
+        enter_response_text_item(&json!({"output_index": 0}), &mut index, &mut texts)
+            .push_str("first");
+        enter_response_text_item(&json!({"output_index": 1}), &mut index, &mut texts)
+            .push_str("second");
+
+        let text = enter_response_text_item(&json!({"output_index": 0}), &mut index, &mut texts);
+        assert_eq!(text, "first");
+        assert!(
+            reconcile_response_text(&mut open, text, "first").is_empty(),
+            "the late terminal report must not replay text the client already saw"
+        );
+    }
+
+    #[test]
+    fn the_first_explicit_index_adopts_the_unindexed_prefix() {
+        // The unindexed delta already opened text, as its branch does.
+        let mut open = true;
+        let mut index = None;
+        let mut texts = std::collections::BTreeMap::new();
+
+        enter_response_text_item(&json!({}), &mut index, &mut texts).push_str("hello");
+        let text = enter_response_text_item(&json!({"output_index": 2}), &mut index, &mut texts);
+
+        assert_eq!(text, "hello");
+        assert_eq!(
+            reconcile_response_text(&mut open, text, "hello world"),
+            vec![ModelEvent::TextDelta(" world".into())]
+        );
+    }
+
+    #[test]
+    fn repeated_reports_for_one_output_item_do_not_replay_its_text() {
+        let mut open = false;
+        let mut index = None;
+        let mut texts = std::collections::BTreeMap::new();
+        let event = json!({"output_index": 0});
+
+        enter_response_text_item(&event, &mut index, &mut texts);
+        let text = enter_response_text_item(&event, &mut index, &mut texts);
+        assert_eq!(
+            reconcile_response_text(&mut open, text, "done"),
+            vec![ModelEvent::TextStart, ModelEvent::TextDelta("done".into())]
+        );
+        open = false;
+
+        let text = enter_response_text_item(&event, &mut index, &mut texts);
+        assert!(reconcile_response_text(&mut open, text, "done").is_empty());
     }
 }
