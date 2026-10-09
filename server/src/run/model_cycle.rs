@@ -37,11 +37,13 @@ struct OpenTool {
     ended: bool,
 }
 
+// `Err` is boxed: `Usage` alone pushes the bare struct past clippy's
+// `result_large_err` limit.
 pub async fn consume_model_cycle(
     mut stream: ProviderStream,
     client: &mpsc::Sender<RunEvent>,
     cancellation: &CancellationToken,
-) -> std::result::Result<ModelCycleResult, ModelCycleFailure> {
+) -> std::result::Result<ModelCycleResult, Box<ModelCycleFailure>> {
     let mut model_call_id = None;
     let mut text = String::new();
     let mut reasoning = String::new();
@@ -375,15 +377,15 @@ fn failure(
     partial_text: String,
     partial_reasoning: String,
     usage: Option<Usage>,
-) -> ModelCycleFailure {
+) -> Box<ModelCycleFailure> {
     let retryable = matches!(failure, RunFailure::Protocol(_) | RunFailure::Provider(_));
-    ModelCycleFailure {
+    Box::new(ModelCycleFailure {
         failure,
         partial_text,
         partial_reasoning,
         usage,
         retryable,
-    }
+    })
 }
 
 fn terminal_failure(
@@ -391,14 +393,14 @@ fn terminal_failure(
     partial_text: String,
     partial_reasoning: String,
     usage: Option<Usage>,
-) -> ModelCycleFailure {
-    ModelCycleFailure {
+) -> Box<ModelCycleFailure> {
+    Box::new(ModelCycleFailure {
         failure,
         partial_text,
         partial_reasoning,
         usage,
         retryable: false,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -443,7 +445,7 @@ mod tests {
         }
     }
 
-    async fn consume_failure(error: crate::Error) -> ModelCycleFailure {
+    async fn consume_failure(error: crate::Error) -> Box<ModelCycleFailure> {
         let stream = Box::pin(tokio_stream::iter(vec![Err(error)]));
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
         consume_model_cycle(stream, &event_tx, &CancellationToken::new())

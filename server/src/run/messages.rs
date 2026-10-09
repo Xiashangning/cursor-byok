@@ -87,7 +87,6 @@ async fn append_one(
         client,
         RunEvent::MessagesCommitted(MessagesCommitted {
             checkpoint_id: checkpoint,
-            tool_round_version: 0,
             cause: CommitCause::RuntimeEvent { event_id },
             barrier,
         }),

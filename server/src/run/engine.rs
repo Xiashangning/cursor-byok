@@ -25,6 +25,12 @@ pub struct RunEngine {
     provider: Arc<dyn Provider>,
 }
 
+/// Provider-visible tail appended when the committed history ends with the
+/// assistant, which happens when Cursor resumes a turn that had already
+/// finished (for example after a cancelled follow-up).
+const CONTINUE_MESSAGE_ID: &str = "runtime:continue";
+const CONTINUE_INSTRUCTION: &str = "Continue from where you left off.";
+
 impl RunEngine {
     pub fn new(store: Store, provider: Arc<dyn Provider>) -> Self {
         Self { store, provider }
@@ -73,7 +79,7 @@ impl RunEngine {
             .map(|(category, summary)| (*category, summary.as_str()));
         if let Err(error) = self
             .store
-            .finish_run(&prepared.run_id, status, usage, failure_ref)
+            .finish_run(&prepared.run_id, status, failure_ref)
             .await
         {
             tracing::error!(run_id = %prepared.run_id, %error, "failed to persist Run outcome");
@@ -130,7 +136,6 @@ impl RunEngine {
                     client,
                     RunEvent::MessagesCommitted(MessagesCommitted {
                         checkpoint_id: checkpoint,
-                        tool_round_version: 0,
                         cause: CommitCause::InitialMessages,
                         barrier,
                     }),
@@ -143,6 +148,12 @@ impl RunEngine {
                 if let Err(outcome) = wait_for_state_ready(ready, cancellation).await {
                     return (outcome, usage);
                 }
+            } else if prepared.background_follow_up {
+                // 并发竞态兜底:通知已由另一个 Run 提交,本 Run 没有任何
+                // 新材料。零写入直接完成,不进入模型循环;收尾由
+                // ConversationOutput 对无最终 checkpoint 的后台 Run
+                // 静默 Success。
+                return (RunOutcome::Completed, usage);
             }
         }
 
@@ -171,6 +182,10 @@ impl RunEngine {
             };
         }
 
+        // A provider refusal for an over-limit prompt triggers one compaction
+        // per run. A second refusal after compacting means the current input
+        // itself does not fit, and compacting again would only destroy history.
+        let mut overflow_compacted = false;
         'model: loop {
             if cancellation.is_cancelled() {
                 return (RunOutcome::Cancelled, usage);
@@ -226,6 +241,18 @@ impl RunEngine {
             if let Err(error) = hydrate_tool_images(&self.store, &mut history).await {
                 return (RunOutcome::Failed(error.into()), usage);
             }
+            // The usage anchor counts persisted messages only; a transient
+            // tail is provider-visible but never committed.
+            let anchored_messages = history.len();
+            let history = if prepared.action == RunAction::Compact {
+                super::history::user_terminated(
+                    history,
+                    "compaction:instruction",
+                    super::compaction::INSTRUCTIONS,
+                )
+            } else {
+                super::history::user_terminated(history, CONTINUE_MESSAGE_ID, CONTINUE_INSTRUCTION)
+            };
             let request = crate::model::ModelRequest {
                 prompt: prepared.prompt.clone(),
                 model: prepared.model.clone(),
@@ -296,7 +323,7 @@ impl RunEngine {
                                         update_context_usage_anchor(
                                             &mut context_usage_anchor,
                                             cycle_usage,
-                                            request.history.len(),
+                                            anchored_messages,
                                         );
                                         accumulate_usage(&mut usage, cycle_usage);
                                     }
@@ -306,7 +333,7 @@ impl RunEngine {
                                         update_context_usage_anchor(
                                             &mut context_usage_anchor,
                                             cycle_usage,
-                                            request.history.len(),
+                                            anchored_messages,
                                         );
                                         accumulate_usage(&mut usage, cycle_usage);
                                     }
@@ -353,13 +380,65 @@ impl RunEngine {
                             update_context_usage_anchor(
                                 &mut context_usage_anchor,
                                 cycle_usage,
-                                request.history.len(),
+                                anchored_messages,
                             );
                             accumulate_usage(&mut usage, cycle_usage);
                         }
                         if cancellation.is_cancelled() {
                             let _ = emit(client, RunEvent::CycleInterrupted).await;
                             return (RunOutcome::Cancelled, usage);
+                        }
+                        // The estimate that cleared the compaction check can
+                        // still land over the real limit: it trails the
+                        // provider's own count by whatever the request adds
+                        // after the anchor was taken. The provider is the
+                        // authority, so treat its refusal as the trigger the
+                        // estimate missed. Without this a conversation that
+                        // crosses the line is wedged: every retry rebuilds the
+                        // same prompt and gets the same refusal.
+                        if !overflow_compacted
+                            && prepared.action != RunAction::Compact
+                            && matches!(&cycle_failure.failure, RunFailure::Provider(message)
+                                if super::compaction::is_context_overflow(message))
+                        {
+                            tracing::warn!(
+                                provider_call_index,
+                                checkpoint_id = checkpoint.0,
+                                "provider rejected the prompt as over-limit; compacting and retrying"
+                            );
+                            overflow_compacted = true;
+                            checkpoint = match super::messages::append_batches(
+                                &self.store,
+                                prepared,
+                                client,
+                                cancellation,
+                                checkpoint,
+                                std::mem::take(&mut pending_insertions),
+                            )
+                            .await
+                            {
+                                Ok((checkpoint, _)) => checkpoint,
+                                Err(outcome) => return (outcome, usage),
+                            };
+                            let messages =
+                                match self.store.load_checkpoint_messages(checkpoint).await {
+                                    Ok(messages) => messages,
+                                    Err(error) => return (RunOutcome::Failed(error.into()), usage),
+                                };
+                            match self
+                                .auto_compact(prepared, checkpoint, &messages, client, cancellation)
+                                .await
+                            {
+                                Ok((next_checkpoint, compaction_usage)) => {
+                                    checkpoint = next_checkpoint;
+                                    context_usage_anchor = None;
+                                    if let Some(compaction_usage) = compaction_usage {
+                                        accumulate_usage(&mut usage, compaction_usage);
+                                    }
+                                    continue 'model;
+                                }
+                                Err(outcome) => return (outcome, usage),
+                            }
                         }
                         if !should_retry(&cycle_failure, retries) {
                             return (RunOutcome::Failed(cycle_failure.failure), usage);
@@ -459,7 +538,7 @@ impl RunEngine {
                 update_context_usage_anchor(
                     &mut context_usage_anchor,
                     cycle_usage,
-                    request.history.len(),
+                    anchored_messages,
                 );
                 accumulate_usage(&mut usage, cycle_usage);
             }
@@ -549,7 +628,6 @@ impl RunEngine {
                     client,
                     RunEvent::MessagesCommitted(MessagesCommitted {
                         checkpoint_id: checkpoint,
-                        tool_round_version: 0,
                         cause: CommitCause::Compaction { summary },
                         barrier,
                     }),
@@ -619,7 +697,7 @@ impl RunEngine {
                     Err(outcome) => return (outcome, usage),
                 };
                 if !closing_insertions.is_empty() {
-                    checkpoint = match super::messages::append_batches(
+                    let inserted = match super::messages::append_batches(
                         &self.store,
                         prepared,
                         client,
@@ -629,18 +707,25 @@ impl RunEngine {
                     )
                     .await
                     {
-                        Ok((next, _)) => next,
+                        Ok((next, inserted)) => {
+                            checkpoint = next;
+                            inserted
+                        }
                         Err(outcome) => return (outcome, usage),
                     };
-                    client.phase.resume_running();
-                    continue 'model;
+                    // 与上方 pending_insertions 分支同一守卫:整批重复
+                    // (已提交消息的at-least-once重投)直接走 FinalTurn 收尾,
+                    // 不再激活模型。
+                    if inserted {
+                        client.phase.resume_running();
+                        continue 'model;
+                    }
                 }
                 let (barrier, ready) = CommitBarrier::before_continue();
                 if emit(
                     client,
                     RunEvent::MessagesCommitted(MessagesCommitted {
                         checkpoint_id: checkpoint,
-                        tool_round_version: 0,
                         cause: CommitCause::FinalTurn,
                         barrier,
                     }),
@@ -721,6 +806,9 @@ impl RunEngine {
             .await
             .map_err(|error| RunOutcome::Failed(error.into()))?;
         let history = crate::model::project_messages(&compactable)
+            .map(|history| {
+                super::compaction::compaction_history(history, prepared.model.context_window_tokens)
+            })
             .map_err(|error| RunOutcome::Failed(error.into()))?;
         let mut model = prepared.model.clone();
         model.max_output_tokens = Some(super::compaction::OUTPUT_TOKENS);
@@ -849,7 +937,6 @@ impl RunEngine {
             client,
             RunEvent::MessagesCommitted(MessagesCommitted {
                 checkpoint_id: checkpoint,
-                tool_round_version: 0,
                 cause: CommitCause::Compaction { summary },
                 barrier,
             }),
@@ -983,6 +1070,7 @@ fn failure_message(failure: &RunFailure) -> String {
     match failure {
         RunFailure::Protocol(message)
         | RunFailure::Provider(message)
+        | RunFailure::ProviderRefusal(message)
         | RunFailure::Store(message)
         | RunFailure::Client(message) => message.clone(),
     }

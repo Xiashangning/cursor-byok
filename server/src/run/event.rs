@@ -10,6 +10,9 @@ use crate::model::{CheckpointId, ToolCall, ToolRoundId, Usage};
 pub enum RunFailure {
     Protocol(String),
     Provider(String),
+    /// 供应商明确拒绝执行本轮(如 Anthropic 在 refusal 下仍流出了工具块):
+    /// 重试只会得到同样的拒绝,因此不进入重试。
+    ProviderRefusal(String),
     Store(String),
     Client(String),
 }
@@ -18,7 +21,7 @@ impl RunFailure {
     pub fn category(&self) -> &'static str {
         match self {
             Self::Protocol(_) => "protocol",
-            Self::Provider(_) => "provider",
+            Self::Provider(_) | Self::ProviderRefusal(_) => "provider",
             Self::Store(_) => "store",
             Self::Client(_) => "client",
         }
@@ -30,9 +33,11 @@ impl From<crate::Error> for RunFailure {
         use crate::Error;
         match error {
             Error::Protocol(message) | Error::Config(message) => Self::Protocol(message),
+            Error::RequestTooLarge(message) => Self::Client(message),
             Error::Provider(message) | Error::ProviderStatus { message, .. } => {
                 Self::Provider(message)
             }
+            Error::ProviderRefusal(message) => Self::ProviderRefusal(message),
             Error::Store(message) => Self::Store(message),
             Error::Cancelled => Self::Client("run was cancelled".into()),
             Error::Http(error) => Self::Provider(error.to_string()),
@@ -64,7 +69,7 @@ pub enum RunOutcome {
 pub enum CommitCause {
     InitialMessages,
     ToolRoundStarted(ToolRoundId),
-    ToolResult { call_id: String, interrupted: bool },
+    ToolResult { call_id: String, synthetic: bool },
     FinalTurn,
     Compaction { summary: String },
     RuntimeEvent { event_id: String },
@@ -96,7 +101,6 @@ impl CommitBarrier {
 #[derive(Debug)]
 pub struct MessagesCommitted {
     pub checkpoint_id: CheckpointId,
-    pub tool_round_version: u64,
     pub cause: CommitCause,
     pub barrier: CommitBarrier,
 }
