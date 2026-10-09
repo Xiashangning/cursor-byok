@@ -183,3 +183,65 @@ func TestModuleScopeWinsOverPackagePreference(t *testing.T) {
 		t.Fatalf("blob_data resolved to %q, want internapi.v1.BlobData (module-local declaration)", resolved)
 	}
 }
+
+// TestGoogleTypeKeepsQualifiedNameNextToSameNamedLocalType 验证 Google 标准类型不会被同包同名类型遮蔽。
+// 复现 agent_v1.proto 中 PrivateWorkerApiService 使用 google.protobuf.Empty 的场景:
+// 包内同时声明了 agent.v1.Empty。若服务方法渲染成裸 Empty,google.protobuf.Empty 就会被指向本地空消息,
+// empty.proto 变成从未使用的 import,protoc 会因此发出未使用 import 警告。
+func TestGoogleTypeKeepsQualifiedNameNextToSameNamedLocalType(t *testing.T) {
+	localEmpty := Message{
+		TypeName:  "agent.v1.Empty",
+		VarName:   "S5t",
+		Package:   "agent.v1",
+		ShortName: "Empty",
+	}
+	response := Message{
+		TypeName:  "agent.v1.GetWorkerIdResponse",
+		VarName:   "txf",
+		Package:   "agent.v1",
+		ShortName: "GetWorkerIdResponse",
+	}
+	service := Service{
+		TypeName:  "agent.v1.PrivateWorkerApiService",
+		VarName:   "ixf",
+		Package:   "agent.v1",
+		ShortName: "PrivateWorkerApiService",
+		Methods: []Method{{
+			Name:       "GetWorkerId",
+			InputType:  "google.protobuf.Empty",
+			OutputType: "agent.v1.GetWorkerIdResponse",
+			Kind:       "Unary",
+		}},
+	}
+
+	messages := []Message{localEmpty, response}
+	resolver := newTypeResolver(messages, nil, nil, nil)
+
+	// 真实流程里 copyAllExternalTypes 会登记包内类型,渲染器依赖它判断短名可用性。
+	copiedTypes = map[string]map[string]string{
+		"agent.v1": {
+			"Empty":               "local:agent.v1.Empty",
+			"GetWorkerIdResponse": "local:agent.v1.GetWorkerIdResponse",
+		},
+	}
+	t.Cleanup(func() { copiedTypes = make(map[string]map[string]string) })
+
+	directory := t.TempDir()
+	generateProtoFile("agent.v1", messages, nil, []Service{service}, resolver, directory)
+
+	data, err := os.ReadFile(filepath.Join(directory, "agent_v1.proto"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+
+	if !strings.Contains(body, `import "google/protobuf/empty.proto";`) {
+		t.Fatalf("expected empty.proto import:\n%s", body)
+	}
+	if !strings.Contains(body, "rpc GetWorkerId(google.protobuf.Empty) returns (GetWorkerIdResponse) {}") {
+		t.Fatalf("google.protobuf.Empty lost its package qualifier:\n%s", body)
+	}
+	if strings.Contains(body, "rpc GetWorkerId(Empty)") {
+		t.Fatalf("google.protobuf.Empty was shadowed by agent.v1.Empty:\n%s", body)
+	}
+}

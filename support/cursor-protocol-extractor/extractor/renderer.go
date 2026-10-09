@@ -97,11 +97,22 @@ func resolveMethodType(ref string, resolver *TypeResolver, currentPkg string, co
 		activeDiagnostics.addUnresolvedType("method:" + ref)
 		return fallbackTypeToken(ref)
 	}
+	return typeToken(currentPkg, typeName)
+}
 
+// typeToken 决定引用类型在生成文件中的写法。
+// 同包类型与复制进当前包的外部类型使用短名;Google 标准类型绕过复制机制,
+// 必须保留全限定名,否则同包同名类型会遮蔽它,例如 agent.v1.Empty 遮蔽 google.protobuf.Empty。
+func typeToken(currentPkg string, typeName string) string {
 	refPkg, shortName := parseTypeName(typeName)
 	if refPkg == currentPkg || refPkg == "" {
 		return shortName
 	}
+
+	if isGooglePkg(refPkg) {
+		return refPkg + "." + shortName
+	}
+
 	// 检查类型是否由其他包复制到当前包。
 	if copied := copiedTypes[currentPkg]; copied != nil {
 		if _, isCopied := copied[shortName]; isCopied {
@@ -325,7 +336,7 @@ func resolveFieldTypeWithPkg(f Field, resolver *TypeResolver, parentPath string,
 			return fallbackTypeToken(ref)
 		}
 
-		refPkg, shortName := parseTypeName(typeName)
+		_, shortName := parseTypeName(typeName)
 
 		// 类型位于同一父消息下时使用相对路径。
 		if parentPath != "" && strings.HasPrefix(shortName, parentPath+".") {
@@ -333,21 +344,7 @@ func resolveFieldTypeWithPkg(f Field, resolver *TypeResolver, parentPath string,
 			return strings.TrimPrefix(shortName, parentPath+".")
 		}
 
-		// 同包类型只使用短名称。
-		if refPkg == currentPkg || refPkg == "" {
-			return shortName
-		}
-
-		// 循环依赖中优先使用已经复制到当前包的类型。
-		if copied := copiedTypes[currentPkg]; copied != nil {
-			if _, isCopied := copied[shortName]; isCopied {
-				// 本地存在复制类型时使用短名称。
-				return shortName
-			}
-		}
-
-		// 其余跨包引用保留全限定类型名。
-		return refPkg + "." + shortName
+		return typeToken(currentPkg, typeName)
 	}
 
 	if f.Kind == "scalar" {

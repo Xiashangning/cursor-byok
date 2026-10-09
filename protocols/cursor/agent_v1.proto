@@ -8702,8 +8702,8 @@ service LifecycleService {
 
 // Source: agent.v1.PrivateWorkerApiService (var: ixf)
 service PrivateWorkerApiService {
-  rpc GetWorkerId(Empty) returns (GetWorkerIdResponse) {}
-  rpc WatchStatus(Empty) returns (stream WatchStatusResponse) {}
+  rpc GetWorkerId(google.protobuf.Empty) returns (GetWorkerIdResponse) {}
+  rpc WatchStatus(google.protobuf.Empty) returns (stream WatchStatusResponse) {}
 }
 
 // Source: agent.v1.PrivateWorkerBridgeExternalService (var: dxf)

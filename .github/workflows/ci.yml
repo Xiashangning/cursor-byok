@@ -67,9 +67,17 @@ jobs:
         working-directory: support/cursor-protocol-extractor
         run: go test ./...
 
+      # Ubuntu 22.04 ships protoc 3.12, which rejects proto3 `optional` fields
+      # outright. Pin the version the Rust build already vendors so both halves
+      # of the repository compile the same schema with the same compiler.
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "31.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Generate and compile protocol consumers
         run: |
-          sudo apt-get install -y protobuf-compiler
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
           export PATH="$(go env GOPATH)/bin:$PATH"
           bash support/cursor-protocol-extractor/scripts/generate.sh
