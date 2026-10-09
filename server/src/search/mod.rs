@@ -6,6 +6,7 @@ mod federation;
 mod fetch;
 mod search_provider;
 
+pub(crate) use cache::{cache_bytes, clear_caches};
 pub use cache::{WebCache, WebCacheEntry};
 pub use engine::{HtmlEngine, JsonEngine, SearchEngine, SearchHit};
 pub use federation::{SearchError, WebSearch};

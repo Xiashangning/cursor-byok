@@ -31,6 +31,11 @@ pub struct App {
 impl App {
     pub async fn new(mut config: Config) -> Result<Self> {
         let store = Store::connect(&config.database_url).await?;
+        // 崩溃恢复：上次进程遗留的进行中状态收敛到终态（数据库清理由用户手动触发）。
+        let recovered = store.recover_interrupted_state().await?;
+        if !recovered.is_empty() {
+            tracing::info!(?recovered, "recovered interrupted state on startup");
+        }
         if config.use_persisted_ports {
             config
                 .listen_addr
@@ -44,7 +49,17 @@ impl App {
             plugin_runtime.clone(),
             config.app_version.clone(),
         )?;
+        plugins.start_quota_refresh();
         let clients = crate::network::NetworkClients::new(store.clone());
+        let access_token =
+            control::AccessToken::resolve(&store, config.access_token.clone()).await?;
+        if !config.listen_addr.ip().is_loopback() {
+            tracing::info!(
+                %config.listen_addr,
+                token = %access_token.current(),
+                "non-loopback bind; remote clients must present this access token"
+            );
+        }
         let provider = std::sync::Arc::new(ProviderRouter::new(
             store.clone(),
             plugins.clone(),
@@ -66,7 +81,7 @@ impl App {
             plugin_runtime,
             plugins,
             clients.clone(),
-            config.app_version.clone(),
+            access_token,
         )?;
         let harness = control.cursor_harness().clone();
         let mut router = api::router(registry.clone(), clients)?;
@@ -132,15 +147,20 @@ impl App {
         let address = listener.local_addr()?;
         self.registry.web_cache().set_service_addr(address);
         self.harness.set_backend_addr(address);
+        self.harness.restore_on_startup().await;
         tracing::info!(%address, "cursor server listening");
         let registry = self.registry;
         let harness = self.harness;
         let graceful = shutdown.clone();
-        let server = axum::serve(listener, self.router)
-            .with_graceful_shutdown(async move {
-                graceful.cancelled().await;
-            })
-            .into_future();
+        let server = axum::serve(
+            listener,
+            self.router
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            graceful.cancelled().await;
+        })
+        .into_future();
         tokio::pin!(server);
 
         tokio::select! {
