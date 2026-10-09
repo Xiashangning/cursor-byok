@@ -148,7 +148,6 @@ mod llm_call {
         pub first_text_at_ms: Option<i64>,
         pub first_valid_response_at_ms: Option<i64>,
         pub finished_at_ms: Option<i64>,
-        pub queue_ms: Option<i64>,
         pub ttfb_ms: Option<i64>,
         pub ttft_ms: Option<i64>,
         pub ttfr_ms: Option<i64>,
@@ -206,6 +205,8 @@ mod cursor_trace {
         pub first_response_at_ms: Option<i64>,
         pub finished_at_ms: Option<i64>,
         pub error_message: Option<String>,
+        /// 附件是否真实存在;清理详细记录后随 cursor_run_trace_artifacts 清空而归零。
+        pub detailed: bool,
     }
 
     #[derive(Clone, Debug)]

@@ -16,8 +16,9 @@ pub enum SubagentKind {
 pub enum RunKind {
     Root,
     Subagent {
-        parent_run_id: RunId,
-        parent_tool_call_id: String,
+        // Parent metadata can be absent for independent resumes or upstream parents.
+        parent_run_id: Option<RunId>,
+        parent_tool_call_id: Option<String>,
         kind: SubagentKind,
         background: bool,
     },
@@ -43,6 +44,7 @@ pub enum RunAction {
 pub struct RecoveredToolRound {
     pub assistant: ToolRoundAssistant,
     pub calls: Vec<ToolCall>,
+    pub completed_messages: Vec<CanonicalMessage>,
     pub started_at_ms: u64,
 }
 
@@ -57,4 +59,7 @@ pub struct PreparedRun {
     pub initial_messages: Vec<CanonicalMessage>,
     pub action: RunAction,
     pub base_checkpoint_id: CheckpointId,
+    /// 后台任务完成通知触发的 follow-up Run。引擎用它识别「初始消息全部
+    /// 已提交」的并发重投:那种 Run 零写入直接完成,不再激活模型。
+    pub background_follow_up: bool,
 }

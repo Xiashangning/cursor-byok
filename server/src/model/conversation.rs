@@ -3,8 +3,6 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::CheckpointId;
-
 macro_rules! string_id {
     ($name:ident) => {
         #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -44,10 +42,3 @@ macro_rules! string_id {
 string_id!(ConversationId);
 string_id!(RunId);
 string_id!(ToolRoundId);
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Conversation {
-    pub conversation_id: ConversationId,
-    pub current_checkpoint_id: CheckpointId,
-    pub active_run_id: Option<RunId>,
-}
