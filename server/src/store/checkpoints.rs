@@ -31,21 +31,6 @@ impl Store {
         Ok(messages)
     }
 
-    pub async fn checkpoint_parent(
-        &self,
-        checkpoint_id: CheckpointId,
-    ) -> Result<Option<CheckpointId>> {
-        let parent = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT parent_checkpoint_id FROM conversation_checkpoints WHERE checkpoint_id = ?",
-        )
-        .bind(checkpoint_id.0)
-        .fetch_optional(&self.pool)
-        .await?
-        .flatten()
-        .map(CheckpointId);
-        Ok(parent)
-    }
-
     pub async fn load_current_messages(
         &self,
         conversation_id: &ConversationId,

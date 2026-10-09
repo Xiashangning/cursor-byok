@@ -43,27 +43,6 @@ impl BufferedLlmChunk {
 }
 
 impl Store {
-    pub async fn detailed_logging(&self) -> Result<bool> {
-        let value: String = sqlx::query_scalar(
-            "SELECT value_json FROM service_settings WHERE setting_key = 'llm_detailed_logging'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(serde_json::from_str(&value)?)
-    }
-
-    pub async fn set_detailed_logging(&self, enabled: bool) -> Result<()> {
-        let _write = self.writes.lock().await;
-        sqlx::query(
-            "INSERT INTO service_settings(setting_key, value_json, updated_at_ms) VALUES ('llm_detailed_logging', ?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
-        )
-        .bind(serde_json::to_string(&enabled)?)
-        .bind(now_ms())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn start_llm_call(&self, call: &NewLlmCall) -> Result<()> {
         let _write = self.writes.lock().await;
         let now = now_ms();
@@ -72,8 +51,8 @@ impl Store {
                 call_id, run_id, conversation_id, provider_call_index, model_hash,
                 provider_type, provider_url, request_type, request_url, model_id, display_name,
                 reasoning_effort, fast, status,
-                created_at_ms, request_started_at_ms, queue_ms, message_count, tool_count, detailed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, 0, ?, ?, ?)"#,
+                created_at_ms, request_started_at_ms, message_count, tool_count, detailed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)"#,
         )
         .bind(&call.call_id)
         .bind(&call.run_id)
@@ -112,20 +91,37 @@ impl Store {
         let _write = self.writes.lock().await;
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if detailed {
-            sqlx::query("INSERT INTO llm_call_requests(call_id, headers_json, body_json, byte_count) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM llm_calls WHERE call_id = ?)")
-                .bind(call_id)
-                .bind(headers_json)
-                .bind(&body_json)
-                .bind(body_json.len() as i64)
-                .bind(call_id)
-                .execute(&mut *transaction)
-                .await?;
-        }
-        sqlx::query("UPDATE llm_calls SET request_bytes = ? WHERE call_id = ?")
+            sqlx::query(
+                "INSERT INTO llm_call_requests(call_id, headers_json, body_json, byte_count)
+                 SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM llm_calls WHERE call_id = ?)
+                 ON CONFLICT(call_id) DO UPDATE SET
+                    headers_json = excluded.headers_json,
+                    body_json = excluded.body_json,
+                    byte_count = excluded.byte_count",
+            )
+            .bind(call_id)
+            .bind(headers_json)
+            .bind(&body_json)
             .bind(body_json.len() as i64)
             .bind(call_id)
             .execute(&mut *transaction)
             .await?;
+            sqlx::query("DELETE FROM llm_call_response_chunks WHERE call_id = ?")
+                .bind(call_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        sqlx::query(
+            "UPDATE llm_calls SET request_bytes = ?, response_headers_at_ms = NULL,
+             first_event_at_ms = NULL, first_text_at_ms = NULL,
+             first_valid_response_at_ms = NULL, ttfb_ms = NULL, ttft_ms = NULL,
+             ttfr_ms = NULL, response_bytes = 0, stream_event_count = 0,
+             http_status = NULL WHERE call_id = ?",
+        )
+        .bind(body_json.len() as i64)
+        .bind(call_id)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -384,7 +380,6 @@ fn summary_from_row(row: sqlx::sqlite::SqliteRow) -> Result<LlmCallSummary> {
         first_text_at_ms: row.try_get("first_text_at_ms")?,
         first_valid_response_at_ms: row.try_get("first_valid_response_at_ms")?,
         finished_at_ms: row.try_get("finished_at_ms")?,
-        queue_ms: row.try_get("queue_ms")?,
         ttfb_ms: row.try_get("ttfb_ms")?,
         ttft_ms: row.try_get("ttft_ms")?,
         ttfr_ms: row.try_get("ttfr_ms")?,
@@ -452,7 +447,13 @@ mod tests {
             .await
             .unwrap();
         let overview = store
-            .overview(None, None, Some(&format!("[\"{plugin_model}\"]")), None)
+            .overview(
+                None,
+                None,
+                Some(&format!("[\"{plugin_model}\"]")),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(overview.metrics.llm_calls, 1);

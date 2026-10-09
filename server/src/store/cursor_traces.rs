@@ -31,35 +31,69 @@ impl Store {
         route: &str,
         model_id: Option<&str>,
     ) -> Result<bool> {
-        if self.cursor_trace_exists(request_id).await? {
+        // 读路径不占写锁:进行中的生命周期与未开启详细日志都不会写库。
+        let status = self.cursor_trace_status(request_id).await?;
+        // 进行中的行属于当前生命周期;已终结的行在 request_id 复用时重置为新生命周期。
+        if status.as_deref() == Some("running") {
             return Ok(true);
         }
         if !self.detailed_logging().await? {
             return Ok(false);
         }
         let _write = self.writes.lock().await;
+        // 锁内复查:并发启动可能已建行。
+        let status = self.cursor_trace_status(request_id).await?;
+        if status.as_deref() == Some("running") {
+            return Ok(true);
+        }
+        if status.is_none() {
+            sqlx::query(
+                "INSERT INTO cursor_run_traces(
+                    request_id, conversation_id, route, model_id, status, received_at_ms
+                 ) VALUES (?, ?, ?, ?, 'running', ?)",
+            )
+            .bind(request_id)
+            .bind(conversation_id)
+            .bind(route)
+            .bind(model_id)
+            .bind(now_ms())
+            .execute(&self.pool)
+            .await?;
+            return Ok(true);
+        }
+        // request_id 复用:旧生命周期的附件随行一起重置,指标从零重新累计;
+        // 失去锚点的 blob 由 prune_unanchored_blobs 回收。
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("DELETE FROM cursor_run_trace_artifacts WHERE request_id = ?")
+            .bind(request_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
-            "INSERT OR IGNORE INTO cursor_run_traces(
-                request_id, conversation_id, route, model_id, status, received_at_ms
-             ) VALUES (?, ?, ?, ?, 'running', ?)",
+            "UPDATE cursor_run_traces
+             SET conversation_id = ?, route = ?, model_id = ?, status = 'running',
+                 request_bytes = 0, response_bytes = 0, response_event_count = 0,
+                 http_status = NULL, received_at_ms = ?, first_response_at_ms = NULL,
+                 finished_at_ms = NULL, error_message = NULL
+             WHERE request_id = ?",
         )
-        .bind(request_id)
         .bind(conversation_id)
         .bind(route)
         .bind(model_id)
         .bind(now_ms())
-        .execute(&self.pool)
+        .bind(request_id)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(true)
     }
 
-    pub async fn cursor_trace_exists(&self, request_id: &str) -> Result<bool> {
-        Ok(sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM cursor_run_traces WHERE request_id = ?)",
+    pub(crate) async fn cursor_trace_status(&self, request_id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT status FROM cursor_run_traces WHERE request_id = ?")
+                .bind(request_id)
+                .fetch_optional(&self.pool)
+                .await?,
         )
-        .bind(request_id)
-        .fetch_one(&self.pool)
-        .await?)
     }
 
     pub async fn append_cursor_trace_request(
@@ -183,10 +217,8 @@ impl Store {
         let _write = self.writes.lock().await;
         sqlx::query(
             "UPDATE cursor_run_traces
-             SET status = 'running', http_status = ?,
-                 first_response_at_ms = COALESCE(first_response_at_ms, ?),
-                 finished_at_ms = NULL, error_message = NULL
-             WHERE request_id = ?",
+             SET http_status = ?, first_response_at_ms = COALESCE(first_response_at_ms, ?)
+             WHERE request_id = ? AND status = 'running'",
         )
         .bind(status as i64)
         .bind(now)
@@ -194,19 +226,6 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    pub async fn add_cursor_trace_response_chunk(
-        &self,
-        request_id: &str,
-        source: &str,
-        data: &[u8],
-    ) -> Result<()> {
-        self.add_cursor_trace_response_chunks(
-            request_id,
-            &[BufferedCursorTraceChunk::new(source, data)],
-        )
-        .await
     }
 
     pub(crate) async fn add_cursor_trace_response_chunks(
@@ -257,7 +276,7 @@ impl Store {
         sqlx::query(
             "UPDATE cursor_run_traces
              SET status = ?, finished_at_ms = ?, error_message = ?
-             WHERE request_id = ?",
+             WHERE request_id = ? AND status = 'running'",
         )
         .bind(if error.is_some() {
             "error"
@@ -273,19 +292,50 @@ impl Store {
     }
 
     pub async fn cursor_trace(&self, request_id: &str) -> Result<Option<CursorRunTraceSummary>> {
-        sqlx::query("SELECT * FROM cursor_run_traces WHERE request_id = ?")
-            .bind(request_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(trace_from_row)
-            .transpose()
+        sqlx::query(
+            "SELECT t.request_id, t.conversation_id, t.route, t.model_id, t.status,
+                    t.request_bytes, t.response_bytes, t.response_event_count, t.http_status,
+                    t.received_at_ms, t.first_response_at_ms, t.finished_at_ms, t.error_message,
+                    EXISTS(
+                        SELECT 1 FROM cursor_run_trace_artifacts a
+                        WHERE a.request_id = t.request_id
+                    ) AS detailed
+             FROM cursor_run_traces t WHERE t.request_id = ?",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(trace_from_row)
+        .transpose()
     }
 
-    pub async fn official_cursor_traces(&self, limit: i64) -> Result<Vec<CursorRunTraceSummary>> {
+    /// Cursor traces that need their own Calls-page row. Official runs have no
+    /// local provider call; a local trace is listed only after it ends without
+    /// ever linking one. While it runs, either its provider call row (or no row
+    /// yet) represents it, so the list never swaps a trace row for a call row.
+    pub(crate) async fn standalone_cursor_traces(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<CursorRunTraceSummary>> {
         let rows = sqlx::query(
-            "SELECT * FROM cursor_run_traces
-             WHERE route = 'cursor_official'
-             ORDER BY received_at_ms DESC LIMIT ?",
+            "SELECT t.request_id, t.conversation_id, t.route, t.model_id, t.status,
+                    t.request_bytes, t.response_bytes, t.response_event_count, t.http_status,
+                    t.received_at_ms, t.first_response_at_ms, t.finished_at_ms, t.error_message,
+                    EXISTS(
+                        SELECT 1 FROM cursor_run_trace_artifacts a
+                        WHERE a.request_id = t.request_id
+                    ) AS detailed
+             FROM cursor_run_traces t
+             WHERE t.route = 'cursor_official'
+                OR (
+                    t.status <> 'running'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM runs r
+                        JOIN llm_calls c ON c.run_id = r.run_id
+                        WHERE r.cursor_request_id = t.request_id
+                    )
+                )
+             ORDER BY t.received_at_ms DESC LIMIT ?",
         )
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
@@ -337,9 +387,67 @@ fn trace_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CursorRunTraceSummary>
         first_response_at_ms: row.try_get("first_response_at_ms")?,
         finished_at_ms: row.try_get("finished_at_ms")?,
         error_message: row.try_get("error_message")?,
+        detailed: row.try_get("detailed")?,
     })
 }
 
 fn as_i64(value: usize) -> i64 {
     value.min(i64::MAX as usize) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reused_request_id_starts_a_new_lifecycle() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store.set_detailed_logging(true).await.unwrap();
+        assert!(store
+            .start_cursor_trace_if_detailed("req-1", Some("conv-1"), "local_byok", Some("model"))
+            .await
+            .unwrap());
+        store
+            .append_cursor_trace_request(
+                "req-1",
+                "bidi_request",
+                "cursor_client",
+                b"payload",
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        store.finish_cursor_trace("req-1", None).await.unwrap();
+        assert!(
+            store.cursor_trace("req-1").await.unwrap().unwrap().detailed,
+            "附件存在时详细记录为真"
+        );
+
+        // Cursor 客户端复用同一 request_id:旧行重置为新生命周期,旧附件与指标清零。
+        assert!(store
+            .start_cursor_trace_if_detailed("req-1", Some("conv-2"), "cursor_official", None)
+            .await
+            .unwrap());
+        let trace = store.cursor_trace("req-1").await.unwrap().unwrap();
+        assert_eq!(trace.status, "running");
+        assert_eq!(trace.conversation_id.as_deref(), Some("conv-2"));
+        assert_eq!(trace.route, "cursor_official");
+        assert_eq!(trace.request_bytes, 0);
+        assert!(trace.finished_at_ms.is_none());
+        assert!(!trace.detailed, "旧附件随行重置后详细记录为假");
+        assert!(store
+            .cursor_trace_artifacts("req-1")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // 新生命周期不再被旧的终结状态卡住,可以正常结束。
+        store
+            .finish_cursor_trace("req-1", Some("boom"))
+            .await
+            .unwrap();
+        let trace = store.cursor_trace("req-1").await.unwrap().unwrap();
+        assert_eq!(trace.status, "error");
+        assert_eq!(trace.error_message.as_deref(), Some("boom"));
+    }
 }

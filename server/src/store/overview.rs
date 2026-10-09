@@ -27,44 +27,40 @@ impl Store {
         end_ms: Option<i64>,
         model_hashes: Option<&str>,
         bucket_ms: Option<i64>,
+        timezone_offset_minutes: Option<i32>,
     ) -> Result<Overview> {
-        let call_row = sqlx::query(
-            "SELECT
-                COUNT(*) AS llm_calls,
-                COALESCE(SUM(status = 'completed'), 0) AS successful_calls,
-                COALESCE(SUM(status != 'completed'), 0) AS failed_calls
-             FROM llm_calls
-             WHERE status != 'running'
-               AND (? IS NULL OR created_at_ms >= ?)
-               AND (? IS NULL OR created_at_ms < ?)
-               AND (? IS NULL OR model_hash IN (SELECT value FROM json_each(?)))",
+        let timezone_offset_ms = i64::from(timezone_offset_minutes.unwrap_or(0)) * MINUTE_MS;
+        let call_filters =
+            llm_call_filters(start_ms, end_ms, model_hashes, Some("status != 'running'"));
+        let call_row = bind_llm_call_filters(
+            sqlx::query(&format!(
+                "SELECT
+                    COUNT(*) AS llm_calls,
+                    COALESCE(SUM(status = 'completed'), 0) AS successful_calls,
+                    COALESCE(SUM(status != 'completed'), 0) AS failed_calls
+                 FROM llm_calls{call_filters}"
+            )),
+            start_ms,
+            end_ms,
+            model_hashes,
         )
-        .bind(start_ms)
-        .bind(start_ms)
-        .bind(end_ms)
-        .bind(end_ms)
-        .bind(model_hashes)
-        .bind(model_hashes)
         .fetch_one(&self.pool)
         .await?;
-        let token_row = sqlx::query(&format!(
-            "SELECT
-                COALESCE(SUM({fresh_input}), 0) AS input_tokens,
-                COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0) AS cache_read_tokens,
-                COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0) AS cache_write_tokens,
-                COALESCE(SUM(COALESCE(output_tokens, 0)), 0) AS output_tokens
-             FROM llm_calls
-             WHERE (? IS NULL OR created_at_ms >= ?)
-               AND (? IS NULL OR created_at_ms < ?)
-               AND (? IS NULL OR model_hash IN (SELECT value FROM json_each(?)))",
-            fresh_input = fresh_input_sql(),
-        ))
-        .bind(start_ms)
-        .bind(start_ms)
-        .bind(end_ms)
-        .bind(end_ms)
-        .bind(model_hashes)
-        .bind(model_hashes)
+        let token_filters = llm_call_filters(start_ms, end_ms, model_hashes, None);
+        let token_row = bind_llm_call_filters(
+            sqlx::query(&format!(
+                "SELECT
+                    COALESCE(SUM({fresh_input}), 0) AS input_tokens,
+                    COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0) AS cache_read_tokens,
+                    COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0) AS cache_write_tokens,
+                    COALESCE(SUM(COALESCE(output_tokens, 0)), 0) AS output_tokens
+                 FROM llm_calls{token_filters}",
+                fresh_input = fresh_input_sql(),
+            )),
+            start_ms,
+            end_ms,
+            model_hashes,
+        )
         .fetch_one(&self.pool)
         .await?;
 
@@ -86,10 +82,13 @@ impl Store {
         };
 
         let (token_usage_granularity, bucket_ms, series_start_ms, bucket_count) =
-            token_usage_buckets(start_ms, end_ms, bucket_ms);
+            token_usage_buckets(start_ms, end_ms, bucket_ms, timezone_offset_ms);
+        let bucket_expression = format!(
+            "((created_at_ms - {timezone_offset_ms}) / {bucket_ms}) * {bucket_ms} + {timezone_offset_ms}"
+        );
         let rows = sqlx::query(&format!(
             "SELECT
-                (created_at_ms / {bucket_ms}) * {bucket_ms} AS bucket_start_ms,
+                {bucket_expression} AS bucket_start_ms,
                 COALESCE(SUM({fresh_input}), 0) AS input_tokens,
                 COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0) AS cache_read_tokens,
                 COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0) AS cache_write_tokens,
@@ -149,6 +148,7 @@ fn token_usage_buckets(
     start_ms: Option<i64>,
     end_ms: Option<i64>,
     requested_bucket_ms: Option<i64>,
+    timezone_offset_ms: i64,
 ) -> (TokenUsageGranularity, i64, i64, i64) {
     if let (Some(start_ms), Some(end_ms)) = (start_ms, end_ms) {
         let duration_ms = end_ms.saturating_sub(start_ms).max(1);
@@ -172,8 +172,11 @@ fn token_usage_buckets(
         } else {
             MAX_RANGE_BUCKETS
         };
-        let last_bucket_ms = end_ms.saturating_sub(1).div_euclid(bucket_ms) * bucket_ms;
-        let first_bucket_ms = start_ms.div_euclid(bucket_ms) * bucket_ms;
+        let last_bucket_ms = (end_ms.saturating_sub(1) - timezone_offset_ms).div_euclid(bucket_ms)
+            * bucket_ms
+            + timezone_offset_ms;
+        let first_bucket_ms =
+            (start_ms - timezone_offset_ms).div_euclid(bucket_ms) * bucket_ms + timezone_offset_ms;
         let bucket_count =
             ((last_bucket_ms - first_bucket_ms).div_euclid(bucket_ms) + 1).clamp(1, max_buckets);
         let series_start_ms =
@@ -181,11 +184,9 @@ fn token_usage_buckets(
         return (granularity, bucket_ms, series_start_ms, bucket_count);
     }
 
-    let today_start_ms = Utc::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .map(|value| value.and_utc().timestamp_millis())
-        .unwrap_or(0);
+    let now_ms = Utc::now().timestamp_millis();
+    let today_start_ms =
+        (now_ms - timezone_offset_ms).div_euclid(DAY_MS) * DAY_MS + timezone_offset_ms;
     let series_start_ms = today_start_ms.saturating_sub(
         i64::try_from(OVERVIEW_DAYS - 1)
             .unwrap_or(0)
@@ -208,6 +209,55 @@ fn fresh_input_sql() -> &'static str {
      END"
 }
 
+/// Builds a WHERE clause from the optional filters. A provided time range binds
+/// directly against `created_at_ms` so SQLite can use the `llm_calls_created`
+/// index, unlike a `(? IS NULL OR created_at_ms >= ?)` predicate that forces a
+/// full table scan. Bind order matches `bind_llm_call_filters`.
+fn llm_call_filters(
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    model_hashes: Option<&str>,
+    base: Option<&str>,
+) -> String {
+    let mut clauses: Vec<&str> = base.into_iter().collect();
+    if start_ms.is_some() {
+        clauses.push("created_at_ms >= ?");
+    }
+    if end_ms.is_some() {
+        clauses.push("created_at_ms < ?");
+    }
+    if model_hashes.is_some() {
+        clauses.push("model_hash IN (SELECT value FROM json_each(?))");
+    }
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    }
+}
+
+type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+
+fn bind_llm_call_filters<'q>(
+    query: SqliteQuery<'q>,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    model_hashes: Option<&'q str>,
+) -> SqliteQuery<'q> {
+    let query = match start_ms {
+        Some(start_ms) => query.bind(start_ms),
+        None => query,
+    };
+    let query = match end_ms {
+        Some(end_ms) => query.bind(end_ms),
+        None => query,
+    };
+    match model_hashes {
+        Some(model_hashes) => query.bind(model_hashes),
+        None => query,
+    }
+}
+
 fn non_negative(value: i64) -> i64 {
     value.max(0)
 }
@@ -224,30 +274,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_hour_range_uses_sixty_minute_buckets() {
+    fn token_usage_buckets_cover_ranges_boundaries_and_caps() {
         let start_ms = 1_800_000_000_000;
-        let (granularity, bucket_ms, series_start_ms, bucket_count) =
-            token_usage_buckets(Some(start_ms), Some(start_ms + HOUR_MS), None);
+        let cases = [
+            (
+                "one hour",
+                Some(start_ms),
+                Some(start_ms + HOUR_MS),
+                None,
+                (TokenUsageGranularity::Minute, MINUTE_MS, start_ms, 60),
+            ),
+            (
+                "minute boundary",
+                Some(start_ms + MINUTE_MS - 1_000),
+                Some(start_ms + MINUTE_MS + 1_000),
+                None,
+                (TokenUsageGranularity::Minute, MINUTE_MS, start_ms, 2),
+            ),
+            (
+                "explicit fifteen-minute day",
+                Some(start_ms),
+                Some(start_ms + DAY_MS),
+                Some(15 * MINUTE_MS),
+                (TokenUsageGranularity::Minute, 15 * MINUTE_MS, start_ms, 96),
+            ),
+            (
+                "explicit thirty-minute day",
+                Some(start_ms),
+                Some(start_ms + DAY_MS),
+                Some(30 * MINUTE_MS),
+                (TokenUsageGranularity::Minute, 30 * MINUTE_MS, start_ms, 48),
+            ),
+            (
+                "explicit hourly month",
+                Some(start_ms),
+                Some(start_ms + 30 * DAY_MS),
+                Some(HOUR_MS),
+                (TokenUsageGranularity::Hour, HOUR_MS, start_ms, 720),
+            ),
+            (
+                "explicit minute cap",
+                Some(start_ms),
+                Some(start_ms + 7 * DAY_MS),
+                Some(MINUTE_MS),
+                (
+                    TokenUsageGranularity::Minute,
+                    MINUTE_MS,
+                    start_ms + 7 * DAY_MS - MAX_EXPLICIT_BUCKETS * MINUTE_MS,
+                    MAX_EXPLICIT_BUCKETS,
+                ),
+            ),
+        ];
 
-        assert_eq!(granularity, TokenUsageGranularity::Minute);
-        assert_eq!(bucket_ms, MINUTE_MS);
-        assert_eq!(series_start_ms, start_ms);
-        assert_eq!(bucket_count, 60);
+        for (name, start, end, explicit_bucket_ms, expected) in cases {
+            let actual = token_usage_buckets(start, end, explicit_bucket_ms, 0);
+            assert_eq!(actual, expected, "case: {name}");
+        }
     }
 
     #[test]
-    fn short_range_crossing_a_minute_boundary_uses_two_buckets() {
-        let minute_start_ms = 1_800_000_000_000;
-        let (granularity, bucket_ms, series_start_ms, bucket_count) = token_usage_buckets(
-            Some(minute_start_ms + MINUTE_MS - 1_000),
-            Some(minute_start_ms + MINUTE_MS + 1_000),
-            None,
+    fn token_usage_buckets_align_to_requested_timezone() {
+        let start_ms = 1_800_000_000_000;
+        let timezone_offset_ms = -8 * HOUR_MS;
+        let (_, bucket_ms, series_start_ms, bucket_count) = token_usage_buckets(
+            Some(start_ms),
+            Some(start_ms + DAY_MS),
+            Some(DAY_MS),
+            timezone_offset_ms,
         );
 
-        assert_eq!(granularity, TokenUsageGranularity::Minute);
-        assert_eq!(bucket_ms, MINUTE_MS);
-        assert_eq!(series_start_ms, minute_start_ms);
+        assert_eq!(bucket_ms, DAY_MS);
         assert_eq!(bucket_count, 2);
+        assert_eq!(
+            series_start_ms,
+            (start_ms - timezone_offset_ms).div_euclid(DAY_MS) * DAY_MS + timezone_offset_ms
+        );
     }
 
     #[tokio::test]
@@ -275,7 +376,7 @@ mod tests {
         )
         .await;
 
-        let overview = store.overview(None, None, None, None).await.unwrap();
+        let overview = store.overview(None, None, None, None, None).await.unwrap();
         assert_eq!(overview.metrics.llm_calls, 3);
         assert_eq!(overview.metrics.successful_calls, 2);
         assert_eq!(overview.metrics.failed_calls, 1);
@@ -316,7 +417,7 @@ mod tests {
         .await;
 
         let overview = store
-            .overview(Some(now - 1_000), Some(now + 1_000), None, None)
+            .overview(Some(now - 1_000), Some(now + 1_000), None, None, None)
             .await
             .unwrap();
 
@@ -338,12 +439,70 @@ mod tests {
                 Some(now + 1_000),
                 Some(r#"["missing-model"]"#),
                 None,
+                None,
             )
             .await
             .unwrap();
         assert_eq!(filtered.metrics.llm_calls, 0);
         assert_eq!(filtered.metrics.token_usage, 0);
         assert_eq!(filtered.token_usage_series[0].total_tokens(), 0);
+    }
+
+    #[tokio::test]
+    async fn overview_honors_explicit_bucket_ms_within_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("bucketed-overview.db").display()
+        ))
+        .await
+        .unwrap();
+        let base_ms = 1_800_000_000_000;
+        insert_call(
+            &store,
+            "before",
+            "anthropic",
+            base_ms - HOUR_MS,
+            [500, 0, 0, 0],
+        )
+        .await;
+        insert_call(
+            &store,
+            "first",
+            "anthropic",
+            base_ms + MINUTE_MS,
+            [10, 0, 0, 0],
+        )
+        .await;
+        insert_call(
+            &store,
+            "second",
+            "anthropic",
+            base_ms + 20 * MINUTE_MS,
+            [30, 0, 0, 0],
+        )
+        .await;
+
+        let overview = store
+            .overview(
+                Some(base_ms),
+                Some(base_ms + HOUR_MS),
+                None,
+                Some(15 * MINUTE_MS),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(overview.metrics.llm_calls, 2);
+        assert_eq!(
+            overview.token_usage_granularity,
+            TokenUsageGranularity::Minute
+        );
+        assert_eq!(overview.token_usage_series.len(), 4);
+        assert_eq!(overview.token_usage_series[0].input_tokens, 10);
+        assert_eq!(overview.token_usage_series[1].input_tokens, 30);
+        assert_eq!(overview.token_usage_series[2].total_tokens(), 0);
     }
 
     async fn insert_call(

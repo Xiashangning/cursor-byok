@@ -2,7 +2,7 @@
 use sqlx::Row;
 
 use crate::{
-    model::{CheckpointId, ConversationId, PreparedRun, RunId, RunKind, Usage},
+    model::{CheckpointId, ConversationId, PreparedRun, RunId, RunKind},
     Error, Result,
 };
 
@@ -32,10 +32,32 @@ pub struct ClaimedRun {
     pub run_id: RunId,
     pub conversation_id: ConversationId,
     pub head_checkpoint_id: CheckpointId,
-    pub replaced_run_id: Option<RunId>,
 }
 
 impl Store {
+    /// Resolve the run that dispatched this call, including finished runs. A Cursor
+    /// request may own multiple runs; its latest run need not own the parent call.
+    pub(crate) async fn parent_tool_call_run(
+        &self,
+        request_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Option<(RunId, serde_json::Value)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT r.run_id, c.arguments_json
+             FROM runs r
+             JOIN tool_rounds t ON t.run_id = r.run_id
+             JOIN tool_round_calls c ON c.round_id = t.round_id
+             WHERE r.cursor_request_id = ? AND c.call_id = ?
+             ORDER BY t.created_at_ms DESC, t.rowid DESC LIMIT 1",
+        )
+        .bind(request_id)
+        .bind(tool_call_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(run_id, arguments)| Ok((RunId::new(run_id), serde_json::from_str(&arguments)?)))
+            .transpose()
+    }
+
     pub async fn claim_run(&self, prepared: &PreparedRun) -> Result<ClaimedRun> {
         let _write = self.writes.lock().await;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -125,10 +147,17 @@ impl Store {
             run_id: prepared.run_id.clone(),
             conversation_id: prepared.conversation_id.clone(),
             head_checkpoint_id: prepared.base_checkpoint_id,
-            replaced_run_id: replaced
-                .filter(|run| run != prepared.run_id.as_str())
-                .map(RunId),
         })
+    }
+
+    /// 一次本地 Run 关联的 Cursor request id;追踪与 provider 调用靠它关联。
+    pub(crate) async fn run_cursor_request_id(&self, run_id: &str) -> Result<Option<String>> {
+        let request_id: Option<Option<String>> =
+            sqlx::query_scalar("SELECT cursor_request_id FROM runs WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(request_id.flatten())
     }
 
     pub async fn active_run_for_cursor_request(
@@ -167,10 +196,8 @@ impl Store {
         &self,
         run_id: &RunId,
         status: RunStatus,
-        usage: Option<Usage>,
         failure: Option<(&str, &str)>,
     ) -> Result<bool> {
-        let usage_json = serde_json::to_string(&usage)?;
         let _write = self.writes.lock().await;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
@@ -200,12 +227,11 @@ impl Store {
         };
         let now = now_ms();
         sqlx::query(
-            "UPDATE runs SET status = ?, turn_usage_json = ?, failure_category = ?,
+            "UPDATE runs SET status = ?, failure_category = ?,
              failure_summary = ?, updated_at_ms = ?
              WHERE run_id = ? AND status = 'running'",
         )
         .bind(status.as_str())
-        .bind(usage_json)
         .bind(category)
         .bind(summary)
         .bind(now)
@@ -264,8 +290,8 @@ fn run_kind_columns(kind: &RunKind) -> (Option<&str>, Option<&str>, &'static str
             kind,
             ..
         } => (
-            Some(parent_run_id.as_str()),
-            Some(parent_tool_call_id.as_str()),
+            parent_run_id.as_ref().map(RunId::as_str),
+            parent_tool_call_id.as_deref(),
             "subagent",
             Some(match kind {
                 crate::model::SubagentKind::GeneralPurpose => "generalPurpose".into(),

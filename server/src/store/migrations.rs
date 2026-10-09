@@ -382,7 +382,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalized_checksums_match_the_published_lf_and_windows_crlf_migrations() {
+    fn normalized_checksums_match_the_lf_and_windows_crlf_migration() {
         let lf = migrator_with_line_endings(MigrationLineEndings::Lf);
         let crlf = migrator_with_line_endings(MigrationLineEndings::Crlf);
         let lf_initial = lf.iter().find(|migration| migration.version == 1).unwrap();
@@ -393,28 +393,26 @@ mod tests {
 
         assert_eq!(
             hex::encode(lf_initial.checksum.as_ref()),
-            "ddf1bc573e460bfd93ea50b60d003e8fc6bb9a1b32de71139cb0fc0d898e88c401c08c8a8b57abbe68f55927e7f004d9"
+            "29d622d6dbfee30358e1d0469bc28529ab8167ec4ea7f74cc933fb7ab5a9e1510358f7f96df3ec4e79438f74ad77c747"
         );
         assert_eq!(
             hex::encode(crlf_initial.checksum.as_ref()),
-            "7c5995693dbd5f9d50880fc874784cb67c499762abcee4a562b54c9afd8239bae125074696b78f90aca0fc136b802a2b"
+            "12e32fddc0417ea11393284580386997e805491e9a1807ddfb363f469d886326799509afdd7d44b806bf669238a97724"
         );
     }
 
     #[tokio::test]
-    async fn lf_and_crlf_migration_histories_upgrade_without_rewriting_checksums() {
+    async fn lf_and_crlf_migration_histories_validate_without_rewriting_checksums() {
         for line_endings in [MigrationLineEndings::Lf, MigrationLineEndings::Crlf] {
             let pool = SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
                 .unwrap();
-            let historical = migrator_with_line_endings(line_endings);
-            let first_four = Migrator {
-                migrations: Cow::Owned(historical.iter().take(4).cloned().collect()),
-                ..Migrator::DEFAULT
-            };
-            first_four.run(&pool).await.unwrap();
+            migrator_with_line_endings(line_endings)
+                .run(&pool)
+                .await
+                .unwrap();
             let checksum_before: Vec<u8> =
                 sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
                     .fetch_one(&pool)
@@ -457,7 +455,16 @@ mod tests {
             let consumed_completion_table_exists: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM sqlite_master
-                    WHERE type = 'table' AND name = 'consumed_background_completions'
+                    WHERE type = 'table' AND name = 'background_consumed'
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let model_selection_column_exists: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('conversations')
+                    WHERE name = 'model_selection'
                  )",
             )
             .fetch_one(&pool)
@@ -465,26 +472,18 @@ mod tests {
             .unwrap();
 
             assert_eq!(checksum_after, checksum_before);
-            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            assert_eq!(versions, vec![1]);
             assert_eq!(checkpoint_table_exists, 1);
             assert_eq!(argument_error_column_exists, 1);
             assert_eq!(consumed_completion_table_exists, 1);
+            assert_eq!(model_selection_column_exists, 1);
         }
-    }
-
-    #[test]
-    fn sqlite_sidecar_paths_preserve_the_database_path() {
-        let database = Path::new(r"C:\Users\Test User\cursor-byok.db");
-        assert_eq!(
-            sidecar_path(database, "-wal"),
-            PathBuf::from(r"C:\Users\Test User\cursor-byok.db-wal")
-        );
     }
 
     #[tokio::test]
     async fn stalled_migration_stage_returns_a_timeout_error() {
         let result = run_stage_with_limits(
-            "0007 rename revisions to checkpoints",
+            "0001 initial",
             Duration::from_millis(2),
             Duration::from_millis(10),
             std::future::pending(),
@@ -494,7 +493,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(Error::MigrationTimeout { stage, .. })
-                if stage == "0007 rename revisions to checkpoints"
+                if stage == "0001 initial"
         ));
     }
 }

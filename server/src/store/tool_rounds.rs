@@ -19,14 +19,9 @@ pub enum ToolRoundStatus {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolRoundSnapshot {
-    pub round_id: ToolRoundId,
-    pub run_id: RunId,
-    pub base_checkpoint_id: CheckpointId,
     pub assistant: ToolRoundAssistant,
     pub calls: Vec<ToolCall>,
-    pub completed_call_ids: Vec<String>,
     pub status: ToolRoundStatus,
-    pub version: u64,
     pub created_at_ms: u64,
 }
 
@@ -219,14 +214,11 @@ impl Store {
 
         sqlx::query(
             "UPDATE tool_round_calls SET status = 'completed', completion_seq = ?,
-             result_content = ?, result_is_error = ?, committed_checkpoint_id = ?, completed_at_ms = ?
+             committed_checkpoint_id = ?
              WHERE round_id = ? AND call_id = ? AND status = 'pending'",
         )
         .bind(completion_seq)
-        .bind(&result.content)
-        .bind(result.is_error)
         .bind(checkpoint.0)
-        .bind(now_ms())
         .bind(round_id.as_str())
         .bind(&result.call_id)
         .execute(&mut *tx)
@@ -260,7 +252,7 @@ impl Store {
 
     pub async fn tool_round(&self, round_id: &ToolRoundId) -> Result<Option<ToolRoundSnapshot>> {
         let Some(round) = sqlx::query(
-            "SELECT run_id, base_checkpoint_id, assistant_json, status, version, created_at_ms
+            "SELECT assistant_json, status, created_at_ms
              FROM tool_rounds WHERE round_id = ?",
         )
         .bind(round_id.as_str())
@@ -270,23 +262,18 @@ impl Store {
             return Ok(None);
         };
         let rows = sqlx::query(
-            "SELECT call_index, call_id, model_call_id, name, arguments_json, argument_error, status
+            "SELECT call_index, call_id, model_call_id, name, arguments_json, argument_error
              FROM tool_round_calls WHERE round_id = ? ORDER BY call_index",
         )
         .bind(round_id.as_str())
         .fetch_all(&self.pool)
         .await?;
         let mut calls = Vec::with_capacity(rows.len());
-        let mut completed = Vec::new();
         for row in rows {
             let arguments_text: String = row.get(4);
-            let call_id: String = row.get(1);
-            if row.get::<&str, _>(6) == "completed" {
-                completed.push(call_id.clone());
-            }
             calls.push(ToolCall {
                 index: row.get::<i64, _>(0) as usize,
-                call_id,
+                call_id: row.get(1),
                 model_call_id: row.get(2),
                 name: row.get(3),
                 arguments: serde_json::from_str(&arguments_text)?,
@@ -295,19 +282,14 @@ impl Store {
             });
         }
         Ok(Some(ToolRoundSnapshot {
-            round_id: round_id.clone(),
-            run_id: RunId(round.get(0)),
-            base_checkpoint_id: CheckpointId(round.get(1)),
-            assistant: serde_json::from_str(round.get(2))?,
+            assistant: serde_json::from_str(round.get(0))?,
             calls,
-            completed_call_ids: completed,
-            status: if round.get::<&str, _>(3) == "settled" {
+            status: if round.get::<&str, _>(1) == "settled" {
                 ToolRoundStatus::Settled
             } else {
                 ToolRoundStatus::Pending
             },
-            version: round.get::<i64, _>(4) as u64,
-            created_at_ms: round.get::<i64, _>(5) as u64,
+            created_at_ms: round.get::<i64, _>(2) as u64,
         }))
     }
 }
