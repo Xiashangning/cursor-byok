@@ -1,35 +1,13 @@
-claude-server.tar
+# macOS
 .DS_Store
-dist
-.task
-/local-docs/
-/bin/
-logs/
-cursor-server.db
-cursor-server.db-shm
-cursor-server.db-wal
-gen/
-logs.zip
-frontend/bindings
-dist
+
+# Dependency and build output
 node_modules
+dist
 *.tsbuildinfo
-cursor-server.tar
-/target/
-/server/target/
-/apps/desktop/src-tauri/gen/
+target/
+
+# Local secrets and generated bindings
 /.tauri/
-/server/*.db
-/server/*.db-shm
-/server/*.db-wal
-server-node/cursor.tar
-server-go/cursor.tar
-server-go/log/
-.cursor-local-assistant
-.cursor-local-assistant-v2
-.cursor-app-formatted/
-proto/extensions-cursor-app/
-cursor-tab-server/cursor-tab-server-linux-amd64.tar
-/scripts/cursor-proto/proto/*
-!/scripts/cursor-proto/proto/agent_v1.proto
-!/scripts/cursor-proto/proto/aiserver_v1.proto
+/apps/desktop/src-tauri/gen/
+/support/cursor-protocol-extractor/gen/

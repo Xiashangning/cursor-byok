@@ -6,14 +6,16 @@ COPY apps/desktop/package.json apps/desktop/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci
 COPY apps/desktop/index.html apps/desktop/tsconfig.json apps/desktop/tsconfig.node.json apps/desktop/vite.config.ts ./
 COPY apps/desktop/plugins/ plugins/
-COPY apps/desktop/public/ public/
 COPY apps/desktop/src/ src/
+COPY apps/desktop/src-tauri/icons/ src-tauri/icons/
 RUN npm run build
 
 FROM rust:1-bookworm AS server
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY server/ server/
+COPY crates/ crates/
+COPY support/benchmarks/semble/ support/benchmarks/semble/
 COPY apps/desktop/src-tauri/Cargo.toml apps/desktop/src-tauri/Cargo.toml
 COPY apps/desktop/src-tauri/build.rs apps/desktop/src-tauri/build.rs
 COPY apps/desktop/src-tauri/src/ apps/desktop/src-tauri/src/
@@ -38,6 +40,8 @@ RUN apt-get update && \
 COPY --from=server /tmp/cursor-server /usr/local/bin/cursor-server
 COPY --from=web /src/apps/desktop/dist/ /app/console/
 
+# 控制 API 对非回环来源要求 Bearer 访问令牌:首次启动自动生成、打印到日志并
+# 持久化到数据目录(设置页可查看/重新生成);生产部署建议用 CURSOR_ACCESS_TOKEN 固定。
 ENV CURSOR_LISTEN_ADDR=0.0.0.0:3000 \
     CURSOR_DATABASE_URL=sqlite:///data/cursor-server.db \
     CURSOR_CONSOLE_DIR=/app/console \
