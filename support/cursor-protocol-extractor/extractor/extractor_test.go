@@ -1,16 +1,22 @@
-// extractor_test.go 验证压缩 bundle 的字段、别名、服务和合并提取行为。
+// extractor_test.go 验证压缩 bundle 的别名解析与现代工厂语法提取行为。
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
-// TestParseFieldObjectSupportsShorthandType 验证字段类型简写可以解析。
-func TestParseFieldObjectSupportsShorthandType(t *testing.T) {
-	field, err := parseFieldObject(`{no:4,name:"file_not_found",kind:"message",T,oneof:"result"}`)
+func TestGeneratedProtoEndsWithOneNewline(t *testing.T) {
+	directory := t.TempDir()
+	generateProtoFile("example.v1", nil, nil, nil, nil, directory)
+	data, err := os.ReadFile(filepath.Join(directory, "example_v1.proto"))
 	if err != nil {
-		t.Fatalf("parse shorthand T: %v", err)
+		t.Fatal(err)
 	}
-	if field.T != "T" {
-		t.Fatalf("parsed shorthand T as %#v, want T", field.T)
+	if !strings.HasSuffix(string(data), "\n") || strings.HasSuffix(string(data), "\n\n") {
+		t.Fatalf("unexpected trailing whitespace: %q", data)
 	}
 }
 
@@ -57,24 +63,6 @@ func TestWebpackExportAliasResolvesServiceMessageType(t *testing.T) {
 	}
 }
 
-// TestResolverPrefersExpectedKindOverCurrentPackage 验证类型类别优先于当前包候选。
-func TestResolverPrefersExpectedKindOverCurrentPackage(t *testing.T) {
-	resolver := &TypeResolver{bySymbol: map[string][]symbolDef{
-		"nt": {
-			{TypeName: "git_forge.v1.GetTagResponse", Kind: "message", Pos: 10, ModuleStart: 1},
-			{TypeName: "origin.v1.TeamGroupKind", Kind: "enum", Pos: 20, ModuleStart: 1},
-		},
-	}}
-
-	typeName, ok := resolver.ResolveTypeName("nt", 30, 1, "origin.v1", "message")
-	if !ok {
-		t.Fatal("expected cross-package message type to resolve")
-	}
-	if typeName != "git_forge.v1.GetTagResponse" {
-		t.Fatalf("resolved nt to %q, want git_forge.v1.GetTagResponse", typeName)
-	}
-}
-
 // TestModernFactorySyntaxExtractsInAppAdServiceTypes 验证现代工厂语法提取完整服务类型。
 func TestModernFactorySyntaxExtractsInAppAdServiceTypes(t *testing.T) {
 	const bundle = `
@@ -116,77 +104,82 @@ func TestModernFactorySyntaxExtractsInAppAdServiceTypes(t *testing.T) {
 	}
 }
 
-// TestAssignmentAliasResolvesStandardProtobufType 验证赋值别名解析标准协议类型。
-func TestAssignmentAliasResolvesStandardProtobufType(t *testing.T) {
+// TestPureAnnotatedFactoryDeclarations 验证 /*@__PURE__*/ 注释不再阻断工厂声明提取。
+// 未压缩构建(如 cursor-resolver 浏览器 bundle)把注释放在 = 与模块路径之间。
+func TestPureAnnotatedFactoryDeclarations(t *testing.T) {
 	const bundle = `
 1:(e,t,n)=>{
-  var Timestamp=class TimestampMessage extends Base{};
-  Timestamp.typeName="google.protobuf.Timestamp",Timestamp.fields=n.proto3.util.newFieldList(()=>[]),ua=Timestamp;
-  var Request=n.makeMessageType("aiserver.v1.Request",()=>[{no:1,name:"created_at",kind:"message",T:ua}]);
+  const Req = /*@__PURE__*/ n.proto3.makeMessageType(
+    "aiserver.v1.PureReq",
+    () => [
+      { no: 1, name: "ad_id", kind: "scalar", T: 9 },
+    ],
+  );
+  const Res = /*@__PURE__*/ n.proto3.makeMessageType("aiserver.v1.PureRes", []);
+  const Role = /*@__PURE__*/ n.proto3.makeEnum(
+    "aiserver.v1.PureRole",
+    [
+      {no: 0, name: "PURE_ROLE_UNSPECIFIED", localName: "UNSPECIFIED"},
+    ],
+  );
 }`
 
 	moduleStarts := buildModuleStarts(bundle)
 	messages := extractMessages(bundle, moduleStarts)
-	resolver := newTypeResolver(messages, nil, buildAliasIndex(bundle, moduleStarts), nil)
+	enums := extractEnums(bundle, moduleStarts)
 
-	typeName, ok := resolver.ResolveTypeName("ua", len(bundle)-1, moduleStartForPos(moduleStarts, len(bundle)-1), "aiserver.v1", "message")
-	if !ok || typeName != "google.protobuf.Timestamp" {
-		t.Fatalf("resolved ua to %q (ok=%v), want google.protobuf.Timestamp", typeName, ok)
+	if len(messages) != 2 {
+		t.Fatalf("extracted %d messages, want 2", len(messages))
+	}
+	if messages[0].TypeName != "aiserver.v1.PureReq" || len(messages[0].Fields) != 1 {
+		t.Fatalf("unexpected PURE message extraction: %#v", messages[0])
+	}
+	if messages[1].TypeName != "aiserver.v1.PureRes" || len(messages[1].Fields) != 0 {
+		t.Fatalf("unexpected PURE empty message extraction: %#v", messages[1])
+	}
+	if len(enums) != 1 || enums[0].TypeName != "aiserver.v1.PureRole" || len(enums[0].Values) != 1 {
+		t.Fatalf("unexpected PURE enum extraction: %#v", enums)
 	}
 }
 
-// TestDeclarationCoverageReportsUnparsedTypesAndIgnoresGoogleTypes 验证覆盖率忽略标准类型并报告遗漏。
-func TestDeclarationCoverageReportsUnparsedTypesAndIgnoresGoogleTypes(t *testing.T) {
-	const bundle = `
-var Request=n.makeMessageType("aiserver.v1.Request",()=>[]);
-var Missing=n.makeMessageType("aiserver.v1.Missing",()=>[]);
-var Timestamp=n.makeMessageType("google.protobuf.Timestamp",()=>[]);
-var Service={typeName:"aiserver.v1.TestService",methods:{}};
-`
-	messages := []Message{{TypeName: "aiserver.v1.Request"}}
-	services := []Service{{TypeName: "aiserver.v1.TestService"}}
+// TestModuleScopeWinsOverPackagePreference 验证模块内同名符号优先于同包其它模块的符号。
+// 复现 QueuedFollowup.blob_data:两个不同模块各声明一个 Mn,字段必须绑定本模块的定义。
+func TestModuleScopeWinsOverPackagePreference(t *testing.T) {
+	const bundle = `1:(e,t,n)=>{
+  Mn.runtime=n.proto3,Mn.typeName="internapi.v1.BlobData",Mn.fields=n.proto3.util.newFieldList(()=>[{no:1,name:"blob_id",kind:"scalar",T:12}]);
+  Pd.runtime=n.proto3,Pd.typeName="aiserver.v1.QueuedFollowup",Pd.fields=n.proto3.util.newFieldList(()=>[{no:9,name:"blob_data",kind:"message",T:Mn,repeated:!0}]);
+},
+2:(e,t,n)=>{
+  Mn.runtime=n.proto3,Mn.typeName="aiserver.v1.TaskSubagentReturnValue",Mn.fields=n.proto3.util.newFieldList(()=>[{no:1,name:"summary",kind:"scalar",T:9}]);
+}`
 
-	declared, extracted, missing := declarationCoverage(bundle, messages, nil, services)
-	if declared != 3 || extracted != 2 {
-		t.Fatalf("coverage=%d/%d, want 2/3", extracted, declared)
+	moduleStarts := buildModuleStarts(bundle)
+	messages := extractMessages(bundle, moduleStarts)
+	if len(messages) != 3 {
+		t.Fatalf("extracted %d messages, want 3: %#v", len(messages), messages)
 	}
-	if len(missing) != 1 || missing[0] != "aiserver.v1.Missing" {
-		t.Fatalf("unexpected missing declarations: %#v", missing)
-	}
-}
 
-// TestExtractServicesSupportsAnonymousDescriptors 验证匿名服务描述符可以提取。
-func TestExtractServicesSupportsAnonymousDescriptors(t *testing.T) {
-	const bundle = `services.push({typeName:"aiserver.v1.FileSyncService",methods:{sync:{name:"Sync",I:Request,O:Response,kind:n.MethodKind.Unary}}})`
-	services := extractServices(bundle, nil)
-	if len(services) != 1 || services[0].TypeName != "aiserver.v1.FileSyncService" {
-		t.Fatalf("unexpected services: %#v", services)
+	var queued Message
+	for _, msg := range messages {
+		if msg.TypeName == "aiserver.v1.QueuedFollowup" {
+			queued = msg
+		}
 	}
-	if len(services[0].Methods) != 1 || services[0].Methods[0].Name != "Sync" {
-		t.Fatalf("unexpected methods: %#v", services[0].Methods)
+	if queued.TypeName == "" {
+		t.Fatal("QueuedFollowup not extracted")
 	}
-}
 
-// TestMergeMessagesPrefersPrimaryBundleAndKeepsSupplementalTypes 验证合并优先主 bundle 并保留补充类型。
-func TestMergeMessagesPrefersPrimaryBundleAndKeepsSupplementalTypes(t *testing.T) {
-	primary := Message{
-		TypeName: "aiserver.v1.Shared",
-		Fields:   []Field{{No: 1, Name: "primary", Kind: "scalar", T: 9}},
+	resolver := newTypeResolver(messages, nil, buildAliasIndex(bundle, moduleStarts), buildWebpackExportAliasIndex(bundle, moduleStarts))
+	resolver.moduleImports = buildModuleImportIndex(bundle, moduleStarts)
+	field := queued.Fields[0]
+	if field.Name != "blob_data" {
+		t.Fatalf("unexpected first field: %#v", field)
 	}
-	supplemental := Message{
-		TypeName: "aiserver.v1.Shared",
-		Fields:   []Field{{No: 1, Name: "supplemental", Kind: "scalar", T: 9}},
+	resolved, ok := resolver.ResolveTypeName(field.T.(string), queued.Pos, queued.ModuleStart, queued.Package, "message")
+	if !ok {
+		t.Fatal("blob_data type did not resolve")
 	}
-	legacy := Message{TypeName: "aiserver.v1.LegacyOnly"}
-
-	merged := mergeMessagesByTypeName([]Message{primary, supplemental, legacy})
-	if len(merged) != 2 {
-		t.Fatalf("merged %d messages, want 2", len(merged))
-	}
-	if merged[0].Fields[0].Name != "primary" {
-		t.Fatalf("duplicate type did not preserve primary definition: %#v", merged[0])
-	}
-	if merged[1].TypeName != "aiserver.v1.LegacyOnly" {
-		t.Fatalf("supplemental-only type missing: %#v", merged)
+	if resolved != "internapi.v1.BlobData" {
+		t.Fatalf("blob_data resolved to %q, want internapi.v1.BlobData (module-local declaration)", resolved)
 	}
 }

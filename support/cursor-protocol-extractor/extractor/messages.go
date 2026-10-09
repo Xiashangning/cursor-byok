@@ -113,7 +113,8 @@ func extractMessages(text string, moduleStarts []int) []Message {
 
 	// 形式三：匹配现代 @bufbuild/protobuf 工厂调用。
 	// 例如 Req=A.makeMessageType("aiserver.v1.HasSeenAdRequest",()=>[{...}])。
-	messageFactoryRe := regexp.MustCompile(`([\w$]+)\s*=\s*[\w$.]+\.makeMessageType\s*\(\s*["']([\w.]+)["']\s*,\s*\(\s*\)\s*=>\s*\[`)
+	// 未压缩构建会在 = 与模块路径之间插入 /*@__PURE__*/ 注释,必须容忍。
+	messageFactoryRe := regexp.MustCompile(`([\w$]+)\s*=\s*` + pureAnnotation + `[\w$.]+\.makeMessageType\s*\(\s*["']([\w.]+)["']\s*,\s*\(\s*\)\s*=>\s*\[`)
 	factoryMatches := messageFactoryRe.FindAllStringSubmatchIndex(text, -1)
 	for _, m := range factoryMatches {
 		varName := text[m[2]:m[3]]
@@ -141,7 +142,7 @@ func extractMessages(text string, moduleStarts []int) []Message {
 
 	// 空消息直接传字段数组，不使用延迟回调。
 	// 例如 Res=A.makeMessageType("aiserver.v1.MarkAdAsSeenResponse",[])。
-	emptyMessageFactoryRe := regexp.MustCompile(`([\w$]+)\s*=\s*[\w$.]+\.makeMessageType\s*\(\s*["']([\w.]+)["']\s*,\s*\[`)
+	emptyMessageFactoryRe := regexp.MustCompile(`([\w$]+)\s*=\s*` + pureAnnotation + `[\w$.]+\.makeMessageType\s*\(\s*["']([\w.]+)["']\s*,\s*\[`)
 	emptyFactoryMatches := emptyMessageFactoryRe.FindAllStringSubmatchIndex(text, -1)
 	for _, m := range emptyFactoryMatches {
 		varName := text[m[2]:m[3]]

@@ -104,6 +104,10 @@ func SetStrictMode(enabled bool) {
 // activeDiagnostics 指向当前提取任务的诊断状态。
 var activeDiagnostics *extractionDiagnostics
 
+// pureAnnotation 匹配工厂赋值前可选的 PURE 注释;未压缩构建会插入该注释,
+// 它出现在等号与模块路径之间,必须允许其存在再解析声明。
+const pureAnnotation = `(?:/\*[@#]__PURE__\*/\s*)?`
+
 // 字段解析正则覆盖压缩 bundle 的各类声明形式。
 var (
 	noRe                    = regexp.MustCompile(`(?:^|[,{]\s*)no:\s*(\d+)`)

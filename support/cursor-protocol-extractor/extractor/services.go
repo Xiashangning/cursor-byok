@@ -45,7 +45,8 @@ func extractEnums(text string, moduleStarts []int) []Enum {
 	}
 
 	// 匹配现代 @bufbuild/protobuf 工厂形式，例如 Role=A.makeEnum("aiserver.v1.InferenceMessageRole",[{...}])。
-	enumFactoryRe := regexp.MustCompile(`([\w$]+)\s*=\s*[\w$.]+\.makeEnum\s*\(\s*["']([\w.]+)["']\s*,\s*\[`)
+	// 未压缩构建会在 = 与模块路径之间插入 /*@__PURE__*/ 注释,必须容忍。
+	enumFactoryRe := regexp.MustCompile(`([\w$]+)\s*=\s*` + pureAnnotation + `[\w$.]+\.makeEnum\s*\(\s*["']([\w.]+)["']\s*,\s*\[`)
 	factoryMatches := enumFactoryRe.FindAllStringSubmatchIndex(text, -1)
 	for _, match := range factoryMatches {
 		varName := text[match[2]:match[3]]

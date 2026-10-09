@@ -233,7 +233,10 @@ func looksLikeFullTypeName(ref string) bool {
 	return matched
 }
 
-// pickBestDefinition 按模块、类别、首选包和源码距离选择定义。
+// pickBestDefinition 按源码作用域、类别、首选包和源码距离选择定义。
+// 模块内同名声明是 JS 词法作用域的最近绑定,必须先于包偏好筛选,
+// 否则同包另一模块的同名符号会错误遮蔽当前模块内的正确符号。
+// contextModuleStart 为 -1 表示不限定模块作用域。
 func pickBestDefinition(candidates []symbolDef, contextPos int, contextModuleStart int, preferredPkg string, expectedKind string) (symbolDef, bool) {
 	if len(candidates) == 0 {
 		return symbolDef{}, false
@@ -252,11 +255,10 @@ func pickBestDefinition(candidates []symbolDef, contextPos int, contextModuleSta
 		}
 	}
 
-	if strings.TrimSpace(preferredPkg) != "" {
+	if contextModuleStart >= 0 {
 		tmp := make([]symbolDef, 0, len(filtered))
 		for _, item := range filtered {
-			pkg, _ := parseTypeName(item.TypeName)
-			if pkg == preferredPkg {
+			if item.ModuleStart == contextModuleStart {
 				tmp = append(tmp, item)
 			}
 		}
@@ -265,10 +267,11 @@ func pickBestDefinition(candidates []symbolDef, contextPos int, contextModuleSta
 		}
 	}
 
-	if contextModuleStart > 0 {
+	if strings.TrimSpace(preferredPkg) != "" {
 		tmp := make([]symbolDef, 0, len(filtered))
 		for _, item := range filtered {
-			if item.ModuleStart == contextModuleStart {
+			pkg, _ := parseTypeName(item.TypeName)
+			if pkg == preferredPkg {
 				tmp = append(tmp, item)
 			}
 		}
@@ -329,7 +332,7 @@ func (resolver *TypeResolver) ResolveTypeName(ref string, contextPos int, contex
 		if len(candidates) == 0 {
 			return "", false
 		}
-		moduleStart := 0
+		moduleStart := -1
 		if preferSameModule {
 			moduleStart = contextModuleStart
 		}
@@ -355,7 +358,7 @@ func (resolver *TypeResolver) ResolveTypeName(ref string, contextPos int, contex
 		if len(candidates) == 0 {
 			return "", false
 		}
-		moduleStart := 0
+		moduleStart := -1
 		if preferSameModule {
 			moduleStart = contextModuleStart
 		}
@@ -369,7 +372,7 @@ func (resolver *TypeResolver) ResolveTypeName(ref string, contextPos int, contex
 	if typeName, ok := resolveBySymbol(trimmed, !strings.Contains(trimmed, ".")); ok {
 		return typeName, true
 	}
-	if typeName, ok := resolveByAlias(trimmed, 0); ok {
+	if typeName, ok := resolveByAlias(trimmed, -1); ok {
 		return typeName, true
 	}
 	if typeName, ok := resolveByShort(trimmed, !strings.Contains(trimmed, ".")); ok {
@@ -380,7 +383,7 @@ func (resolver *TypeResolver) ResolveTypeName(ref string, contextPos int, contex
 		parts := strings.Split(trimmed, ".")
 		first := parts[0]
 		last := parts[len(parts)-1]
-		targetModuleStart := 0
+		targetModuleStart := -1
 		if imports := resolver.moduleImports[contextModuleStart]; imports != nil {
 			targetModuleStart = imports[first]
 		}

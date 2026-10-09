@@ -44,9 +44,14 @@ add_input() {
   INPUT_PATHS+=("$candidate")
 }
 
+# 协议 marker 出现即视为输入候选，避免按文件名匹配漏掉改版后的新入口。
+# newFieldList 覆盖只有字段表、没有工厂调用的旧式声明所在文件。
+PROTOCOL_MARKER_PATTERN='makeMessageType\(|setEnumType\(|makeEnum\(|newFieldList\('
+
 if [[ -f "$INPUT_ROOT" ]]; then
   add_input "$INPUT_ROOT"
 elif [[ -d "$INPUT_ROOT" ]]; then
+  # 优先保留主工作台与扩展宿主，让它们的完整声明在合并时先落位。
   CANDIDATES=(
     "$INPUT_ROOT/Contents/Resources/app/out/vs/workbench/workbench.desktop.main.js"
     "$INPUT_ROOT/Resources/app/out/vs/workbench/workbench.desktop.main.js"
@@ -66,7 +71,9 @@ elif [[ -d "$INPUT_ROOT" ]]; then
   done
   while IFS= read -r JS_FILE; do
     add_input "$JS_FILE"
-  done < <(find "$INPUT_ROOT" -type f ! -path "*/node_modules/*" \( -name "workbench.desktop.main.js" -o -name "extensionHostProcess.js" -o -path "*/extensions/*/dist/main.js" \) | sort)
+  done < <(grep -r -l -m1 -E "$PROTOCOL_MARKER_PATTERN" \
+    --include="*.js" --include="*.mjs" --include="*.cjs" \
+    --exclude-dir=node_modules "$INPUT_ROOT" 2>/dev/null | sort)
 fi
 
 if [[ -z "${INPUT_PATHS[*]-}" ]]; then

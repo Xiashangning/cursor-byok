@@ -86,7 +86,7 @@ func generateProtoFile(pkgName string, messages []Message, enums []Enum, service
 	fileName := strings.ReplaceAll(pkgName, ".", "_") + ".proto"
 	filePath := filepath.Join(outputDir, fileName)
 
-	os.WriteFile(filePath, []byte(sb.String()), 0644)
+	os.WriteFile(filePath, []byte(strings.TrimRight(sb.String(), "\n")+"\n"), 0644)
 	fmt.Printf("Generated: %s (%d messages, %d enums, %d services)\n", filePath, len(messages), len(enums), len(services))
 }
 
