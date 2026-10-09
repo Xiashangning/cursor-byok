@@ -362,7 +362,7 @@ mod tests {
                 markdown: markdown.clone(),
                 cache: Some(WebCacheEntry {
                     url: location.into(),
-                    file_path: "C:/Users/test/.cursor-byok-v3/cache/web/page.txt".into(),
+                    file_path: "C:/Users/test/.cursor-byok/cache/web/page.txt".into(),
                     size_bytes: markdown.len() as i64,
                     line_count: 1,
                 }),
@@ -393,7 +393,7 @@ mod tests {
                 .output_location
                 .as_ref()
                 .map(|location| location.file_path.as_str()),
-            Some("C:/Users/test/.cursor-byok-v3/cache/web/page.txt")
+            Some("C:/Users/test/.cursor-byok/cache/web/page.txt")
         );
     }
 

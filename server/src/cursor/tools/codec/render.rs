@@ -5,7 +5,7 @@ use crate::{
     cursor::{
         protocol::proto::agent::v1 as pb,
         tools::{
-            codec, edit,
+            codec,
             tool_call_result::{self as tool_result, ToolCompletion},
         },
     },
@@ -210,7 +210,7 @@ pub fn tool_completed(call: &ToolCall, completion: &ToolCompletion) -> pb::Agent
 pub fn tool_placeholder(name: &str, call_id: &str) -> Result<pb::ToolCall> {
     use pb::tool_call::Tool;
     let tool = match normalized(name).as_str() {
-        "shell" | "bash" => Tool::ShellToolCall(pb::ShellToolCall::default()),
+        "shell" => Tool::ShellToolCall(pb::ShellToolCall::default()),
         "delete" => Tool::DeleteToolCall(pb::DeleteToolCall::default()),
         "glob" => Tool::GlobToolCall(pb::GlobToolCall::default()),
         "grep" => Tool::GrepToolCall(pb::GrepToolCall::default()),
@@ -223,9 +223,7 @@ pub fn tool_placeholder(name: &str, call_id: &str) -> Result<pb::ToolCall> {
         }
         "createplan" => Tool::CreatePlanToolCall(pb::CreatePlanToolCall::default()),
         "websearch" => Tool::WebSearchToolCall(pb::WebSearchToolCall::default()),
-        "task" | "createagent" | "sendmessagetoagent" => {
-            Tool::TaskToolCall(pb::TaskToolCall::default())
-        }
+        "task" | "sendmessagetoagent" => Tool::TaskToolCall(pb::TaskToolCall::default()),
         "fetchmcpresource" => Tool::ReadMcpResourceToolCall(pb::ReadMcpResourceToolCall::default()),
         "askquestion" => Tool::AskQuestionToolCall(pb::AskQuestionToolCall::default()),
         "webfetch" => Tool::WebFetchToolCall(pb::WebFetchToolCall::default()),
@@ -289,13 +287,25 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
             .and_then(Value::as_str)
             .map(str::to_string)
     };
+    let int = |name: &str, minimum: i64| -> Result<Option<i32>> {
+        super::request::integer(call, name, minimum, i32::MAX as i64)
+            .map(|value| value.map(|value| value as i32))
+    };
     match output.tool.as_mut() {
         Some(pb::tool_call::Tool::ShellToolCall(tool)) => {
-            tool.description = optional("description");
+            let command = string("command");
+            // 模型未提供 description 时,以完整命令作为卡片标题;
+            // 否则客户端回退到命令首个 token,只显示 "grep"、"python" 等。
+            let description = optional("description").or_else(|| {
+                let command = command.trim();
+                (!command.is_empty()).then(|| command.into())
+            });
+            tool.description = description.clone();
             tool.args = Some(pb::ShellArgs {
-                command: string("command"),
+                command,
                 working_directory: optional("working_directory").unwrap_or_default(),
-                description: optional("description"),
+                timeout: int("block_until_ms", 0)?.unwrap_or(30_000),
+                description,
                 tool_call_id: call.call_id.clone(),
                 ..Default::default()
             })
@@ -318,6 +328,19 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
                 path: optional("path"),
                 glob: optional("glob"),
                 output_mode: optional("output_mode"),
+                context_before: int("-B", 0)?,
+                context_after: int("-A", 0)?,
+                context: int("-C", 0)?,
+                head_limit: int("head_limit", 0)?,
+                offset: int("offset", 0)?,
+                case_insensitive: call.arguments.get("-i").and_then(Value::as_bool),
+                multiline: call.arguments.get("multiline").and_then(Value::as_bool),
+                r#type: optional("type"),
+                sort: optional("sort"),
+                sort_ascending: call
+                    .arguments
+                    .get("sort_ascending")
+                    .and_then(Value::as_bool),
                 tool_call_id: call.call_id.clone(),
                 ..Default::default()
             })
@@ -325,20 +348,9 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
         Some(pb::tool_call::Tool::ReadToolCall(tool)) => {
             tool.args = Some(pb::ReadToolArgs {
                 path: string("path"),
-                offset: call
-                    .arguments
-                    .get("offset")
-                    .and_then(Value::as_i64)
-                    .map(|value| value as i32),
-                limit: call
-                    .arguments
-                    .get("limit")
-                    .and_then(Value::as_i64)
-                    .map(|value| value as i32),
-                include_line_numbers: call
-                    .arguments
-                    .get("include_line_numbers")
-                    .and_then(Value::as_bool),
+                offset: int("offset", i32::MIN as i64)?,
+                limit: int("limit", 0)?,
+                include_line_numbers: None,
             })
         }
         Some(pb::tool_call::Tool::UpdateTodosToolCall(tool)) => {
@@ -363,7 +375,7 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
                 } else {
                     string("path")
                 },
-                stream_content: Some(edit::normalize_newlines(&stream_content)),
+                stream_content: Some(stream_content),
             })
         }
         Some(pb::tool_call::Tool::ReadLintsToolCall(tool)) => {
@@ -426,21 +438,16 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
             })
         }
         Some(pb::tool_call::Tool::TaskToolCall(tool)) => {
-            let description = optional("description")
-                .or_else(|| optional("title"))
-                .unwrap_or_default();
-            let resume = optional("resume")
-                .or_else(|| optional("agent_id"))
-                .or_else(|| optional("agentId"));
+            let resume = if call.name.eq_ignore_ascii_case("sendmessagetoagent") {
+                optional("agent_id")
+            } else {
+                optional("resume")
+            };
             tool.args = Some(pb::TaskArgs {
-                description,
+                description: string("description"),
                 prompt: string("prompt"),
-                subagent_type: Some(subagent_type(
-                    &optional("subagent_type")
-                        .or_else(|| optional("subagentType"))
-                        .unwrap_or_default(),
-                )),
-                model: optional("model"),
+                subagent_type: Some(subagent_type(&string("subagent_type"))),
+                model: optional("model_display").or_else(|| optional("model")),
                 resume,
                 agent_id: None,
                 attachments: call
@@ -453,7 +460,15 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
                     .map(str::to_string)
                     .collect(),
                 mode: 0,
-                responding_to_message_ids: Vec::new(),
+                responding_to_message_ids: call
+                    .arguments
+                    .get("responding_to_message_ids")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
                 environment: execution_environment(optional("environment").as_deref()),
                 machine: None,
             })
@@ -503,30 +518,8 @@ pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall
                 completed_subtitle: optional("completed_subtitle"),
             })
         }
-        Some(pb::tool_call::Tool::WriteShellStdinToolCall(tool)) => {
-            tool.args = Some(pb::WriteShellStdinArgs {
-                shell_id: call
-                    .arguments
-                    .get("shell_id")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default() as u32,
-                chars: string("chars"),
-            })
-        }
         Some(pb::tool_call::Tool::AwaitToolCall(tool)) => {
-            tool.args = Some(pb::AwaitArgs {
-                task_id: optional("shell_id")
-                    .or_else(|| optional("task_id"))
-                    .or_else(|| optional("agent_id"))
-                    .unwrap_or_default(),
-                block_until_ms: call
-                    .arguments
-                    .get("block_until_ms")
-                    .or_else(|| call.arguments.get("timeout_ms"))
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u32),
-                regex: optional("pattern"),
-            })
+            tool.args = Some(crate::cursor::tools::runtime::await_arguments(call)?);
         }
         Some(pb::tool_call::Tool::GetMcpToolsToolCall(tool)) => {
             tool.args = Some(pb::GetMcpToolsArgs {
@@ -601,20 +594,36 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_placeholder;
     use crate::cursor::protocol::proto::agent::v1 as pb;
+    use crate::model::ToolCall;
+    use serde_json::json;
+
+    fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "call-1".into(),
+            model_call_id: "model-1".into(),
+            name: name.into(),
+            arguments_text: arguments.to_string(),
+            arguments,
+            argument_error: None,
+        }
+    }
 
     #[test]
-    fn bash_renders_as_a_shell_placeholder() {
-        // The dispatcher treats `bash`/`Bash` as a Shell alias, so the streaming
-        // placeholder must too; otherwise a `Bash` tool call aborts the turn with
-        // `unsupported tool: bash` before it ever runs.
-        for name in ["shell", "Shell", "bash", "Bash"] {
-            let tool = tool_placeholder(name, "call-1").unwrap().tool;
-            assert!(
-                matches!(tool, Some(pb::tool_call::Tool::ShellToolCall(_))),
-                "{name} should render as a Shell tool"
-            );
-        }
+    fn shell_description_falls_back_to_the_full_command() {
+        let rendered = super::render_tool_call(
+            &call("Shell", json!({"command": "grep -rn foo src/"})),
+            false,
+        )
+        .unwrap();
+        let Some(pb::tool_call::Tool::ShellToolCall(tool)) = rendered.tool else {
+            panic!("expected a Shell tool")
+        };
+        assert_eq!(tool.description.as_deref(), Some("grep -rn foo src/"));
+        assert_eq!(
+            tool.args.unwrap().description.as_deref(),
+            Some("grep -rn foo src/")
+        );
     }
 }

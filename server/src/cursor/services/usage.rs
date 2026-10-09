@@ -92,8 +92,10 @@ pub(crate) fn breakdown(
         measures[SUMMARY].characters = summary.character_count.unwrap_or(0) as u64;
         estimates[SUMMARY] = summary.estimated_tokens as u64;
     }
-    let easter_egg_tokens = 1_u64;
-    let categorized_tokens = used_tokens as u64;
+    // The easter egg is part of the reported total: it takes at most one token
+    // out of `used_tokens` instead of being added on top.
+    let easter_egg_tokens = u64::from(used_tokens > 0);
+    let categorized_tokens = used_tokens as u64 - easter_egg_tokens;
     fit_special_estimates(&mut estimates, categorized_tokens);
     estimates[CONVERSATION] =
         categorized_tokens.saturating_sub(estimates[..CONVERSATION].iter().sum::<u64>());
@@ -215,5 +217,79 @@ fn fit_special_estimates(estimates: &mut [u64; 8], total: u64) {
         }
         estimates[index] += 1;
         remainder -= 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn categories(used_tokens: u32, instructions: &str) -> Vec<(String, u32)> {
+        let dynamic_tools = HashSet::new();
+        breakdown(used_tokens, 0, None, instructions, &[], &dynamic_tools, &[])
+            .unwrap()
+            .categories
+            .into_iter()
+            .map(|category| (category.id, category.estimated_tokens))
+            .collect()
+    }
+
+    fn tokens_for(categories: &[(String, u32)], id: &str) -> u32 {
+        categories
+            .iter()
+            .find(|(category_id, _)| category_id == id)
+            .expect("category exists")
+            .1
+    }
+
+    fn category_sum(categories: &[(String, u32)]) -> u32 {
+        categories.iter().map(|(_, tokens)| tokens).sum()
+    }
+
+    #[test]
+    fn zero_total_reports_zero_easter_egg() {
+        let categories = categories(0, "some instructions");
+        assert_eq!(category_sum(&categories), 0);
+        assert_eq!(tokens_for(&categories, EASTER_EGG_CATEGORY.0), 0);
+        assert_eq!(tokens_for(&categories, CATEGORIES[CONVERSATION].0), 0);
+    }
+
+    #[test]
+    fn tiny_total_spends_one_token_on_the_easter_egg() {
+        let instructions = "x".repeat(4_000);
+        let categories = categories(2, &instructions);
+        assert_eq!(category_sum(&categories), 2);
+        assert_eq!(tokens_for(&categories, EASTER_EGG_CATEGORY.0), 1);
+        assert_eq!(tokens_for(&categories, CATEGORIES[SYSTEM].0), 1);
+        assert_eq!(tokens_for(&categories, CATEGORIES[CONVERSATION].0), 0);
+    }
+
+    #[test]
+    fn scaled_categories_never_exceed_total() {
+        let instructions = "x".repeat(4_000);
+        for total in [1, 2, 5, 100, 272, 273, 274, 10_000] {
+            let categories = categories(total, &instructions);
+            assert_eq!(category_sum(&categories), total, "total {total}");
+            assert_eq!(
+                tokens_for(&categories, EASTER_EGG_CATEGORY.0),
+                1,
+                "total {total}"
+            );
+            assert_eq!(
+                tokens_for(&categories, CATEGORIES[CONVERSATION].0),
+                total.saturating_sub(tokens_for(&categories, CATEGORIES[SYSTEM].0) + 1),
+                "total {total}"
+            );
+        }
+    }
+
+    #[test]
+    fn unscaled_categories_leave_the_remainder_to_conversation() {
+        let instructions = "x".repeat(20);
+        let categories = categories(100, &instructions);
+        assert_eq!(category_sum(&categories), 100);
+        assert_eq!(tokens_for(&categories, CATEGORIES[SYSTEM].0), 6);
+        assert_eq!(tokens_for(&categories, CATEGORIES[CONVERSATION].0), 93);
+        assert_eq!(tokens_for(&categories, EASTER_EGG_CATEGORY.0), 1);
     }
 }

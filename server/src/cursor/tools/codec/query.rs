@@ -12,6 +12,16 @@ pub fn tool_query(id: u32, call: &ToolCall) -> Result<pb::AgentServerMessage> {
             .map(str::to_string)
             .ok_or_else(|| Error::Protocol(format!("{} is missing {name}", call.name)))
     };
+    let nonblank = |name: &str| -> Result<String> {
+        let value = string(name)?;
+        if value.trim().is_empty() {
+            return Err(Error::Protocol(format!(
+                "{} {name} must not be blank",
+                call.name
+            )));
+        }
+        Ok(value)
+    };
     let optional_string = |name: &str| {
         call.arguments
             .get(name)
@@ -80,13 +90,13 @@ pub fn tool_query(id: u32, call: &ToolCall) -> Result<pb::AgentServerMessage> {
         }
         "websearch" => Query::WebSearchRequestQuery(pb::WebSearchRequestQuery {
             args: Some(pb::WebSearchArgs {
-                search_term: string("search_term")?,
+                search_term: nonblank("search_term")?,
                 tool_call_id: call.call_id.clone(),
             }),
         }),
         "webfetch" => Query::WebFetchRequestQuery(pb::WebFetchRequestQuery {
             args: Some(pb::WebFetchArgs {
-                url: string("url")?,
+                url: nonblank("url")?,
                 tool_call_id: call.call_id.clone(),
             }),
             skip_approval: false,

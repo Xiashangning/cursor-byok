@@ -1,4 +1,6 @@
 //! Decodes Tool execution responses received from Cursor.
+use std::time::Duration;
+
 use crate::{
     cursor::{
         protocol::{events, proto::agent::v1 as pb},
@@ -17,6 +19,11 @@ use super::request::edit_write_request;
 pub enum ClientExecEvent {
     Delta(Box<pb::AgentServerMessage>),
     Message(Box<pb::AgentServerMessage>),
+    DelayedMessage {
+        delay: Duration,
+        exec_id: u32,
+        message: Box<pb::AgentServerMessage>,
+    },
     Completed(Box<ToolCompletion>),
     Pending,
 }
@@ -51,7 +58,41 @@ pub async fn client_event(
     let pb::exec_client_message::Message::ShellStream(stream) = wire_result else {
         let entry = take(message.id, pending).await?;
         return match entry.stage {
+            ExecStage::Diagnostics(_) => {
+                let result = match wire_result {
+                    pb::exec_client_message::Message::DiagnosticsResult(result) => result.clone(),
+                    _ => crate::cursor::tools::diagnostics::failed_result(
+                        "Expected DiagnosticsResult",
+                    ),
+                };
+                crate::cursor::tools::diagnostics::advance(entry, result, pending).await
+            }
             ExecStage::EditRead => advance_edit(entry, wire_result, pending).await,
+            ExecStage::ShellAwaitPoll => {
+                match super::super::tool_call_dispatch::advance_shell_await_poll(
+                    pending,
+                    entry,
+                    wire_result,
+                )
+                .await?
+                {
+                    super::super::tool_call_dispatch::ShellAwaitPoll::Completed(completion) => {
+                        Ok(ClientExecEvent::Completed(completion))
+                    }
+                    super::super::tool_call_dispatch::ShellAwaitPoll::Retry {
+                        delay,
+                        exec_id,
+                        message,
+                    } => Ok(ClientExecEvent::DelayedMessage {
+                        delay,
+                        exec_id,
+                        message,
+                    }),
+                    super::super::tool_call_dispatch::ShellAwaitPoll::Pending => {
+                        Ok(ClientExecEvent::Pending)
+                    }
+                }
+            }
             ExecStage::Direct | ExecStage::DynamicMcp(_) | ExecStage::EditWrite(_) => {
                 completed(entry, wire_result.clone())
             }
@@ -142,9 +183,19 @@ pub async fn stream_closed(id: u32, pending: &CursorToolRuntime) -> Result<Optio
     let Some(entry) = pending.take_exec(id).await else {
         return Ok(None);
     };
+    if matches!(entry.stage, ExecStage::ShellAwaitPoll) {
+        return Ok(None);
+    }
     let error = "Cursor Exec stream closed before returning a terminal result";
-    if entry.call.name.eq_ignore_ascii_case("Shell") || entry.call.name.eq_ignore_ascii_case("Bash")
-    {
+    if let ExecStage::Diagnostics(state) = &entry.stage {
+        let mut results = state.results.clone();
+        results.push(crate::cursor::tools::diagnostics::failed_result(format!(
+            "{error}; diagnostics incomplete; remaining paths: {:?}",
+            state.paths
+        )));
+        return Ok(Some(result::complete_diagnostics(entry, &results)?));
+    }
+    if entry.call.name.eq_ignore_ascii_case("Shell") {
         let command = entry
             .call
             .arguments
@@ -288,12 +339,18 @@ fn shell_exit_result(
     stdout: &str,
     stderr: &str,
 ) -> pb::ShellResult {
+    // 完整输出落盘时透传客户端提供的落盘位置:模型侧 16 KiB 流式截断之外,
+    // 全量输出可循 file_path 续读。size/line 只用客户端上报值,不自行统计,
+    // 更不读取落盘文件。exit 只在 ShellStreamExit 携带真实退出码时透传;
+    // 控制事件(Rejected 等)不编造退出码。
+    let output_location = exit.output_location.clone();
     let result = if exit.code == 0 && !exit.aborted {
         pb::shell_result::Result::Success(pb::ShellSuccess {
             working_directory: exit.cwd.clone(),
             exit_code: exit.code as i32,
             stdout: stdout.into(),
             stderr: stderr.into(),
+            output_location,
             interleaved_output: Some(format!("{stdout}{stderr}")),
             local_execution_time_ms: exit
                 .local_execution_time_ms
@@ -306,6 +363,7 @@ fn shell_exit_result(
             exit_code: exit.code as i32,
             stdout: stdout.into(),
             stderr: stderr.into(),
+            output_location,
             interleaved_output: Some(format!("{stdout}{stderr}")),
             abort_reason: exit.abort_reason,
             aborted: exit.aborted,
@@ -369,4 +427,89 @@ fn shell_delta(call: &ToolCall, stdout: bool, content: &str) -> pb::AgentServerM
             model_call_id: call.model_call_id.clone(),
         },
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exit(
+        code: u32,
+        output_location: Option<pb::OutputLocation>,
+        aborted: bool,
+    ) -> pb::ShellStreamExit {
+        pb::ShellStreamExit {
+            code,
+            cwd: "/tmp".into(),
+            output_location,
+            aborted,
+            abort_reason: None,
+            local_execution_time_ms: Some(42),
+        }
+    }
+
+    /// L-3:ShellStreamExit 折叠时透传客户端提供的完整输出位置;
+    /// 退出码始终保留。
+    #[test]
+    fn shell_exit_folding_passes_through_the_output_location() {
+        let message = pb::ExecClientMessage::default();
+        let exit = exit(
+            0,
+            Some(pb::OutputLocation {
+                file_path: "/tmp/outputs/7.txt".into(),
+                size_bytes: 500_000,
+                line_count: 12_345,
+            }),
+            false,
+        );
+        let result = shell_exit_result(&message, &exit, "out", "err");
+        let pb::shell_result::Result::Success(success) = result.result.unwrap() else {
+            panic!("expected success");
+        };
+        assert_eq!(success.exit_code, 0);
+        let location = success.output_location.expect("location passes through");
+        assert_eq!(location.file_path, "/tmp/outputs/7.txt");
+        assert_eq!(location.size_bytes, 500_000);
+        assert_eq!(location.line_count, 12_345);
+        assert_eq!(success.stdout, "out");
+        assert_eq!(success.stderr, "err");
+        assert_eq!(success.local_execution_time_ms, Some(42));
+    }
+
+    /// L-3:失败路径同样透传落盘位置;无位置时保持 None。
+    #[test]
+    fn shell_exit_folding_keeps_failure_output_location() {
+        let message = pb::ExecClientMessage::default();
+        let exit = exit(
+            1,
+            Some(pb::OutputLocation {
+                file_path: "/tmp/outputs/fail.txt".into(),
+                size_bytes: 3,
+                line_count: 1,
+            }),
+            false,
+        );
+        let result = shell_exit_result(&message, &exit, "", "boom");
+        let pb::shell_result::Result::Failure(failure) = result.result.unwrap() else {
+            panic!("expected failure");
+        };
+        assert_eq!(failure.exit_code, 1);
+        assert_eq!(
+            failure.output_location.unwrap().file_path,
+            "/tmp/outputs/fail.txt"
+        );
+        assert_eq!(failure.stderr, "boom");
+    }
+
+    /// L-3:无落盘位置时不虚构。
+    #[test]
+    fn shell_exit_folding_without_a_location_adds_none() {
+        let message = pb::ExecClientMessage::default();
+        let result = shell_exit_result(&message, &exit(0, None, false), "", "");
+        let pb::shell_result::Result::Success(success) = result.result.unwrap() else {
+            panic!("expected success");
+        };
+        assert!(success.output_location.is_none());
+        assert_eq!(success.stdout, "");
+    }
 }

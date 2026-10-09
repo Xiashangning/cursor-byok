@@ -28,14 +28,16 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
             .and_then(Value::as_str)
             .map(str::to_string)
     };
-    let int = |name: &str| {
-        call.arguments
-            .get(name)
-            .and_then(Value::as_i64)
-            .map(|v| v as i32)
+    let int = |name: &str| -> Result<Option<i32>> {
+        let minimum = if call.name == "Read" && name == "offset" {
+            i32::MIN as i64
+        } else {
+            0
+        };
+        integer(call, name, minimum, i32::MAX as i64).map(|value| value.map(|value| value as i32))
     };
     let message = match normalize(&call.name).as_str() {
-        "shell" | "bash" => {
+        "shell" => {
             let command = string("command")?;
             let (simple_commands, parsing_result) = shell_command_metadata(&command);
             Message::ShellStreamArgs(pb::ShellArgs {
@@ -49,7 +51,7 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                 timeout_behavior: pb::TimeoutBehavior::Background as i32,
                 hard_timeout: Some(86_400_000),
                 description: optional_string("description"),
-                output_notification: shell_notification(call)?,
+                output_notification: None,
                 smart_mode_approval: smart_mode_approval(
                     call,
                     "request_smart_mode_approval",
@@ -58,20 +60,15 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                 requested_sandbox_policy: shell_sandbox_policy(call),
                 close_stdin: true,
                 conversation_id: Some(context.conversation_id.clone()),
-                admin_command_denylist: context.admin_command_denylist.clone(),
                 ..Default::default()
             })
         }
         "read" => Message::ReadArgs(pb::ReadArgs {
             path: string("path")?,
             tool_call_id: call.call_id.clone(),
-            offset: int("offset"),
-            limit: call
-                .arguments
-                .get("limit")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
-            encoding_hint: optional_string("encoding_hint"),
+            offset: int("offset")?,
+            limit: integer(call, "limit", 0, i32::MAX as i64)?.map(|value| value as u32),
+            encoding_hint: None,
         }),
         "delete" => Message::DeleteArgs(pb::DeleteArgs {
             path: string("path")?,
@@ -82,12 +79,12 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
             path: optional_string("path"),
             glob: optional_string("glob"),
             output_mode: optional_string("output_mode"),
-            context_before: int("-B"),
-            context_after: int("-A"),
-            context: int("-C"),
+            context_before: int("-B")?,
+            context_after: int("-A")?,
+            context: int("-C")?,
             case_insensitive: call.arguments.get("-i").and_then(Value::as_bool),
             r#type: optional_string("type"),
-            head_limit: int("head_limit"),
+            head_limit: int("head_limit")?,
             multiline: call.arguments.get("multiline").and_then(Value::as_bool),
             sort: optional_string("sort"),
             sort_ascending: call
@@ -96,7 +93,7 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                 .and_then(Value::as_bool),
             tool_call_id: call.call_id.clone(),
             sandbox_policy: None,
-            offset: int("offset"),
+            offset: int("offset")?,
         }),
         "glob" => Message::GrepArgs(pb::GrepArgs {
             pattern: String::new(),
@@ -106,27 +103,22 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
             tool_call_id: call.call_id.clone(),
             ..Default::default()
         }),
-        "readlints" => Message::DiagnosticsArgs(pb::DiagnosticsArgs {
-            path: call
-                .arguments
-                .get("paths")
-                .and_then(Value::as_array)
-                .and_then(|paths| paths.first())
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .into(),
-            tool_call_id: call.call_id.clone(),
-        }),
         "task" => {
-            let model_parameters = task_model_parameters(call)?;
-            let model_id = string("model")?;
+            let model_id = match call.arguments.get("model_selection") {
+                Some(value) => {
+                    serde_json::from_value::<crate::model::ModelSelection>(value.clone())?
+                        .cursor_model_id(&context.model_directory)
+                }
+                None => string("model")?,
+            };
+            let resume_agent_id = optional_string("resume");
             Message::SubagentArgs(pb::SubagentArgs {
                 tool_call_id: call.call_id.clone(),
                 subagent_type: optional_string("subagent_type").unwrap_or_default(),
                 model_id,
                 prompt: string("prompt")?,
                 readonly: false,
-                resume_agent_id: optional_string("resume"),
+                resume_agent_id,
                 run_in_background: call
                     .arguments
                     .get("run_in_background")
@@ -137,7 +129,7 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                 mode: 0,
                 fork_agent_id: None,
                 root_parent_conversation_id: Some(context.root_conversation_id.clone()),
-                selected_context: task_attachments(call),
+                selected_context: None,
                 direct_meta_parent_child_subagent: None,
                 environment: match optional_string("environment").as_deref() {
                     Some("cloud") => pb::SubagentExecutionEnvironment::Cloud as i32,
@@ -149,77 +141,55 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
                     }
                 },
                 cloud_base_branch: optional_string("cloud_base_branch"),
-                model_parameters,
                 credentials: None,
             })
         }
-        "createagent" => Message::ForceBackgroundSubagentArgs(pb::ForceBackgroundSubagentArgs {
-            tool_call_id: call.call_id.clone(),
-        }),
         "sendmessagetoagent" => {
             let prompt = string("prompt")?;
-            let agent_id = optional_string("agent_id").or_else(|| optional_string("agentId"));
-            let requested_model = optional_string("model").filter(|model| !model.is_empty());
-            let subagent_type = optional_string("subagent_type")
-                .or_else(|| optional_string("subagentType"))
-                .unwrap_or_default();
-            let model_id = match context.subagent_model_for(&subagent_type) {
-                Some(crate::cursor::tools::runtime::SubagentModel::Model(model)) => model.clone(),
-                Some(crate::cursor::tools::runtime::SubagentModel::Inherit) => {
-                    context.default_subagent_model.clone()
-                }
-                Some(crate::cursor::tools::runtime::SubagentModel::Disabled) => {
-                    return Err(Error::Protocol(
-                        "send-message-to-agent is disabled by the subagent model override".into(),
-                    ))
-                }
-                None => requested_model.unwrap_or_else(|| context.default_subagent_model.clone()),
-            };
-            let readonly = call
-                .arguments
-                .get("readonly")
-                .or_else(|| call.arguments.get("readOnly"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let agent_id = string("agent_id")?;
+            if agent_id.trim().is_empty() {
+                return Err(Error::Protocol(
+                    "SendMessageToAgent agent_id must not be blank".into(),
+                ));
+            }
+            // The client owns the resumed task. Preserve the existing public
+            // follow-up wire defaults; do not accept hidden configuration overrides.
+            // Whether the client honors these defaults when resuming needs client
+            // verification; until then the follow-up runs as a plain agent.
             Message::SubagentArgs(pb::SubagentArgs {
                 tool_call_id: call.call_id.clone(),
-                subagent_type,
-                model_id,
+                subagent_type: String::new(),
+                model_id: context.default_subagent_model.clone(),
                 prompt,
-                readonly,
-                resume_agent_id: agent_id,
+                readonly: false,
+                resume_agent_id: Some(agent_id),
                 run_in_background: None,
                 continuation_config: None,
                 parent_conversation_id: Some(context.conversation_id.clone()),
-                interrupt: None,
-                mode: if readonly {
-                    pb::TaskMode::Plan as i32
-                } else {
-                    pb::TaskMode::Agent as i32
-                },
+                // follow-up 默认打断运行中的子代理；显式 false 保留忙时失败语义。
+                interrupt: Some(
+                    call.arguments
+                        .get("interrupt")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                ),
+                mode: pb::TaskMode::Agent as i32,
                 fork_agent_id: None,
                 root_parent_conversation_id: Some(context.root_conversation_id.clone()),
                 selected_context: None,
                 direct_meta_parent_child_subagent: None,
                 environment: pb::SubagentExecutionEnvironment::Local as i32,
                 cloud_base_branch: None,
-                model_parameters: Vec::new(),
                 credentials: None,
             })
         }
-        "await" => Message::SubagentAwaitArgs(pb::SubagentAwaitArgs {
-            agent_id: optional_string("task_id")
-                .or_else(|| optional_string("agent_id"))
-                .or_else(|| optional_string("agentId"))
-                .ok_or_else(|| Error::Protocol("AWAIT is missing task_id".into()))?,
-            timeout_ms: call
-                .arguments
-                .get("block_until_ms")
-                .or_else(|| call.arguments.get("timeout_ms"))
-                .and_then(Value::as_u64)
-                .unwrap_or(30_000)
-                .min(u32::MAX as u64) as u32,
-        }),
+        "await" => {
+            let args = crate::cursor::tools::runtime::await_arguments(call)?;
+            Message::SubagentAwaitArgs(pb::SubagentAwaitArgs {
+                agent_id: args.task_id,
+                timeout_ms: args.block_until_ms.expect("Await timeout is resolved"),
+            })
+        }
         "fetchmcpresource" => Message::ReadMcpResourceExecArgs(pb::ReadMcpResourceExecArgs {
             server: string("server")?,
             uri: string("uri")?,
@@ -249,6 +219,24 @@ pub fn request(id: u32, call: &ToolCall, context: &ExecContext) -> Result<pb::Ag
         message,
         accept_hook_additional_contexts,
     ))
+}
+
+pub(crate) fn shell_await_read_request(
+    id: u32,
+    call: &ToolCall,
+    path: String,
+) -> pb::AgentServerMessage {
+    // Each poll is a fresh exec on the client, so it needs its own exec_id.
+    server_message_with_exec_id(
+        id,
+        uuid::Uuid::new_v4().to_string(),
+        pb::exec_server_message::Message::ReadArgs(pb::ReadArgs {
+            path,
+            tool_call_id: call.call_id.clone(),
+            ..Default::default()
+        }),
+        Some(false),
+    )
 }
 
 pub(crate) fn edit_read_request(id: u32, call: &ToolCall) -> Result<pb::AgentServerMessage> {
@@ -284,9 +272,39 @@ pub(super) fn edit_write_request(
     ))
 }
 
+pub(crate) fn diagnostics_request(
+    id: u32,
+    call: &ToolCall,
+    path: String,
+) -> pb::AgentServerMessage {
+    server_message(
+        id,
+        call,
+        pb::exec_server_message::Message::DiagnosticsArgs(pb::DiagnosticsArgs {
+            path,
+            tool_call_id: call.call_id.clone(),
+        }),
+        Some(true),
+    )
+}
+
 fn server_message(
     id: u32,
     call: &ToolCall,
+    message: pb::exec_server_message::Message,
+    accept_hook_additional_contexts: Option<bool>,
+) -> pb::AgentServerMessage {
+    server_message_with_exec_id(
+        id,
+        call.call_id.clone(),
+        message,
+        accept_hook_additional_contexts,
+    )
+}
+
+fn server_message_with_exec_id(
+    id: u32,
+    exec_id: String,
     message: pb::exec_server_message::Message,
     accept_hook_additional_contexts: Option<bool>,
 ) -> pb::AgentServerMessage {
@@ -295,7 +313,7 @@ fn server_message(
         message: Some(pb::agent_server_message::Message::ExecServerMessage(
             pb::ExecServerMessage {
                 id,
-                exec_id: call.call_id.clone(),
+                exec_id,
                 span_context: None,
                 accept_hook_additional_contexts,
                 message: Some(message),
@@ -360,12 +378,15 @@ pub(crate) fn mcp_meta_request(
             route.tool_name
         )));
     }
-    let args = call
-        .arguments
-        .get("arguments")
-        .and_then(Value::as_object)
-        .map(json_object_to_prost)
-        .unwrap_or_default();
+    let args = match call.arguments.get("arguments") {
+        None => Default::default(),
+        Some(Value::Object(arguments)) => json_object_to_prost(arguments),
+        Some(_) => {
+            return Err(Error::Protocol(
+                "CallMcpTool arguments must be a JSON object".into(),
+            ));
+        }
+    };
     Ok(server_message(
         id,
         call,
@@ -417,6 +438,31 @@ pub fn abort(id: u32) -> pb::AgentServerMessage {
             },
         )),
     }
+}
+
+pub(crate) fn integer(
+    call: &ToolCall,
+    name: &str,
+    minimum: i64,
+    maximum: i64,
+) -> Result<Option<i64>> {
+    call.arguments
+        .get(name)
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|value| {
+                    value.fract() == 0.0 && *value >= minimum as f64 && *value <= maximum as f64
+                })
+                .map(|value| value as i64)
+                .ok_or_else(|| {
+                    Error::Protocol(format!(
+                        "{} {name} must be an integer in {minimum}..{maximum}",
+                        call.name
+                    ))
+                })
+        })
+        .transpose()
 }
 
 fn shell_sandbox_policy(call: &ToolCall) -> Option<pb::SandboxPolicy> {
@@ -507,93 +553,94 @@ fn smart_mode_approval(
     }))
 }
 
-fn shell_notification(call: &ToolCall) -> Result<Option<pb::ShellOutputNotificationConfig>> {
-    let Some(value) = call.arguments.get("notify_on_output") else {
+/// Task 附件整体内联进一条流消息,重连依赖 64 MiB 的重放缓冲,因此单个
+/// 附件与全部附件合计都不超过 32 MiB。
+const MAX_TASK_ATTACHMENT_BYTES: u64 = 32 * 1024 * 1024;
+
+pub(crate) async fn task_attachments(call: &ToolCall) -> Result<Option<pb::SelectedContext>> {
+    let Some(paths) = call
+        .arguments
+        .get("file_attachments")
+        .and_then(Value::as_array)
+    else {
         return Ok(None);
     };
-    let object = value
-        .as_object()
-        .ok_or_else(|| Error::Protocol("Shell notify_on_output must be an object".into()))?;
-    let required = |field: &str| {
-        object
-            .get(field)
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| Error::Protocol(format!("Shell notify_on_output is missing {field}")))
-    };
-    Ok(Some(pb::ShellOutputNotificationConfig {
-        pattern: required("pattern")?,
-        reason: required("reason")?,
-        debounce: object.get("debounce_ms").and_then(Value::as_f64),
-        notification_limit: None,
-    }))
-}
-
-fn task_model_parameters(call: &ToolCall) -> Result<Vec<pb::requested_model::ModelParameterValue>> {
-    let Some(value) = call.arguments.get("model_parameters") else {
-        return Ok(Vec::new());
-    };
-    let parameters: Vec<&Value> = match value {
-        Value::Array(parameters) => parameters.iter().collect(),
-        Value::Object(_) => vec![value],
-        _ => {
-            return Err(Error::Protocol(
-                "Task model_parameters must be an object or array".into(),
-            ))
-        }
-    };
-    parameters
-        .iter()
-        .map(|parameter| {
-            let object = parameter.as_object().ok_or_else(|| {
-                Error::Protocol("Task model_parameters entries must be objects".into())
-            })?;
-            let id = object
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| matches!(*id, "effort" | "context"))
-                .ok_or_else(|| {
-                    Error::Protocol("Task model_parameters id must be effort or context".into())
-                })?;
-            let value = object.get("value").and_then(Value::as_str).ok_or_else(|| {
-                Error::Protocol(format!("Task model parameter {id} is missing value"))
-            })?;
-            Ok(pb::requested_model::ModelParameterValue {
-                id: id.into(),
-                value: value.into(),
-            })
-        })
-        .collect()
-}
-
-fn task_attachments(call: &ToolCall) -> Option<pb::SelectedContext> {
-    let paths = call.arguments.get("file_attachments")?.as_array()?;
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let limit_mib = MAX_TASK_ATTACHMENT_BYTES / (1024 * 1024);
+    let mut total_bytes = 0_u64;
     let mut context = pb::SelectedContext::default();
     for path in paths.iter().filter_map(Value::as_str) {
-        let extension = std::path::Path::new(path)
+        let size = tokio::fs::metadata(path)
+            .await
+            .map_err(|error| {
+                Error::Protocol(format!("cannot read Task attachment {path}: {error}"))
+            })?
+            .len();
+        if size > MAX_TASK_ATTACHMENT_BYTES {
+            return Err(Error::Protocol(format!(
+                "Task attachment {path} exceeds the {limit_mib} MiB limit"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(size);
+        if total_bytes > MAX_TASK_ATTACHMENT_BYTES {
+            return Err(Error::Protocol(format!(
+                "Task attachments exceed the {limit_mib} MiB limit in total"
+            )));
+        }
+        let data = tokio::fs::read(path).await.map_err(|error| {
+            Error::Protocol(format!("cannot read Task attachment {path}: {error}"))
+        })?;
+        let file = std::path::Path::new(path);
+        let filename = file
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .to_string();
+        let extension = file
             .extension()
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if matches!(extension.as_str(), "mp4" | "mov" | "webm" | "mkv") {
+        if let Some(mime_type) = video_mime_type(&extension) {
             context.selected_videos.push(pb::SelectedVideo {
                 path: path.into(),
-                filename: std::path::Path::new(path)
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .unwrap_or_default()
-                    .into(),
+                filename,
+                mime_type: mime_type.into(),
                 materialize_to_filesystem: true,
+                data_or_blob_id: Some(pb::selected_video::DataOrBlobId::Data(data)),
                 ..Default::default()
             });
-        } else {
-            context.selected_images.push(pb::SelectedImage {
-                path: path.into(),
-                ..Default::default()
-            });
+            continue;
         }
+        let metadata = crate::model::image_metadata(&data).ok_or_else(|| {
+            Error::Protocol(format!(
+                "Task attachment is not a supported image or video: {path}"
+            ))
+        })?;
+        context.selected_images.push(pb::SelectedImage {
+            path: path.into(),
+            mime_type: metadata.mime_type.into(),
+            dimension: Some(pb::selected_image::Dimension {
+                width: metadata.width,
+                height: metadata.height,
+            }),
+            data_or_blob_id: Some(pb::selected_image::DataOrBlobId::Data(data)),
+            ..Default::default()
+        });
     }
-    Some(context)
+    Ok(Some(context))
+}
+
+fn video_mime_type(extension: &str) -> Option<&'static str> {
+    match extension {
+        "mp4" => Some("video/mp4"),
+        "mov" => Some("video/quicktime"),
+        "webm" => Some("video/webm"),
+        "mkv" => Some("video/x-matroska"),
+        _ => None,
+    }
 }
 
 fn normalize(value: &str) -> String {
@@ -667,53 +714,210 @@ mod tests {
     }
 
     #[test]
-    fn task_model_parameters_accepts_single_object_parameter() {
-        let parameters = task_model_parameters(&call(
-            "Task",
-            json!({
-                "model_parameters": {"id": "effort", "value": "low"}
-            }),
-        ))
+    fn read_delete_canonical_path_matches_execution_and_display() {
+        for name in ["Read", "Delete"] {
+            for arguments in [json!({"path": "/primary"}), json!({"path": "/second"})] {
+                let call = call(name, arguments);
+                let expected = call.arguments.get("path").unwrap().as_str().unwrap();
+                let path = match message(&call) {
+                    pb::exec_server_message::Message::ReadArgs(args) => args.path,
+                    pb::exec_server_message::Message::DeleteArgs(args) => args.path,
+                    _ => panic!("unexpected execution"),
+                };
+                assert_eq!(path, expected);
+                let rendered = super::super::render_tool_call(&call, false).unwrap();
+                let displayed = match rendered.tool.unwrap() {
+                    pb::tool_call::Tool::ReadToolCall(tool) => tool.args.unwrap().path,
+                    pb::tool_call::Tool::DeleteToolCall(tool) => tool.args.unwrap().path,
+                    _ => panic!("unexpected display"),
+                };
+                assert_eq!(displayed, path);
+            }
+            for value in [Value::Null, json!(42), json!([])] {
+                let call = call(name, json!({"path": value, "file_path": "/alias"}));
+                assert!(request(7, &call, &ExecContext::default()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn followup_requires_a_nonblank_canonical_agent_id() {
+        for arguments in [
+            json!({"prompt": "continue"}),
+            json!({"agentId": "alias", "prompt": "continue"}),
+            json!({"agent_id": "", "prompt": "continue"}),
+            json!({"agent_id": " \t", "prompt": "continue"}),
+            json!({"agent_id": null, "prompt": "continue"}),
+        ] {
+            assert!(request(
+                7,
+                &call("SendMessageToAgent", arguments),
+                &ExecContext::default()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn mcp_arguments_default_to_empty_when_omitted() {
+        let route = McpRoute {
+            name: "search".into(),
+            provider_identifier: "provider".into(),
+            tool_name: "search".into(),
+            input_schema: None,
+        };
+        for arguments in [
+            json!({"server": "server", "toolName": "search"}),
+            json!({"server": "server", "toolName": "search", "arguments": {}}),
+        ] {
+            assert!(mcp_meta_request(1, &call("CallMcpTool", arguments), "server", &route).is_ok());
+        }
+    }
+
+    #[test]
+    fn resumed_task_keeps_model_parameters_off_the_wire() {
+        let model_directory = {
+            let model = crate::model::ModelConfig {
+                model_hash: "model-hash".into(),
+                display_name: "Model".into(),
+                model_id: "upstream-model".into(),
+                effort_options: vec!["low".into(), "high".into()],
+                context_options: vec!["200k".into(), "1m".into()],
+                ..Default::default()
+            };
+            crate::model::ModelDirectory::new(std::slice::from_ref(&model), &[]).unwrap()
+        };
+        fn subagent_args(
+            call: &ToolCall,
+            model_directory: &crate::model::ModelDirectory,
+        ) -> pb::SubagentArgs {
+            let server = request(
+                7,
+                call,
+                &crate::cursor::tools::runtime::ExecContext {
+                    model_directory: model_directory.clone(),
+                    ..ExecContext::default()
+                },
+            )
+            .unwrap();
+            let Some(pb::agent_server_message::Message::ExecServerMessage(server)) = server.message
+            else {
+                panic!("expected ExecServerMessage")
+            };
+            let Some(pb::exec_server_message::Message::SubagentArgs(args)) = server.message else {
+                panic!("expected SubagentArgs")
+            };
+            args
+        }
+
+        // 续接已有子任务:参数不上线,保存的变体经 model_selection 烘焙进
+        // model_id slug(派发侧准备的调用同时携带 model 与 model_selection)。
+        // 参数仍出现在模型侧 JSON 参数里,由派发侧消费,编码忽略。
+        let resumed = subagent_args(
+            &call(
+                "Task",
+                json!({
+                    "prompt": "continue",
+                    "resume": "agent-1",
+                    "model": "model-hash",
+                    "model_parameters": [{"id": "reasoning", "value": "low"}],
+                    "model_selection": {"kind":"local","id":"model-hash","parameters":{"context":"1m","reasoning":"low","fast":true}}
+                }),
+            ),
+            &model_directory,
+        );
+        assert_eq!(resumed.resume_agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(resumed.model_id, "model-hash-1m-low-fast");
+
+        // 无变体选择时裸 model 字符串原样透传。
+        let plain = subagent_args(
+            &call(
+                "Task",
+                json!({
+                    "prompt": "continue",
+                    "resume": "agent-1",
+                    "model": "model-hash-1m-low"
+                }),
+            ),
+            &model_directory,
+        );
+        assert_eq!(plain.model_id, "model-hash-1m-low");
+
+        // resume=self 派生新代理,与创建一样:变体同样只进 model_id slug。
+        for resume in [serde_json::json!("self"), serde_json::json!(null)] {
+            let mut arguments = json!({
+                "prompt": "inspect",
+                "model": "model-hash",
+                "model_selection": {"kind":"local","id":"model-hash","parameters":{"context":"1m","reasoning":"low","fast":false}}
+            });
+            if !resume.is_null() {
+                arguments["resume"] = resume;
+            }
+            let args = subagent_args(&call("Task", arguments), &model_directory);
+            assert_eq!(args.model_id, "model-hash-1m-low");
+        }
+    }
+
+    #[test]
+    fn send_message_to_agent_ignores_hidden_model_overrides() {
+        let context = crate::cursor::tools::runtime::ExecContext {
+            conversation_id: "conversation-1".into(),
+            root_conversation_id: "root-1".into(),
+            default_subagent_model: "model-1".into(),
+            ..Default::default()
+        };
+        let server = request(
+            7,
+            &call(
+                "SendMessageToAgent",
+                json!({"agent_id":"agent-1","prompt":"continue","model":"DeepSeek Flash"}),
+            ),
+            &context,
+        )
         .unwrap();
-        assert_eq!(parameters.len(), 1);
-        assert_eq!(parameters[0].id, "effort");
-        assert_eq!(parameters[0].value, "low");
+        let Some(pb::agent_server_message::Message::ExecServerMessage(server)) = server.message
+        else {
+            panic!("expected ExecServerMessage")
+        };
+        let Some(pb::exec_server_message::Message::SubagentArgs(args)) = server.message else {
+            panic!("expected SubagentArgs")
+        };
+        assert_eq!(args.model_id, "model-1");
     }
 
     #[test]
     fn orchestration_tools_encode_to_client_exec_messages() {
         assert!(matches!(
-            message(&call("create-agent", json!({"title":"Inspect","prompt":"inspect"}))),
-            pb::exec_server_message::Message::ForceBackgroundSubagentArgs(args)
-                if args.tool_call_id == "call-1"
-        ));
-        assert!(matches!(
             message(&call(
-                "send-message-to-agent",
+                "SendMessageToAgent",
                 json!({"agent_id":"agent-1","prompt":"continue","readonly":true})
             )),
             pb::exec_server_message::Message::SubagentArgs(args)
                 if args.resume_agent_id.as_deref() == Some("agent-1")
                     && args.parent_conversation_id.as_deref() == Some("conversation-1")
-                    && args.mode == pb::TaskMode::Plan as i32
+                    && args.mode == pb::TaskMode::Agent as i32
+                    && args.interrupt == Some(true)
+        ));
+        // 显式 interrupt:false 保留忙时失败语义。
+        assert!(matches!(
+            message(&call(
+                "SendMessageToAgent",
+                json!({"agent_id":"agent-1","prompt":"continue","interrupt":false})
+            )),
+            pb::exec_server_message::Message::SubagentArgs(args) if args.interrupt == Some(false)
+        ));
+        // Task 未显式 interrupt 时不打断。
+        assert!(matches!(
+            message(&call(
+                "Task",
+                json!({"prompt":"inspect","resume":"agent-1","model":"m"})
+            )),
+            pb::exec_server_message::Message::SubagentArgs(args) if args.interrupt.is_none()
         ));
         assert!(matches!(
-            message(&call("AWAIT", json!({"task_id":"agent-1","block_until_ms":5000}))),
+            message(&call("Await", json!({"task_id":"agent-1","block_until_ms":5000}))),
             pb::exec_server_message::Message::SubagentAwaitArgs(args)
                 if args.agent_id == "agent-1" && args.timeout_ms == 5000
         ));
-    }
-
-    #[test]
-    fn bash_is_encoded_as_a_shell_exec_request() {
-        // The dispatcher routes `bash`/`Bash` to the shell executor, so the
-        // request codec must encode it as a Shell stream instead of erroring
-        // with `tool bash is not executed through ExecServerMessage`.
-        let pb::exec_server_message::Message::ShellStreamArgs(args) =
-            message(&call("Bash", json!({ "command": "ls -la" })))
-        else {
-            panic!("expected ShellStreamArgs");
-        };
-        assert_eq!(args.command, "ls -la");
     }
 }

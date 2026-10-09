@@ -1,4 +1,5 @@
 //! Converts completed Tool work into canonical Tool results.
+mod await_shell;
 mod exec;
 mod gate;
 mod interaction;
@@ -19,14 +20,22 @@ use crate::{
 
 use super::runtime::now_ms;
 
-pub(crate) use exec::{edit_failure, from_exec};
+pub(crate) use await_shell::{
+    completed as shell_await_completed, task_status, task_status_name,
+    timed_out as shell_await_timed_out, ShellCompletion,
+};
+pub(crate) use exec::{complete_diagnostics, edit_failure, from_exec};
 pub(crate) use interaction::{complete_web_fetch, complete_web_search, from_interaction};
-pub(crate) use local::{local, subagents_disabled, todo_items};
+pub(crate) use local::{local, subagents_disabled, todo_items, todo_write};
 pub(crate) use mcp::failure as mcp_failure;
 pub(crate) use search::complete as semble;
 
 #[derive(Clone, Debug)]
 pub struct ToolCompletion {
+    pub(crate) exec_id: Option<u32>,
+    /// 轮询先于通知判定 shell 终态时携带的台账身份
+    /// (`task_identity`, `tool_call_id`),由会话层写入 background_consumed。
+    pub(crate) consumed_background: Option<(String, String)>,
     result: ToolResult,
     tool_call: pb::ToolCall,
     read_image: Option<ReadImage>,
@@ -95,6 +104,8 @@ impl ToolCompletion {
         // carry the same bounded result without reprocessing it.
         gate::tool_completion(&call.name, &mut tool, &mut result.content);
         Self {
+            exec_id: None,
+            consumed_background: None,
             result,
             tool_call: pb::ToolCall {
                 tool_call_id: Some(call.call_id.clone()),
@@ -151,6 +162,9 @@ impl ToolResultSender {
 }
 
 impl ToolResultReceiver {
+    pub(crate) fn try_recv(&mut self) -> Option<Result<ToolCompletion>> {
+        self.0.try_recv().ok()
+    }
     pub async fn recv(&mut self) -> Option<Result<ToolCompletion>> {
         self.0.recv().await
     }

@@ -4,6 +4,8 @@ use bytes::Bytes;
 
 use crate::store::BlobId;
 
+use super::DecodedMessage;
+
 pub(super) const TRACE_UNKNOWN: u8 = 0;
 pub(super) const TRACE_ACTIVE: u8 = 1;
 pub(super) const TRACE_DISABLED: u8 = 2;
@@ -24,6 +26,7 @@ pub(super) enum TraceEvent {
         request_id: String,
         artifact_type: String,
         data: Bytes,
+        decoded: Option<DecodedMessage>,
         metadata: serde_json::Value,
     },
     Artifact {

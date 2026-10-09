@@ -162,7 +162,7 @@ pub async fn add(
     }
 
     let id = format!("{}{}", store::LOCAL_ID_PREFIX, uuid::Uuid::new_v4());
-    store.upsert(&RuleRecord {
+    store.upsert_and_record_add(&RuleRecord {
         id: id.clone(),
         knowledge: message.knowledge,
         title: message.title,
@@ -170,7 +170,6 @@ pub async fn add(
         is_generated: false,
         git_origin: message.git_origin,
     })?;
-    store.record_add(&id)?;
     proto(KnowledgeBaseAddResponse { success: true, id })
 }
 
@@ -283,8 +282,7 @@ pub async fn update(
     };
     record.knowledge = message.knowledge;
     record.title = message.title;
-    store.upsert(&record)?;
-    store.record_update(&message.id)?;
+    store.upsert_and_record_update(&record)?;
     proto(KnowledgeBaseUpdateResponse { success: true })
 }
 
@@ -320,14 +318,15 @@ pub async fn remove(
         }
     }
 
-    store.remove(&message.id)?;
-    store.record_remove(&message.id)?;
+    store.remove_and_record(&message.id)?;
     proto(KnowledgeBaseRemoveResponse { success: true })
 }
 
+const KNOWLEDGE_REQUEST_LIMIT: usize = 4 * 1024 * 1024;
+
 async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts, Bytes)> {
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, KNOWLEDGE_REQUEST_LIMIT)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     Ok((parts, body))

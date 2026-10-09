@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 pub mod codec;
 pub(crate) mod compat;
+mod diagnostics;
 pub(crate) mod edit;
 pub(crate) mod registry;
 pub mod runtime;
@@ -15,9 +16,10 @@ mod schedule;
 pub(crate) mod stream;
 mod tool_call_dispatch;
 pub(crate) mod tool_call_result;
+mod validation;
 
 use crate::{
-    model::{CanonicalMessage, MessageContent, Role, ToolCall},
+    model::{CanonicalMessage, ConversationId, MessageContent, Role, ToolCall},
     search::{WebCache, WebFetch, WebSearch},
     store::Store,
     Error, Result,
@@ -26,7 +28,7 @@ use crate::{
 use self::schedule::{DeferredEdit, EditSchedule};
 use self::tool_call_result::{ToolCompletion, ToolResultSender};
 use super::protocol::proto::agent::v1 as pb;
-use runtime::{CursorToolRuntime, ExecContext};
+use runtime::{task_resume_target, CursorToolRuntime, ExecContext};
 
 #[derive(Clone)]
 pub struct ToolDispatcher {
@@ -96,6 +98,17 @@ impl ToolDispatcher {
             + usize::from(!state.response_thinking.is_empty())
             + usize::from(!state.response_text.is_empty())
             + 1;
+        use crate::cursor::prompting::{
+            fold_derived_state_from, validated_todo_write, DerivedState,
+        };
+        let mut todos = fold_derived_state_from(
+            messages,
+            DerivedState {
+                todos: context.initial_todos.clone(),
+                plan: None,
+            },
+        )
+        .todos;
         let mut dispatched = Vec::new();
         for (position, call) in calls.iter().enumerate() {
             if state.completed.contains(&call.call_id) {
@@ -105,6 +118,43 @@ impl ToolDispatcher {
             let publish_started = !state.started.contains(&call.call_id);
             if let Some(error) = &call.argument_error {
                 dispatched.push(validation_failure(call, error.clone()));
+                continue;
+            }
+            if let Err(error) =
+                validation::validate(call, &context.tool_definitions).and_then(|()| {
+                    if dynamic_mcp.contains_key(&call.name) {
+                        Ok(())
+                    } else {
+                        validation::semantics(call)
+                            .and_then(|()| validation::mcp_arguments(call, context))
+                    }
+                })
+            {
+                dispatched.push(recover_validation_failure(call, error)?);
+                continue;
+            }
+            if call.name == "TodoWrite" && !dynamic_mcp.contains_key(&call.name) {
+                match validated_todo_write(todos.clone(), call.arguments.clone()).and_then(
+                    |resolved| {
+                        let completion =
+                            tool_call_result::todo_write(call, todos.as_ref(), &resolved)?;
+                        let mut rendered_call = call.clone();
+                        rendered_call.arguments = resolved.clone();
+                        let messages = if publish_started {
+                            vec![codec::tool_started(&rendered_call, None)?]
+                        } else {
+                            Vec::new()
+                        };
+                        todos = Some(resolved);
+                        Ok(DispatchedTool {
+                            messages,
+                            completion: Some(completion),
+                        })
+                    },
+                ) {
+                    Ok(result) => dispatched.push(result),
+                    Err(error) => dispatched.push(recover_validation_failure(call, error)?),
+                }
                 continue;
             }
             let edit_path = if dynamic_mcp.contains_key(&call.name) {
@@ -138,6 +188,7 @@ impl ToolDispatcher {
                         next.publish_started,
                         dynamic_mcp,
                         &next.context,
+                        messages,
                     )
                     .await;
                 dispatched.push(match started {
@@ -147,7 +198,14 @@ impl ToolDispatcher {
                 continue;
             }
             let started = self
-                .start(call, message_index, publish_started, dynamic_mcp, context)
+                .start(
+                    call,
+                    message_index,
+                    publish_started,
+                    dynamic_mcp,
+                    context,
+                    messages,
+                )
                 .await;
             dispatched.push(match started {
                 Ok(started) => started,
@@ -169,6 +227,7 @@ impl ToolDispatcher {
                 next.publish_started,
                 &BTreeMap::new(),
                 &next.context,
+                &[],
             )
             .await
         {
@@ -182,6 +241,13 @@ impl ToolDispatcher {
         self.runtime.interrupt_for_message().await
     }
 
+    pub(crate) async fn complete_shell_awaits(
+        &self,
+        action: &pb::BackgroundTaskCompletionAction,
+    ) -> Result<Option<tool_call_dispatch::MatchedShellAwaits>> {
+        tool_call_dispatch::complete_shell_awaits(&self.runtime, action).await
+    }
+
     async fn start(
         &self,
         call: &ToolCall,
@@ -189,8 +255,44 @@ impl ToolDispatcher {
         publish_started: bool,
         dynamic_mcp: &BTreeMap<String, pb::McpToolDefinition>,
         context: &ExecContext,
+        history: &[CanonicalMessage],
     ) -> Result<DispatchedTool> {
-        let call = context.prepare_call(call)?;
+        let mut resume_variant_write: Option<(String, crate::model::ModelSelection)> = None;
+        let call = if dynamic_mcp.contains_key(&call.name) {
+            call.clone()
+        } else {
+            let mut normalized = call.clone();
+            if call.name != "CallMcpTool" {
+                validation::normalize_integers(&mut normalized.arguments);
+            }
+            let resume_target = task_resume_target(&normalized).map(str::to_owned);
+            let resume_model_variant = match (&self.store, resume_target.as_deref()) {
+                (Some(store), Some(target)) => {
+                    store
+                        .conversation_model_selection(&ConversationId::new(target))
+                        .await?
+                }
+                _ => None,
+            };
+            // 只有显式模型选择才覆盖子会话配置;仅继承父级默认值的续接
+            // 不得把它固化进子会话。
+            let explicit_model = normalized
+                .arguments
+                .as_object()
+                .is_some_and(runtime::task_resume_has_explicit_model);
+            let prepared = context
+                .prepare_call_with_resume_variant(&normalized, resume_model_variant.as_ref())?;
+            if let (Some(target), Some(selection)) =
+                (resume_target, prepared.arguments.get("model_selection"))
+            {
+                let selection: crate::model::ModelSelection =
+                    serde_json::from_value(selection.clone())?;
+                if explicit_model && resume_model_variant.as_ref() != Some(&selection) {
+                    resume_variant_write = Some((target, selection));
+                }
+            }
+            prepared
+        };
         let mut messages = if publish_started {
             vec![codec::tool_started(&call, dynamic_mcp.get(&call.name))?]
         } else {
@@ -204,8 +306,16 @@ impl ToolDispatcher {
             dynamic_mcp,
             context,
             self.store.as_ref(),
+            history,
         )
         .await?;
+        // 派发成功后才写入;失败的派发不留下新配置。消息在此仅被返回,
+        // 由调用方发送,因此子会话的首个请求仍会先读到新值。
+        if let (Some(store), Some((target, model))) = (self.store.as_ref(), resume_variant_write) {
+            store
+                .set_conversation_model_selection(&ConversationId::new(target), Some(&model))
+                .await?;
+        }
         messages.extend(started.messages);
         Ok(DispatchedTool {
             messages,
@@ -303,4 +413,181 @@ fn current_turn_step_count(messages: &[CanonicalMessage]) -> usize {
             _ => 0,
         })
         .sum()
+}
+
+#[cfg(test)]
+mod shell_await_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(shell_id: &str) -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "await-call".into(),
+            model_call_id: "model-call".into(),
+            name: "Await".into(),
+            arguments_text: json!({"shell_id": shell_id}).to_string(),
+            arguments: json!({"shell_id": shell_id}),
+            argument_error: None,
+        }
+    }
+
+    fn action(shell_id: &str) -> pb::BackgroundTaskCompletionAction {
+        pb::BackgroundTaskCompletionAction {
+            completions: vec![pb::BackgroundTaskCompletion {
+                task_id: shell_id.into(),
+                kind: pb::BackgroundTaskKind::Shell as i32,
+                status: pb::BackgroundTaskStatus::Success as i32,
+                title: "Background build".into(),
+                output_path: Some(format!("/tmp/{shell_id}.txt")),
+                detail: Some("exit_code: 7".into()),
+                reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
+                tool_call_id: Some("shell-call".into()),
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_completion_finishes_the_matching_pending_await() {
+        let runtime = CursorToolRuntime::default();
+        let dispatcher = ToolDispatcher::new(runtime.clone());
+        assert!(
+            dispatcher
+                .complete_shell_awaits(&action("99"))
+                .await
+                .unwrap()
+                .is_none(),
+            "an unmatched completion stays available for notification delivery"
+        );
+
+        let await_call = call("42");
+        let pending = runtime
+            .reserve_shell_await(&await_call, "42".into(), Some("shell-call".into()))
+            .await
+            .unwrap();
+        runtime
+            .reserve_shell_poll(
+                &await_call,
+                &ExecContext {
+                    terminals_folder: "/tmp/terminals".into(),
+                    ..ExecContext::default()
+                },
+                "42",
+                pending.started_at_ms,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let matched = dispatcher
+            .complete_shell_awaits(&action("42"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(matched.completions.len(), 1);
+        assert_eq!(matched.consumed, vec![("42".into(), "shell-call".into())]);
+        assert!(runtime.running_exec_ids().await.is_empty());
+        assert!(!matched.completions[0].result().is_error);
+        let Some(pb::tool_call::Tool::AwaitToolCall(tool)) =
+            &matched.completions[0].tool_call().tool
+        else {
+            panic!("expected Await tool completion")
+        };
+        assert!(matches!(
+            tool.result.as_ref().and_then(|result| result.result.as_ref()),
+            Some(pb::await_result::Result::Success(pb::AwaitSuccess {
+                await_result: Some(pb::await_success::AwaitResult::Complete(complete)),
+            }))
+                if complete.task_id == "42" && complete.exit_code == Some(7)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod resumed_task_model_tests {
+    use super::*;
+    use crate::model::{ConversationId, ModelConfig, ModelDirectory, SubagentKind};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    /// 单模型目录(测试辅助):与运行时目录同构。
+    fn test_directory(id: &str, display_name: &str) -> ModelDirectory {
+        let model = ModelConfig {
+            model_hash: id.into(),
+            display_name: display_name.into(),
+            model_id: "upstream-model".into(),
+            effort_options: vec!["low".into(), "high".into()],
+            context_options: vec!["200k".into(), "1m".into()],
+            ..Default::default()
+        };
+        ModelDirectory::new(std::slice::from_ref(&model), &[]).unwrap()
+    }
+
+    fn resumed_task() -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "resume-task".into(),
+            model_call_id: "model-call".into(),
+            name: "Task".into(),
+            arguments_text: json!({
+                "prompt": "continue",
+                "resume": "child-conversation",
+                "model_parameters": [{"id": "reasoning", "value": "low"}]
+            })
+            .to_string(),
+            arguments: json!({
+                "prompt": "continue",
+                "resume": "child-conversation",
+                "model_parameters": [{"id": "reasoning", "value": "low"}]
+            }),
+            argument_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resumed_task_persists_its_effective_model_variant() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let child = ConversationId::new("child-conversation");
+        store.ensure_conversation(&child).await.unwrap();
+        store
+            .set_conversation_model_selection(&child, Some(&serde_json::from_value(serde_json::json!({"kind":"local","id":"model-hash","parameters":{"context":"1m","reasoning":"high","fast":true}})).unwrap()))
+            .await
+            .unwrap();
+        let (results, _receiver) = tool_call_result::tool_result_channel();
+        let dispatcher = ToolDispatcher::with_results(
+            CursorToolRuntime::default(),
+            results,
+            store.clone(),
+            WebCache::default(),
+        );
+        let context = ExecContext {
+            default_subagent_model: "model-hash".into(),
+            default_subagent_model_variant: Some(serde_json::from_value(serde_json::json!({"kind":"local","id":"model-hash","parameters":{"context":"200k","reasoning":"high","fast":false}})).unwrap()),
+            model_directory: test_directory("model-hash", "Model"),
+            subagent_models: HashMap::from([(
+                SubagentKind::GeneralPurpose,
+                runtime::SubagentModel::Inherit,
+            )]),
+            allow_subagents: true,
+            ..ExecContext::default()
+        };
+
+        let dispatched = dispatcher
+            .start(&resumed_task(), 1, false, &BTreeMap::new(), &context, &[])
+            .await
+            .unwrap();
+
+        assert!(dispatched.completion.is_none());
+        assert_eq!(
+            store
+                .conversation_model_selection(&child)
+                .await
+                .unwrap()
+                .as_ref()
+                .map(|selection| selection.cursor_model_id(&context.model_directory)),
+            Some("model-hash-1m-low-fast".into())
+        );
+    }
 }

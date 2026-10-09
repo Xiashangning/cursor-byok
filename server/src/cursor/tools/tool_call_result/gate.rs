@@ -387,7 +387,15 @@ fn gate_mcp(tool: &mut pb::McpToolCall) {
             "[truncated: MCP content items exceeded {MCP_CONTENT_ITEM_LIMIT} items; showing {MCP_CONTENT_ITEM_LIMIT} of {original_items} items]"
         ));
     }
+    let original_text_bytes = success.content.iter().fold(0usize, |total, item| {
+        let bytes = match item.content.as_ref() {
+            Some(pb::mcp_tool_result_content_item::Content::Text(text)) => text.text.len(),
+            _ => 0,
+        };
+        total.saturating_add(bytes)
+    });
     let mut remaining_text = MCP_TEXT_LIMIT;
+    let mut text_truncated = false;
     let mut content = Vec::with_capacity(success.content.len() + notices.len());
     for mut item in std::mem::take(&mut success.content) {
         // MCP images are sent to the client as inline binary data. Truncating
@@ -399,18 +407,22 @@ fn gate_mcp(tool: &mut pb::McpToolCall) {
             let original = text.text.clone();
             let next = truncate_text("MCP content item", &original, MCP_TEXT_LIMIT);
             if remaining_text == 0 {
-                notices.push(truncation_notice(
-                    "MCP text",
-                    MCP_TEXT_LIMIT,
-                    MCP_TEXT_LIMIT,
-                    MCP_TEXT_LIMIT.saturating_add(original.len()),
-                ));
+                text_truncated |= !next.is_empty();
                 continue;
             }
             text.text = truncate_text("MCP text", &next, remaining_text);
+            text_truncated |= text.text != next;
             remaining_text = remaining_text.saturating_sub(text.text.len());
         }
         content.push(item);
+    }
+    if text_truncated {
+        notices.push(truncation_notice(
+            "MCP text",
+            MCP_TEXT_LIMIT,
+            MCP_TEXT_LIMIT.saturating_sub(remaining_text),
+            original_text_bytes,
+        ));
     }
     content.extend(notices.into_iter().map(mcp_notice));
     success.content = content;
@@ -505,11 +517,9 @@ fn gate_mcp_resources(tool: &mut pb::ListMcpResourcesToolCall) {
             .push(pb::list_mcp_resources_exec_result::McpResource {
                 uri: "truncated:list-mcp-resources".into(),
                 name: Some("truncated".into()),
-                description: Some(truncation_notice(
-                    "ListMcpResources",
-                    MCP_TEXT_LIMIT,
-                    success.resources.len(),
-                    original,
+                description: Some(format!(
+                    "[truncated: ListMcpResources result exceeded {MCP_RESOURCE_LIMIT} resources; showing {} of {original} resources]",
+                    success.resources.len()
                 )),
                 ..Default::default()
             });
@@ -644,14 +654,37 @@ fn truncate_text(tool_name: &str, content: &str, limit: usize) -> String {
         }
         let kept = utf8_prefix(content, limit - notice.len());
         // `notice.len()` grows with the digit count of `shown`, so `kept.len()`
-        // can alternate between two values across a power-of-ten boundary
-        // instead of reaching a fixed point. Settle on the first repeat; the
-        // reported count is then off by one at most and the result still fits.
+        // can alternate between two values across a power-of-ten boundary.
         if kept.len() == shown || previous == Some(kept.len()) {
-            return format!("{}{notice}", kept.trim_end_matches('\n'));
+            return truncated_prefix_with_notice(tool_name, content, limit, original, kept.len());
         }
         previous = Some(shown);
         shown = kept.len();
+    }
+}
+
+fn truncated_prefix_with_notice(
+    tool_name: &str,
+    content: &str,
+    limit: usize,
+    original: usize,
+    initial_cap: usize,
+) -> String {
+    let mut cap = initial_cap;
+    loop {
+        let kept = utf8_prefix(content, cap).trim_end_matches('\n');
+        let notice = format!(
+            "\n\n[truncated: {tool_name} result exceeded {limit} bytes; showing {} of {original} bytes]",
+            kept.len()
+        );
+        if notice.len() >= limit {
+            return utf8_prefix(content, limit).to_string();
+        }
+        let available = limit - notice.len();
+        if kept.len() <= available {
+            return format!("{kept}{notice}");
+        }
+        cap = available;
     }
 }
 
@@ -732,6 +765,30 @@ mod tests {
         })
     }
 
+    fn mcp_tool(texts: Vec<String>) -> pb::McpToolCall {
+        pb::McpToolCall {
+            args: None,
+            result: Some(pb::McpToolResult {
+                result: Some(pb::mcp_tool_result::Result::Success(pb::McpSuccess {
+                    content: texts
+                        .into_iter()
+                        .map(|text| pb::McpToolResultContentItem {
+                            content: Some(pb::mcp_tool_result_content_item::Content::Text(
+                                pb::McpTextContent {
+                                    text,
+                                    output_location: None,
+                                },
+                            )),
+                        })
+                        .collect(),
+                    is_error: false,
+                    structured_content: None,
+                })),
+            }),
+            description: None,
+        }
+    }
+
     #[test]
     fn truncate_text_never_exceeds_its_limit() {
         let content = "b".repeat(200);
@@ -746,34 +803,105 @@ mod tests {
     }
 
     #[test]
-    fn truncate_text_terminates_when_the_notice_length_oscillates() {
-        // `limit` values where the notice grows and shrinks with the digit count
-        // of the reported byte count, so the fixed point is never reached.
-        assert!(truncate_text("Grep", &"b".repeat(200), 78).len() <= 78);
-        assert!(truncate_text("Grep", &"b".repeat(200), 170).len() <= 170);
-        assert!(truncate_text("MCP text", &"b".repeat(500), 82).len() <= 82);
+    fn truncate_text_reports_the_actual_utf8_prefix_size() {
+        let content = "😀".repeat(1_000);
+        let output = truncate_text("Grep", &content, 81);
+        let (kept, notice) = output
+            .split_once("\n\n[truncated:")
+            .expect("the truncation notice fits");
+        assert!(
+            notice.contains(&format!("showing {} of", kept.len())),
+            "notice must report the actual UTF-8 prefix size: {output}"
+        );
+        assert!(output.len() <= 81);
     }
 
     #[test]
-    fn grep_content_gate_survives_a_nearly_exhausted_byte_budget() {
-        // 16 matches leave 16 bytes of the 32 KiB content budget, which is less
-        // than the truncation notice for the 17th match.
-        let mut matches = vec!["a".repeat(2047); 16];
-        matches.push("b".repeat(100));
-        let mut tool = grep_tool(matches);
-        let mut content = String::new();
-        tool_completion("Grep", &mut tool, &mut content);
+    fn mcp_total_text_truncation_always_adds_a_notice() {
+        let mut tool = mcp_tool(vec!["a".repeat(MCP_TEXT_LIMIT - 8), "b".repeat(100)]);
+        gate_mcp(&mut tool);
+        let success = match tool.result.unwrap().result.unwrap() {
+            pb::mcp_tool_result::Result::Success(success) => success,
+            _ => panic!("expected MCP success"),
+        };
+        assert_eq!(success.content.len(), 3);
+        assert!(is_mcp_notice(success.content.last().unwrap()));
     }
 
     #[test]
-    fn grep_content_gate_terminates_on_an_oscillating_remaining_budget() {
-        // The same path, tuned so the remaining budget lands on a `limit` where
-        // the truncation notice length oscillates.
-        let mut matches = vec!["a".repeat(2043); 15];
-        matches.push("a".repeat(2045));
-        matches.push("b".repeat(200));
-        let mut tool = grep_tool(matches);
-        let mut content = String::new();
-        tool_completion("Grep", &mut tool, &mut content);
+    fn grep_content_gate_truncates_nearly_exhausted_and_oscillating_budgets() {
+        for matches in [
+            {
+                // 16 matches leave too little room for the truncation notice.
+                let mut matches = vec!["a".repeat(2047); 16];
+                matches.push("b".repeat(100));
+                matches
+            },
+            {
+                // The remaining budget oscillates with the notice length.
+                let mut matches = vec!["a".repeat(2043); 15];
+                matches.push("a".repeat(2045));
+                matches.push("b".repeat(200));
+                matches
+            },
+        ] {
+            let mut tool = grep_tool(matches);
+            let mut content = String::new();
+            tool_completion("Grep", &mut tool, &mut content);
+            let pb::tool_call::Tool::GrepToolCall(tool) = tool else {
+                panic!("expected Grep tool");
+            };
+            let Some(pb::grep_result::Result::Success(success)) = tool.result.unwrap().result
+            else {
+                panic!("expected Grep success");
+            };
+            let Some(pb::grep_union_result::Result::Content(result)) =
+                success.active_editor_result.unwrap().result
+            else {
+                panic!("expected Grep content");
+            };
+            assert!(result.client_truncated);
+            assert!(grep_content_bytes(&result.matches) <= GREP_CONTENT_LIMIT);
+            assert!(result
+                .matches
+                .iter()
+                .flat_map(|file| &file.matches)
+                .any(is_grep_notice));
+        }
+    }
+
+    #[test]
+    fn list_mcp_resources_reports_the_cap_it_actually_applied() {
+        let resources = (0..MCP_RESOURCE_LIMIT + 50)
+            .map(|index| pb::list_mcp_resources_exec_result::McpResource {
+                uri: format!("mcp://resource/{index}"),
+                ..Default::default()
+            })
+            .collect();
+        let mut tool = pb::ListMcpResourcesToolCall {
+            args: None,
+            result: Some(pb::ListMcpResourcesExecResult {
+                result: Some(pb::list_mcp_resources_exec_result::Result::Success(
+                    pb::ListMcpResourcesSuccess { resources },
+                )),
+            }),
+        };
+
+        gate_mcp_resources(&mut tool);
+
+        let pb::list_mcp_resources_exec_result::Result::Success(success) =
+            tool.result.unwrap().result.unwrap()
+        else {
+            panic!("expected a successful result");
+        };
+        let notice = success.resources.last().unwrap();
+        assert_eq!(notice.uri, "truncated:list-mcp-resources");
+        assert_eq!(
+            notice.description.as_deref(),
+            Some(
+                "[truncated: ListMcpResources result exceeded 200 resources; \
+                 showing 200 of 250 resources]"
+            )
+        );
     }
 }

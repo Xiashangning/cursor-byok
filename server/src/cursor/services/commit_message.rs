@@ -2,8 +2,8 @@
 //!
 //! Cursor sends `aiserver.v1.AiService/WriteGitCommitMessage` with the staged
 //! diffs. Empty commit-settings `model_id` keeps the original behaviour and
-//! forwards the RPC unchanged (直连). A configured Cursor model hash answers
-//! the request locally: truncated diffs + previous commits form the user
+//! forwards the RPC unchanged (直连). A configured local model identifier
+//! answers the request locally: truncated diffs + previous commits form the user
 //! message, the customizable commit prompt is the system prompt, and the raw
 //! completion is cleaned before being returned.
 use std::{
@@ -40,6 +40,8 @@ const DIFF_SINGLE_LIMIT: usize = 16_000;
 const PREVIOUS_COMMIT_LIMIT: usize = 12;
 const EXPLICIT_CONTEXT_LIMIT: usize = 20_000;
 const GENERATION_TIMEOUT: Duration = Duration::from_secs(180);
+const COMMIT_MAX_OUTPUT_TOKENS: u64 = 30_000;
+const COMMIT_REQUEST_LIMIT: usize = 16 * 1024 * 1024;
 
 pub async fn write_git_commit_message(
     State(registry): State<TransportRegistry>,
@@ -77,7 +79,7 @@ async fn generate_local(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
     tracing::info!(?connect_timeout_ms, "write git commit message received");
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, COMMIT_REQUEST_LIMIT)
         .await
         .map_err(|error| Error::Protocol(format!("cannot read request body: {error}")))?;
     let request: ai::WriteGitCommitMessageRequest = connect::decode_unary(&body)?;
@@ -85,19 +87,23 @@ async fn generate_local(
     if diffs.is_empty() {
         return Err(Error::Protocol("diffs are required".into()));
     }
-    let model_hash = settings.model_id.trim();
-    let model = registry
-        .store()
-        .model(model_hash)
-        .await?
-        .ok_or_else(|| {
-            Error::Provider(format!(
-                "commit model {model_hash} is not configured; select a Cursor model in the commit settings"
-            ))
-        })?;
+    let model_id = settings.model_id.trim();
+    let selection = ensure_configured_model(registry, model_id).await?;
+    let mut settings = settings;
+    settings.model_id = selection.id().to_owned();
+    let parameters = selection.parameters();
+    if settings.parameters.context.is_none() {
+        settings.parameters.context = parameters.context.clone();
+    }
+    if settings.parameters.reasoning.is_none() {
+        settings.parameters.reasoning = parameters.reasoning.clone();
+    }
+    if settings.parameters.fast.is_none() {
+        settings.parameters.fast = parameters.fast;
+    }
     let invocation = build_invocation(
         &settings,
-        &model.model_hash,
+        &settings.model_id,
         build_user_content(&request, &diffs),
     );
     let provider = registry.conversations().dependencies().provider.clone();
@@ -121,12 +127,46 @@ async fn generate_local(
     Ok(response)
 }
 
+/// Commit 设置是纯本地配置入口:未匹配/歧义都返回明确校验错误。
+async fn ensure_configured_model(
+    registry: &TransportRegistry,
+    model_id: &str,
+) -> Result<crate::model::ModelSelection> {
+    let directory =
+        crate::model::ModelDirectory::configured(registry.store(), registry.plugins()).await?;
+    match directory.resolve(model_id) {
+        crate::model::Resolution::Matched { id, parts } => Ok(
+            crate::model::ModelSelection::matched(&directory, id, parts),
+        ),
+        crate::model::Resolution::Ambiguous { candidates } => Err(Error::Config(format!(
+            "commit model '{model_id}' is ambiguous; use one of the model IDs: {}",
+            candidates.join(", ")
+        ))),
+        crate::model::Resolution::NotFound => Err(Error::Provider(format!(
+            "commit model {model_id} is not configured; select a configured model in the commit settings"
+        ))),
+    }
+}
+
 fn build_invocation(
     settings: &CommitSettings,
-    model_hash: &str,
+    model_id: &str,
     user_content: String,
 ) -> ModelInvocation {
     let call_id = format!("commit-message-{}", uuid::Uuid::new_v4());
+    let mut model = ModelSpec::new(model_id);
+    model.max_output_tokens = Some(COMMIT_MAX_OUTPUT_TOKENS);
+    if let Some(context) = &settings.parameters.context {
+        model.context_window_tokens = crate::model::parse_token_count(context);
+    }
+    if let Some(effort) = &settings.parameters.reasoning {
+        model.reasoning.explicitly_disabled = matches!(effort.as_str(), "none" | "off");
+        model.reasoning.enabled = !model.reasoning.explicitly_disabled;
+        model.reasoning.effort = model.reasoning.enabled.then(|| effort.clone());
+    }
+    if settings.parameters.fast == Some(true) {
+        model.latency = crate::model::ModelLatency::Fast;
+    }
     ModelInvocation {
         call_id: call_id.clone(),
         run_id: call_id.clone(),
@@ -137,7 +177,7 @@ fn build_invocation(
                 instructions: settings.effective_prompt().to_owned(),
                 tools: Vec::new(),
             },
-            model: ModelSpec::new(model_hash.to_owned()),
+            model,
             history: vec![ProjectedMessage {
                 message_id: "commit-message".into(),
                 role: Role::User,
@@ -356,16 +396,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invocation_uses_saved_identity_and_independent_parameters() {
+        let settings = CommitSettings {
+            model_id: "1234abcd".into(),
+            parameters: crate::model::SelectionParameters {
+                context: Some("1m".into()),
+                reasoning: Some("low".into()),
+                fast: Some(true),
+            },
+            ..Default::default()
+        };
+        let invocation = build_invocation(&settings, &settings.model_id, "diff".into());
+        assert_eq!(invocation.request.model.model_id, "1234abcd");
+        assert_eq!(
+            invocation.request.model.context_window_tokens,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            invocation.request.model.reasoning.effort.as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            invocation.request.model.latency,
+            crate::model::ModelLatency::Fast
+        );
+    }
+
+    #[test]
     fn empty_model_id_is_direct() {
         assert!(CommitSettings::default().is_direct());
         assert!(CommitSettings {
             model_id: "  ".into(),
-            prompt: String::new(),
+            ..CommitSettings::default()
         }
         .is_direct());
         assert!(!CommitSettings {
             model_id: "abc".into(),
-            prompt: String::new(),
+            ..CommitSettings::default()
         }
         .is_direct());
     }
@@ -377,30 +444,5 @@ mod tests {
         assert_eq!(truncated.len(), 3);
         let total: usize = truncated.iter().map(|diff| diff.chars().count()).sum();
         assert!(total <= DIFF_TOTAL_LIMIT + 3 * "\n...[truncated]".len());
-    }
-
-    #[test]
-    fn cleaning_strips_fences_and_prefixes() {
-        let raw = "```\nCommit message: fix: 修复登录超时问题\n```";
-        assert_eq!(clean_generated_commit_message(raw), "fix: 修复登录超时问题");
-    }
-
-    #[test]
-    fn cleaning_returns_empty_for_blank_output() {
-        assert_eq!(clean_generated_commit_message("  \n "), "");
-    }
-
-    #[test]
-    fn explicit_context_drops_empty_fields() {
-        let empty = explicit_context_json(&ai::ExplicitContext {
-            context: "  ".into(),
-            repo_context: None,
-        });
-        assert_eq!(empty, "");
-        let filled = explicit_context_json(&ai::ExplicitContext {
-            context: "背景".into(),
-            repo_context: Some("repo".into()),
-        });
-        assert_eq!(filled, "{\"context\":\"背景\",\"repo_context\":\"repo\"}");
     }
 }

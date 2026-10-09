@@ -11,7 +11,7 @@ use crate::{
     Error, Result,
 };
 
-use super::REPLAY_ENVELOPE_PREFIX;
+use super::{COMPLETED_TOOL_MESSAGES_FIELD, REPLAY_ENVELOPE_PREFIX};
 
 pub fn decode(data: &[u8], internal_id: String) -> Result<CanonicalMessage> {
     let value: Value = serde_json::from_slice(data)?;
@@ -70,6 +70,17 @@ pub fn decode_pending(value: &str) -> Result<RecoveredToolRound> {
         .ok_or_else(|| {
             Error::Protocol("Cursor pending assistant is missing pendingToolCallStartedAtMs".into())
         })?;
+    let completed_messages = wire
+        .get("providerOptions")
+        .and_then(Value::as_object)
+        .and_then(|options| options.get("cursor"))
+        .and_then(Value::as_object)
+        .and_then(|cursor| cursor.get(COMPLETED_TOOL_MESSAGES_FIELD))
+        .cloned()
+        .map(serde_json::from_value::<Vec<CanonicalMessage>>)
+        .transpose()?
+        .unwrap_or_default();
+    let completed_call_ids = super::completed_call_ids(&completed_messages);
     let internal_id = format!(
         "cursor-pending:{}",
         BlobId::digest(value.as_bytes()).to_base64()
@@ -98,7 +109,7 @@ pub fn decode_pending(value: &str) -> Result<RecoveredToolRound> {
         .filter(|value| !value.is_empty())
         .unwrap_or(&internal_id)
         .to_string();
-    let calls = tool_calls
+    let mut calls = tool_calls
         .into_iter()
         .enumerate()
         .map(|(index, call)| {
@@ -119,14 +130,26 @@ pub fn decode_pending(value: &str) -> Result<RecoveredToolRound> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    calls.retain(|call| !completed_call_ids.contains(&call.call_id));
+    if calls.is_empty() {
+        return Err(Error::Protocol(
+            "Cursor pending assistant has no unfinished tool calls".into(),
+        ));
+    }
+    let has_completed = !completed_messages.is_empty();
     Ok(RecoveredToolRound {
         assistant: ToolRoundAssistant {
-            text,
-            thinking,
+            text: if has_completed { String::new() } else { text },
+            thinking: if has_completed {
+                String::new()
+            } else {
+                thinking
+            },
             model_call_id,
-            replay_state,
+            replay_state: if has_completed { None } else { replay_state },
         },
         calls,
+        completed_messages,
         started_at_ms,
     })
 }

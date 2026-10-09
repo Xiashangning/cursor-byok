@@ -60,9 +60,8 @@ impl PromptCompiler {
         let mut dynamic_tools = dynamic_tools.to_vec();
         dynamic_tools.sort_by(|left, right| left.name.cmp(&right.name));
         append_dynamic_tools(&mut tools, dynamic_tools)?;
-        if !model.supports_image_generation {
-            tools.retain(|tool| tool.name != "GenerateImage");
-        }
+        // No server-side image executor is installed, even for image-capable models.
+        tools.retain(|tool| tool.name != "GenerateImage");
         let fake_model_name = model
             .display_name
             .as_deref()
@@ -139,7 +138,7 @@ mod tests {
                 &ModelSpec::new("model"),
                 &[],
                 false,
-                "- inherit\n- Configured [provider-model] — effort: low, high; context: 272k, 1m",
+                "- inherit\n- abcd1234 (Configured [provider-model]): reasoning: low, high; context: 272k, 1m",
             )
             .unwrap();
         let task = prompt
@@ -147,10 +146,14 @@ mod tests {
             .iter()
             .find(|tool| tool.name == "Task")
             .unwrap();
-        assert!(task.description.contains("Configured [provider-model]"));
         assert!(task
             .description
-            .contains("effort: low, high; context: 272k, 1m"));
+            .contains("abcd1234 (Configured [provider-model])"));
+        assert!(task
+            .description
+            .contains("reasoning: low, high; context: 272k, 1m"));
+        // 说明写入:展示名用于匹配,提交值必须是模型 ID。
+        assert!(task.description.contains("submit the model ID"));
         assert!(!task.description.contains("{{AVAILABLE_SUBAGENT_MODELS}}"));
     }
 }

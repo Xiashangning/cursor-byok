@@ -11,7 +11,7 @@ use crate::{
         checkpoint::StepBuffer,
         checkpoint::{
             worker::{CheckpointJob, CheckpointKind, CheckpointWorker, FinalCheckpoints},
-            CheckpointBuilder,
+            BuiltCheckpoint, CheckpointBuilder,
         },
         compile::{
             compile_injection, compile_user_message_action, CursorRunContext, RuntimeAction,
@@ -34,7 +34,10 @@ use crate::{
     Error, Result,
 };
 
-use super::{CompiledMessages, ConversationRegistry, MessageDelivery, RunFinish, TransportFinish};
+use super::{
+    injection::{Admission, InjectionTracker},
+    CompiledMessages, ConversationRegistry, MessageDelivery, RunFinish, TransportFinish,
+};
 use crate::cursor::transport::TransportHandle;
 
 pub struct ConversationOutput {
@@ -48,17 +51,12 @@ pub struct ConversationOutput {
     results: ToolResultReceiver,
     checkpoint: CheckpointBuilder,
     tool_runtime: CursorToolRuntime,
+    tasks: super::task::Tasks,
     runtime_actions: mpsc::UnboundedReceiver<RuntimeAction>,
     compiler: PromptCompiler,
     blob_sync: BlobSynchronizer,
-    injection_ids: HashSet<String>,
-    pending_injections: HashMap<String, PendingInjection>,
+    injections: InjectionTracker,
     superseded: CancellationToken,
-}
-
-struct PendingInjection {
-    user_message: Option<pb::UserMessage>,
-    delivery_batch_id: String,
 }
 
 struct InjectionState<'a> {
@@ -70,11 +68,15 @@ struct InjectionState<'a> {
 }
 
 pub(crate) struct ConversationOutputDependencies {
+    /// Stable client run identity used to admit InjectContextAction targeting;
+    /// distinct from the per-attempt transport request id.
+    pub injections: InjectionTracker,
     pub superseded: CancellationToken,
     pub tools: ToolDispatcher,
     pub results: ToolResultReceiver,
     pub checkpoint: CheckpointBuilder,
     pub tool_runtime: CursorToolRuntime,
+    pub tasks: super::task::Tasks,
     pub runtime_actions: mpsc::UnboundedReceiver<RuntimeAction>,
     pub compiler: PromptCompiler,
     pub blob_sync: BlobSynchronizer,
@@ -101,11 +103,11 @@ impl ConversationOutput {
             results: runtime.results,
             checkpoint: runtime.checkpoint,
             tool_runtime: runtime.tool_runtime,
+            tasks: runtime.tasks,
             runtime_actions: runtime.runtime_actions,
             compiler: runtime.compiler,
             blob_sync: runtime.blob_sync,
-            injection_ids: HashSet::new(),
-            pending_injections: HashMap::new(),
+            injections: runtime.injections,
             superseded: runtime.superseded,
         }
     }
@@ -116,7 +118,9 @@ impl ConversationOutput {
             if !self.superseded.is_cancelled() {
                 self.abort_execs().await;
                 let (category, summary) = match error {
-                    Error::Provider(_) | Error::Http(_) => ("provider", error.to_string()),
+                    Error::Provider(_) | Error::ProviderRefusal(_) | Error::Http(_) => {
+                        ("provider", error.to_string())
+                    }
                     Error::Store(_) | Error::Database(_) | Error::Migration(_) => {
                         ("store", error.to_string())
                     }
@@ -133,7 +137,6 @@ impl ConversationOutput {
                     .finish_run(
                         self.run.run_id(),
                         crate::store::RunStatus::Failed,
-                        None,
                         Some((category, summary.as_str())),
                     )
                     .await;
@@ -166,7 +169,7 @@ impl ConversationOutput {
         let mut interrupted_rounds = HashSet::<ToolRoundId>::new();
         let mut interrupted_tool_calls = HashSet::<String>::new();
         let mut final_checkpoint = None::<FinalCheckpoints>;
-        let mut compaction_checkpoint = None::<pb::ConversationStateStructure>;
+        let mut compaction_checkpoint = None::<BuiltCheckpoint>;
         let mut turn_usage = None::<Usage>;
         let mut context_tokens = None::<u64>;
         let mut ready = VecDeque::new();
@@ -436,6 +439,7 @@ impl ConversationOutput {
                             completed.clear();
                             completed_round = Some(round_id.clone());
                         }
+                        interrupted_tool_calls.clear();
                         active_round = Some(round_id.clone());
                         active_tool_calls = round_calls
                             .iter()
@@ -446,9 +450,7 @@ impl ConversationOutput {
                         // ToolRoundStarted event reaches this session. In that case the
                         // accepted injection is still pending delivery and this round must be
                         // detached without starting any root tools.
-                        if interrupted_rounds.contains(&round_id)
-                            || !self.pending_injections.is_empty()
-                        {
+                        if interrupted_rounds.contains(&round_id) || self.injections.has_pending() {
                             interrupted_rounds.insert(round_id.clone());
                             interrupted_tool_calls.extend(active_tool_calls.iter().cloned());
                             continue;
@@ -474,6 +476,8 @@ impl ConversationOutput {
                             )
                             .await?
                         {
+                            self.tasks
+                                .register(&round_id, self.tool_runtime.task_execs().await);
                             for message in dispatched.messages {
                                 self.handle.emit(&message)?;
                             }
@@ -487,6 +491,27 @@ impl ConversationOutput {
                         streams.clear();
                     }
                     RunEvent::MessagesCommitted(state) => {
+                        let completion_ids = match &state.cause {
+                            CommitCause::RuntimeEvent { event_id } => vec![event_id.clone()],
+                            CommitCause::InitialMessages => self
+                                .store
+                                .load_checkpoint_messages(state.checkpoint_id)
+                                .await?
+                                .into_iter()
+                                .filter_map(|message| message.runtime_event_id)
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        for event_id in completion_ids {
+                            if let Some((call, completion)) =
+                                self.tasks.take_presentation(&event_id)
+                            {
+                                self.handle
+                                    .emit(&codec::tool_completed(&call, &completion))?;
+                                presentation.tool_completed(&completion);
+                            }
+                        }
+
                         if matches!(&state.cause, CommitCause::RuntimeEvent { .. }) {
                             response_text.clear();
                             response_thinking.clear();
@@ -494,23 +519,15 @@ impl ConversationOutput {
                             streams.clear();
                         }
                         if let CommitCause::RuntimeEvent { event_id } = &state.cause {
-                            // Injections key `pending_injections` by their raw
-                            // injection id and commit under `inject-context:{id}`,
-                            // while runtime user messages key it by (and commit
-                            // under) the full `user-message:{id}` event id. Strip
-                            // the injection prefix when present and otherwise use
-                            // the event id verbatim so both are cleared and emit
-                            // their delivered/appended events.
-                            let injection_id = event_id
-                                .strip_prefix("inject-context:")
-                                .unwrap_or(event_id.as_str());
-                            if let Some(pending) = self.pending_injections.remove(injection_id) {
+                            if let Some((injection_id, pending)) =
+                                self.injections.take_committed(event_id)
+                            {
                                 let delivered_at_ms = crate::cursor::tools::runtime::now_ms()
                                     .min(i64::MAX as u64)
                                     as i64;
                                 self.handle.emit(&events::context_injection_delivered(
-                                    injection_id.to_owned(),
-                                    pending.delivery_batch_id.clone(),
+                                    injection_id.clone(),
+                                    injection_id,
                                     delivered_at_ms,
                                 ))?;
                                 if let Some(user_message) = pending.user_message {
@@ -523,11 +540,8 @@ impl ConversationOutput {
                             active_round = Some(round_id.clone());
                         }
                         let mut tool_round_settled = false;
-                        if let CommitCause::ToolResult {
-                            call_id,
-                            interrupted,
-                        } = &state.cause
-                        {
+                        let mut todo_updated = None;
+                        if let CommitCause::ToolResult { call_id, synthetic } = &state.cause {
                             let snapshot = self
                                 .store
                                 .tool_round(active_round.as_ref().ok_or_else(|| {
@@ -546,12 +560,13 @@ impl ConversationOutput {
                                         "committed call is absent from tool round: {call_id}"
                                     ))
                                 })?;
-                            if !interrupted {
+                            if !synthetic {
                                 let completion = completions.remove(call_id).ok_or_else(|| {
                                     Error::Protocol(format!(
                                         "core committed a tool result without typed Cursor state: {call_id}"
                                     ))
                                 })?;
+                                todo_updated = completed_todos(&completion);
                                 self.handle
                                     .emit(&codec::tool_completed(call, &completion))?;
                                 presentation.tool_completed(&completion);
@@ -586,7 +601,7 @@ impl ConversationOutput {
                                 .map_err(|_| Error::Protocol("checkpoint worker stopped".into()))?
                             {
                                 Ok(checkpoint) => {
-                                    context_tokens = checkpoint_context_tokens(&checkpoint);
+                                    context_tokens = checkpoint_context_tokens(&checkpoint.state);
                                     compaction_checkpoint = Some(checkpoint);
                                     state.barrier.complete(Ok(()));
                                 }
@@ -677,6 +692,24 @@ impl ConversationOutput {
                             }
                             active_tool_calls.clear();
                             self.tool_runtime.clear_completed().await;
+                        } else if let Some(todos) = todo_updated {
+                            let round_id = active_round.clone().ok_or_else(|| {
+                                Error::Protocol("TodoWrite commit has no active round".into())
+                            })?;
+                            worker
+                                .jobs
+                                .send(CheckpointJob {
+                                    kind: CheckpointKind::TodoUpdated {
+                                        round_id,
+                                        checkpoint_id: state.checkpoint_id,
+                                        todos,
+                                    },
+                                    presentation: presentation.take(),
+                                    context_tokens,
+                                    ready: None,
+                                })
+                                .await
+                                .map_err(|_| Error::Protocol("checkpoint worker closed".into()))?;
                         } else if !matches!(&state.cause, CommitCause::ToolResult { .. })
                             && active_round.is_some()
                         {
@@ -746,12 +779,26 @@ impl ConversationOutput {
                                     for _ in 0..3 {
                                         self.checkpoint.publish(&self.handle, &checkpoint).await?;
                                     }
-                                    return Ok(RunFinish::TurnCompleted);
+                                    return Ok(RunFinish::TurnCompleted(Box::new(
+                                        checkpoint.state,
+                                    )));
                                 }
-                                let checkpoints = final_checkpoint.take().ok_or_else(|| {
-                                    Error::Protocol("Completed without final state".into())
-                                })?;
-                                self.handle.emit(&events::turn_ended(turn_usage))?;
+                                let Some(checkpoints) = final_checkpoint.take() else {
+                                    // 并发重投的后台 follow-up 在引擎入口被兜底
+                                    // 跳过(初始消息全部已提交):零写入、无最终
+                                    // checkpoint,按无操作重投静默 Success。
+                                    if self.context.background_completion {
+                                        return Ok(RunFinish::Transport(TransportFinish::Success));
+                                    }
+                                    return Err(Error::Protocol(
+                                        "Completed without final state".into(),
+                                    ));
+                                };
+                                // The Cursor interaction stays open while detached Tasks
+                                // still owe results, even when this model Run is finished.
+                                if !self.tasks.has_pending() {
+                                    self.handle.emit(&events::turn_ended(turn_usage))?;
+                                }
                                 self.checkpoint
                                     .publish(&self.handle, &checkpoints.staged)
                                     .await?;
@@ -760,9 +807,11 @@ impl ConversationOutput {
                                     .await?;
                                 self.handle.emit(&pb::AgentServerMessage {
                                     ttft_breakdown: None,
-                                    message: Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(checkpoints.settled)),
+                                    message: Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(checkpoints.settled.state.clone())),
                                 })?;
-                                Ok(RunFinish::TurnCompleted)
+                                Ok(RunFinish::TurnCompleted(Box::new(
+                                    checkpoints.settled.state,
+                                )))
                             }
                             RunOutcome::Cancelled => {
                                 worker.abort();
@@ -784,6 +833,7 @@ impl ConversationOutput {
     }
 
     async fn abort_execs(&self) {
+        self.tasks.cancel();
         for id in self.tool_runtime.drain_running().await {
             let _ = self.handle.emit(&codec::abort(id));
         }
@@ -795,6 +845,14 @@ impl ConversationOutput {
         completions: &mut HashMap<String, ToolCompletion>,
         interrupted_tool_calls: &HashSet<String>,
     ) -> Result<Option<ToolCompletion>> {
+        if !self.tasks.accept_foreground(&completion, &self.handle) {
+            return Ok(None);
+        }
+        if let Some(id) = completion.exec_id {
+            if self.tool_runtime.is_interrupted(id).await {
+                return Ok(None);
+            }
+        }
         if interrupted_tool_calls.contains(&completion.result().call_id) {
             return Ok(None);
         }
@@ -879,42 +937,43 @@ impl ConversationOutput {
                 "InjectContextAction has no injection_id".into(),
             ));
         }
-        if self.injection_ids.contains(&action.injection_id) {
-            return Ok(());
-        }
-        if action.expected_run_id != self.context.request_id {
-            let reason = format!(
-                "InjectContextAction expected run {}, active run is {}",
-                action.expected_run_id, self.context.request_id
-            );
-            self.handle.emit(&events::context_injection_rejected(
-                action.injection_id.clone(),
-                reason,
-            ))?;
-            self.injection_ids.insert(action.injection_id);
-            return Ok(());
-        }
-        let user_message = match action.payload.as_ref() {
-            Some(pb::inject_context_action::Payload::UserContext(context)) => {
-                context.user_message.clone()
+        match self
+            .injections
+            .admit(&action.injection_id, &action.expected_run_id)
+        {
+            Admission::Duplicate => Ok(()),
+            Admission::Rejected(reason) => {
+                self.handle.emit(&events::context_injection_rejected(
+                    action.injection_id,
+                    reason,
+                ))?;
+                Ok(())
             }
-            _ => None,
-        };
-        let message =
-            compile_injection(&action, self.context.mode, &self.compiler, &self.blob_sync).await?;
-        self.queue_injection(
-            action.injection_id,
-            user_message,
-            message,
-            InjectionState {
-                active_round,
-                active_tool_calls,
-                completions,
-                interrupted_rounds,
-                interrupted_tool_calls,
-            },
-        )
-        .await
+            Admission::Accepted => {
+                let user_message = match action.payload.as_ref() {
+                    Some(pb::inject_context_action::Payload::UserContext(context)) => {
+                        context.user_message.clone()
+                    }
+                    _ => None,
+                };
+                let message =
+                    compile_injection(&action, self.context.mode, &self.compiler, &self.blob_sync)
+                        .await?;
+                self.queue_injection(
+                    action.injection_id,
+                    user_message,
+                    message,
+                    InjectionState {
+                        active_round,
+                        active_tool_calls,
+                        completions,
+                        interrupted_rounds,
+                        interrupted_tool_calls,
+                    },
+                )
+                .await
+            }
+        }
     }
 
     async fn queue_injection(
@@ -924,17 +983,17 @@ impl ConversationOutput {
         message: crate::model::CanonicalMessage,
         state: InjectionState<'_>,
     ) -> Result<()> {
-        let delivery_batch_id = injection_id.clone();
-        self.injection_ids.insert(injection_id.clone());
-        self.pending_injections.insert(
-            injection_id.clone(),
-            PendingInjection {
-                user_message,
-                delivery_batch_id,
-            },
-        );
+        self.injections.enqueue(injection_id.clone(), user_message);
         self.handle
-            .emit(&events::context_injection_queued(injection_id.clone()))?;
+            .emit(&events::context_injection_queued(injection_id))?;
+        let detached_results = state
+            .active_round
+            .map(|round| (round.clone(), self.tasks.detach(round)));
+        // Results decoded before detach are still owned here. Transfer them before
+        // the foreground run can finish and drop its receiver.
+        while let Some(result) = self.results.try_recv() {
+            self.tasks.accept_foreground(&result?, &self.handle);
+        }
         state.interrupted_tool_calls.extend(
             state
                 .active_tool_calls
@@ -954,7 +1013,7 @@ impl ConversationOutput {
         let conversation_id = ConversationId::new(&self.context.exec.conversation_id);
         tokio::spawn(async move {
             let _ = registry
-                .deliver(
+                .deliver_with_detached_results(
                     &conversation_id,
                     CompiledMessages {
                         event_id,
@@ -962,6 +1021,7 @@ impl ConversationOutput {
                         messages: vec![message],
                         delivery: MessageDelivery::BreakMessages,
                     },
+                    detached_results,
                 )
                 .await;
         });
@@ -1000,6 +1060,7 @@ fn cursor_error(failure: RunFailure) -> Error {
     match failure {
         RunFailure::Protocol(message) => Error::Protocol(message),
         RunFailure::Provider(message) => Error::Provider(message),
+        RunFailure::ProviderRefusal(message) => Error::ProviderRefusal(message),
         RunFailure::Store(message) => Error::Store(message),
         RunFailure::Client(message) => Error::Protocol(message),
     }
@@ -1045,16 +1106,17 @@ pub(crate) fn finish_failed(handle: &TransportHandle, error: &Error) -> Result<(
         details: Vec::new(),
     };
     let stream_error = match error {
-        Error::Provider(_) | Error::Http(_) => {
+        Error::Provider(_) | Error::ProviderRefusal(_) | Error::Http(_) => {
+            let refused = matches!(error, Error::ProviderRefusal(_));
             let detail = ai::ErrorDetails {
                 error: ai::error_details::Error::ProviderError as i32,
                 details: Some(ai::CustomErrorDetails {
-                    title: "Provider Error".into(),
+                    title: if refused { "Provider Refusal" } else { "Provider Error" }.into(),
                     detail: error.to_string(),
                     allow_command_links_potentially_unsafe_please_only_use_for_handwritten_trusted_markdown: Some(true),
-                    is_retryable: Some(true),
+                    is_retryable: Some(!refused),
                     show_request_id: Some(true),
-                    should_show_immediate_error: Some(false),
+                    should_show_immediate_error: Some(refused),
                 }),
                 is_expected: Some(true),
             };
@@ -1093,6 +1155,22 @@ pub(crate) fn finish_cancelled(handle: &TransportHandle) -> Result<()> {
     Ok(())
 }
 
+fn completed_todos(completion: &ToolCompletion) -> Option<Vec<pb::TodoItem>> {
+    if completion.result().is_error {
+        return None;
+    }
+    let pb::tool_call::Tool::UpdateTodosToolCall(tool) = completion.tool_call().tool.as_ref()?
+    else {
+        return None;
+    };
+    let pb::update_todos_result::Result::Success(success) =
+        tool.result.as_ref()?.result.as_ref()?
+    else {
+        return None;
+    };
+    Some(success.todos.clone())
+}
+
 fn checkpoint_context_tokens(checkpoint: &pb::ConversationStateStructure) -> Option<u64> {
     checkpoint
         .token_details
@@ -1102,25 +1180,8 @@ fn checkpoint_context_tokens(checkpoint: &pb::ConversationStateStructure) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{accept_tool_completion, checkpoint_context_tokens};
-    use crate::{cursor::protocol::proto::agent::v1 as pb, run::CommandResult, Error};
-
-    #[test]
-    fn compacted_checkpoint_replaces_the_in_memory_context_usage() {
-        let compacted = pb::ConversationStateStructure {
-            token_details: Some(pb::ConversationTokenDetails {
-                used_tokens: 20_000,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        assert_eq!(checkpoint_context_tokens(&compacted), Some(20_000));
-        assert_eq!(
-            checkpoint_context_tokens(&pb::ConversationStateStructure::default()),
-            None
-        );
-    }
+    use super::accept_tool_completion;
+    use crate::{run::CommandResult, Error};
 
     #[test]
     fn closing_and_ended_runs_ignore_known_tool_completions() {

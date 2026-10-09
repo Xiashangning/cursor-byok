@@ -44,30 +44,38 @@ pub(crate) async fn compile_user_message_action(
     } else {
         user.mode
     };
-    let mut action_context = action
-        .prepend_user_messages
-        .iter()
-        .map(|message| message.text.trim())
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    action_context.extend(
-        user.subagent_system_reminder
-            .iter()
-            .filter(|text| !text.is_empty())
-            .cloned(),
-    );
+    let action_context = join_action_context(action);
     let empty_context = pb::RequestContext::default();
     compile(
         format!("user-message:{}", user.message_id),
         super::run::mode_from_proto(mode)?,
         user,
         action.request_context.as_ref().unwrap_or(&empty_context),
-        &action_context.join("\\n\\n"),
+        &action_context,
         compiler,
         blobs,
     )
     .await
+}
+
+fn join_action_context(action: &pb::UserMessageAction) -> String {
+    let mut contexts = action
+        .prepend_user_messages
+        .iter()
+        .map(|message| message.text.trim())
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    contexts.extend(
+        action
+            .user_message
+            .as_ref()
+            .into_iter()
+            .flat_map(|user| user.subagent_system_reminder.iter())
+            .filter(|text| !text.is_empty())
+            .cloned(),
+    );
+    contexts.join("\n\n")
 }
 
 pub(crate) async fn compile_injection(
@@ -411,5 +419,28 @@ impl Time {
             timestamp: format!("{} ({utc})", now.format("%A, %b %-d, %Y, %-I:%M %p")),
             today: now.format("%A %b %-d,\n%Y").to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joins_user_action_context_with_real_blank_lines() {
+        let action = pb::UserMessageAction {
+            prepend_user_messages: vec![pb::UserMessage {
+                text: " first ".into(),
+                ..Default::default()
+            }],
+            user_message: Some(pb::UserMessage {
+                subagent_system_reminder: Some("second".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(join_action_context(&action), "first\n\nsecond");
+        assert!(!join_action_context(&action).contains(r"\n\n"));
     }
 }

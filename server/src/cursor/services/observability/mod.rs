@@ -3,30 +3,51 @@
 mod event;
 mod worker;
 
-use std::sync::{
-    atomic::{AtomicBool, AtomicU8, Ordering},
-    Arc,
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc,
+    },
 };
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::store::{BlobId, Store};
 
 use event::{TraceEvent, TRACE_DISABLED, TRACE_UNKNOWN};
 
-const TRACE_QUEUE_CAPACITY: usize = 512;
+/// 上限只用于回收已没有 recorder 持有的异常终止 request。
+const MAX_TRACKED_TRACES: usize = 256;
+
+type Activations = Arc<Mutex<HashMap<Arc<str>, Arc<AtomicU8>>>>;
+
+/// A decoded view of one captured client message, persisted next to its raw payload.
+#[derive(Clone)]
+pub struct DecodedMessage {
+    pub data: Bytes,
+    pub metadata: serde_json::Value,
+}
 
 #[derive(Clone)]
 pub struct CursorTraceService {
-    sender: mpsc::Sender<TraceEvent>,
+    sender: mpsc::UnboundedSender<TraceEvent>,
+    activations: Activations,
 }
 
 impl CursorTraceService {
     pub fn new(store: Store) -> Self {
-        let (sender, receiver) = mpsc::channel(TRACE_QUEUE_CAPACITY);
-        tokio::spawn(worker::run(store, receiver));
-        Self { sender }
+        // 详细记录必须完整且不能阻塞通信路径。单一后台 worker 保持落库顺序;
+        // 显式开启详细记录时,由其负责吸收 SQLite 的短暂写入延迟。
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let activations: Activations = Arc::new(Mutex::new(HashMap::new()));
+        tokio::spawn(worker::run(store, receiver, activations.clone()));
+        Self {
+            sender,
+            activations,
+        }
     }
 
     pub fn recorder(&self, request_id: &str) -> CursorTraceRecorder {
@@ -34,15 +55,31 @@ impl CursorTraceService {
             request_id: Arc::from(request_id),
             sender: self.sender.clone(),
             finished: Arc::new(AtomicBool::new(false)),
-            activation: Arc::new(AtomicU8::new(TRACE_UNKNOWN)),
+            activation: self.activation(request_id),
         }
+    }
+
+    /// 同一 request 的所有 recorder 共享一个激活单元。后台确认当前请求
+    /// 是否记录前保持 UNKNOWN，避免启动或设置变更时丢弃首批事件。
+    fn activation(&self, request_id: &str) -> Arc<AtomicU8> {
+        let mut activations = self.activations.lock();
+        if let Some(activation) = activations.get(request_id) {
+            return activation.clone();
+        }
+        if activations.len() >= MAX_TRACKED_TRACES {
+            activations.retain(|_, activation| Arc::strong_count(activation) > 1);
+        }
+        let request_id: Arc<str> = Arc::from(request_id);
+        let activation = Arc::new(AtomicU8::new(TRACE_UNKNOWN));
+        activations.insert(request_id, activation.clone());
+        activation
     }
 }
 
 #[derive(Clone)]
 pub struct CursorTraceRecorder {
     request_id: Arc<str>,
-    sender: mpsc::Sender<TraceEvent>,
+    sender: mpsc::UnboundedSender<TraceEvent>,
     finished: Arc<AtomicBool>,
     activation: Arc<AtomicU8>,
 }
@@ -69,13 +106,25 @@ impl CursorTraceRecorder {
         });
     }
 
-    pub fn request(&self, artifact_type: &str, data: Bytes, metadata: serde_json::Value) {
+    /// Sends one Bidi append together with its optional decoded view. Both are
+    /// persisted adjacently so a trace reads as raw payload + decoded message.
+    pub fn bidi_append(
+        &self,
+        data: Bytes,
+        metadata: serde_json::Value,
+        decoded: Option<DecodedMessage>,
+    ) {
         self.send(TraceEvent::Request {
             request_id: self.request_id.to_string(),
-            artifact_type: artifact_type.to_owned(),
+            artifact_type: "bidi_request".into(),
             data,
+            decoded,
             metadata,
         });
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.activation.load(Ordering::Acquire) != TRACE_DISABLED
     }
 
     pub fn artifact(
@@ -146,11 +195,10 @@ impl CursorTraceRecorder {
     }
 
     fn send_control(&self, event: TraceEvent) {
-        if let Err(error) = self.sender.try_send(event) {
+        if self.sender.send(event).is_err() {
             tracing::warn!(
                 request_id = %self.request_id,
-                %error,
-                "dropping Cursor trace event"
+                "Cursor trace worker stopped before accepting an event"
             );
         }
     }

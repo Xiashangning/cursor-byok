@@ -12,10 +12,16 @@ pub(super) fn output(
         Message::WriteResult(value) => write(value),
         Message::DeleteResult(value) => delete(value),
         Message::GrepResult(value) => grep(value),
-        Message::DiagnosticsResult(value) => diagnostics(value, call),
+        Message::DiagnosticsResult(value) => diagnostics(value),
         Message::McpResult(value) => mcp(value),
         Message::ReadMcpResourceExecResult(value) => read_mcp(value),
-        Message::SubagentResult(value) => task(value, call),
+        Message::SubagentResult(value) => {
+            let (content, is_error) = task(value, call)?;
+            Ok((
+                crate::cursor::tools::runtime::task_result_with_model(call, content),
+                is_error,
+            ))
+        }
         _ => Err(Error::Protocol(
             "unsupported terminal ExecClientMessage".into(),
         )),
@@ -34,7 +40,10 @@ fn shell(value: &pb::ShellResult) -> Result<(String, bool)> {
                 fields.push(format!("terminals_folder={folder}"));
             }
             let output = streams(&success.stdout, &success.stderr);
-            let prefix = format!("shell running in background {}", fields.join(" "));
+            let prefix = format!(
+                "shell running in background {}\nCursor will notify you when it finishes. Outside Multitask Mode, continue independent work if possible; when none remains, you MUST call Await with this shell_id and must not end the turn. In Multitask Mode, call Await when the next step depends on this shell, or end the turn and wait for the notification.",
+                fields.join(" ")
+            );
             return Ok((
                 if output == "shell completed without output" {
                     prefix
@@ -44,8 +53,26 @@ fn shell(value: &pb::ShellResult) -> Result<(String, bool)> {
                 false,
             ));
         }
-        R::Success(success) => return Ok((streams(&success.stdout, &success.stderr), false)),
-        R::Failure(failure) => streams(&failure.stdout, &failure.stderr),
+        R::Success(success) => {
+            let mut output = streams(&success.stdout, &success.stderr);
+            append_shell_status(
+                success.exit_code,
+                success.output_location.as_ref(),
+                success.signal.as_str(),
+                &mut output,
+            );
+            return Ok((output, false));
+        }
+        R::Failure(failure) => {
+            let mut output = streams(&failure.stdout, &failure.stderr);
+            append_shell_status(
+                failure.exit_code,
+                failure.output_location.as_ref(),
+                failure.signal.as_str(),
+                &mut output,
+            );
+            output
+        }
         R::Timeout(timeout) => format!(
             "shell timed out after {}ms in {}",
             timeout.timeout_ms, timeout.working_directory
@@ -55,6 +82,28 @@ fn shell(value: &pb::ShellResult) -> Result<(String, bool)> {
         R::PermissionDenied(denied) => denied.error.clone(),
     };
     Ok((output, true))
+}
+
+/// Keep execution metadata at the tail so output truncation preserves it.
+fn append_shell_status(
+    exit_code: i32,
+    location: Option<&pb::OutputLocation>,
+    signal: &str,
+    output: &mut String,
+) {
+    output.push_str(&format!("\n\nExit code: {exit_code}"));
+    if !signal.is_empty() {
+        output.push_str(&format!("\nSignal: {signal}"));
+    }
+    if let Some(location) = location.filter(|location| !location.file_path.is_empty()) {
+        output.push_str(&format!("\nFull output: {}", location.file_path));
+        if location.size_bytes > 0 {
+            output.push_str(&format!("\nOutput size: {} bytes", location.size_bytes));
+        }
+        if location.line_count > 0 {
+            output.push_str(&format!("\nOutput lines: {}", location.line_count));
+        }
+    }
 }
 
 fn streams(stdout: &str, stderr: &str) -> String {
@@ -208,59 +257,28 @@ fn grep_truncation(
     lines: &mut Vec<String>,
 ) {
     if client_truncated || ripgrep_truncated {
-        lines.push(format!("[Results truncated; {total} total {unit}]"));
+        lines.push(format!("[Results truncated; at least {total} {unit}]"));
     }
 }
 
-fn diagnostics(value: &pb::DiagnosticsResult, call: &ToolCall) -> Result<(String, bool)> {
+fn diagnostics(value: &pb::DiagnosticsResult) -> Result<(String, bool)> {
     use pb::diagnostics_result::Result as R;
     match value
         .result
         .as_ref()
         .ok_or_else(|| missing("diagnostics"))?
     {
-        R::Success(value) => Ok((diagnostics_success(value, call), false)),
-        R::Error(value) => Ok((value.error.clone(), true)),
-        R::Rejected(value) => Ok((value.reason.clone(), true)),
+        R::Success(value) => Ok((diagnostics_success(value), false)),
+        R::Error(value) => Ok((format!("{}: {}", value.path, value.error), true)),
+        R::Rejected(value) => Ok((format!("{}: {}", value.path, value.reason), true)),
         R::FileNotFound(value) => Ok((format!("file not found: {}", value.path), true)),
         R::PermissionDenied(value) => Ok((format!("permission denied: {}", value.path), true)),
     }
 }
 
-/// `codec::request` encodes only `paths[0]` into the `DiagnosticsArgs` exec, and
-/// `DiagnosticsSuccess` carries a single `path`, so a multi-path ReadLints call
-/// only ever inspects the first entry. Name the rest instead of letting a clean
-/// result for one file read as a clean bill of health for all of them.
-fn unchecked_lint_paths(call: &ToolCall) -> Vec<&str> {
-    call.arguments
-        .get("paths")
-        .and_then(serde_json::Value::as_array)
-        .map(|paths| {
-            paths
-                .iter()
-                .skip(1)
-                .filter_map(serde_json::Value::as_str)
-                .filter(|path| !path.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn diagnostics_success(value: &pb::DiagnosticsSuccess, call: &ToolCall) -> String {
-    let unchecked = unchecked_lint_paths(call);
-    let notice = (!unchecked.is_empty()).then(|| {
-        format!(
-            "[Only {} was checked; ReadLints reads one path per call. Not checked: {}]",
-            value.path,
-            unchecked.join(", ")
-        )
-    });
+fn diagnostics_success(value: &pb::DiagnosticsSuccess) -> String {
     if value.diagnostics.is_empty() {
-        let clean = format!("No diagnostics found in {}", value.path);
-        return match notice {
-            Some(notice) => format!("{clean}\n{notice}"),
-            None => clean,
-        };
+        return format!("No diagnostics found in {}", value.path);
     }
     let mut lines = value
         .diagnostics
@@ -292,7 +310,6 @@ fn diagnostics_success(value: &pb::DiagnosticsSuccess, call: &ToolCall) -> Strin
             value.diagnostics.len()
         ));
     }
-    lines.extend(notice);
     lines.join("\n")
 }
 
@@ -443,36 +460,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn backgrounded_resume_result_keeps_the_subagent_identity() {
-        let call = ToolCall {
-            index: 0,
-            call_id: "resume-call".into(),
-            model_call_id: "model-call".into(),
-            name: "Task".into(),
-            arguments_text: "{}".into(),
-            arguments: serde_json::json!({
-                "description": "Continue inspection",
-                "resume": "agent-1",
-                "run_in_background": true,
-            }),
-            argument_error: None,
-        };
-        let result = pb::SubagentResult {
-            result: Some(pb::subagent_result::Result::Success(pb::SubagentSuccess {
-                agent_id: "agent-1".into(),
-                background_reason: pb::SubagentBackgroundReason::UserRequest as i32,
-                ..Default::default()
-            })),
-        };
-
-        let (content, is_error) = task(&result, &call).unwrap();
-
-        assert!(!is_error);
-        assert!(content.contains("Subagent name: Continue inspection"));
-        assert!(content.contains("Subagent ID: agent-1"));
-    }
-
     fn read_lints(paths: serde_json::Value) -> ToolCall {
         ToolCall {
             index: 0,
@@ -497,34 +484,22 @@ mod tests {
         })
     }
 
-    /// The codec encodes only `paths[0]` into the DiagnosticsArgs exec, so a
-    /// clean result for that one path must not read as "these files are all
-    /// clean" for the paths that were never looked at.
+    /// 逐路径渲染在聚合前完成:单路径逐字不变,多路径只渲染本次结果。
     #[test]
-    fn read_lints_names_the_paths_it_did_not_check() {
-        let call = read_lints(json!(["a.ts", "b.ts", "c.ts"]));
-        let (content, is_error) = output(&clean_result("a.ts"), &call).unwrap();
+    fn read_lints_renders_each_path_result_before_aggregation() {
+        let single = read_lints(json!(["a.ts"]));
+        let (content, is_error) = output(&clean_result("a.ts"), &single).unwrap();
         assert!(!is_error);
-        assert!(content.contains("a.ts"));
-        assert!(
-            content.contains("b.ts") && content.contains("c.ts"),
-            "unchecked paths must be reported, got: {content}"
-        );
-    }
+        assert_eq!(content, "No diagnostics found in a.ts");
 
-    /// The overwhelmingly common single-path call must be byte-for-byte
-    /// unchanged.
-    #[test]
-    fn read_lints_single_path_result_is_unchanged() {
-        let call = read_lints(json!(["a.ts"]));
-        let (content, _) = output(&clean_result("a.ts"), &call).unwrap();
+        let many = read_lints(json!(["a.ts", "b.ts", "c.ts"]));
+        let (content, is_error) = output(&clean_result("a.ts"), &many).unwrap();
+        assert!(!is_error);
         assert_eq!(content, "No diagnostics found in a.ts");
     }
 
-    /// The notice belongs on a result that did report diagnostics too: those
-    /// diagnostics are still only a.ts's.
     #[test]
-    fn read_lints_reports_unchecked_paths_alongside_diagnostics() {
+    fn read_lints_reports_this_paths_diagnostics() {
         let call = read_lints(json!(["a.ts", "b.ts"]));
         let message = pb::exec_client_message::Message::DiagnosticsResult(pb::DiagnosticsResult {
             result: Some(pb::diagnostics_result::Result::Success(
@@ -541,9 +516,99 @@ mod tests {
         });
         let (content, _) = output(&message, &call).unwrap();
         assert!(content.contains("unused import"));
+        assert!(!content.contains("Not checked"));
+    }
+
+    fn shell_call() -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "shell-call".into(),
+            model_call_id: "model:0".into(),
+            name: "Shell".into(),
+            arguments_text: String::new(),
+            arguments: json!({"command": "make"}),
+            argument_error: None,
+        }
+    }
+
+    fn shell_success(
+        stdout: &str,
+        stderr: &str,
+        output_location: Option<pb::OutputLocation>,
+        signal: &str,
+    ) -> pb::exec_client_message::Message {
+        pb::exec_client_message::Message::ShellResult(pb::ShellResult {
+            result: Some(pb::shell_result::Result::Success(pb::ShellSuccess {
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+                output_location,
+                signal: signal.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+
+    /// L-3:完整输出落盘时,模型可见结果携带客户端上报的续读路径,
+    /// 尺寸与行数只用客户端提供的值。
+    #[test]
+    fn shell_success_appends_the_client_provided_output_location() {
+        let message = shell_success(
+            "built\n",
+            "",
+            Some(pb::OutputLocation {
+                file_path: "/tmp/outputs/42.txt".into(),
+                size_bytes: 1_048_576,
+                line_count: 40_000,
+            }),
+            "",
+        );
+        let (content, is_error) = output(&message, &shell_call()).unwrap();
+        assert!(!is_error);
+        assert!(content.contains("built"), "{content}");
         assert!(
-            content.contains("Not checked: b.ts"),
-            "unchecked paths must be reported, got: {content}"
+            content.contains(
+                "Full output: /tmp/outputs/42.txt\nOutput size: 1048576 bytes\nOutput lines: 40000"
+            ),
+            "the client-reported location must be passed through: {content}"
+        );
+    }
+
+    /// L-3:无落盘位置时不添加任何提示;不虚构字段。
+    #[test]
+    fn shell_success_without_an_output_location_adds_no_hint() {
+        let message = shell_success("built\n", "", None, "");
+        let (content, is_error) = output(&message, &shell_call()).unwrap();
+        assert!(!is_error);
+        assert_eq!(content, "built\n\n\nExit code: 0");
+    }
+
+    /// L-3:终止信号存在时透传;与落盘位置同时出现则合并进同一提示。
+    #[test]
+    fn shell_failure_passes_the_signal_and_output_location() {
+        let message = pb::exec_client_message::Message::ShellResult(pb::ShellResult {
+            result: Some(pb::shell_result::Result::Failure(pb::ShellFailure {
+                exit_code: 137,
+                stdout: String::new(),
+                stderr: "killed".into(),
+                signal: "SIGKILL".into(),
+                output_location: Some(pb::OutputLocation {
+                    file_path: "/tmp/outputs/killed.txt".into(),
+                    size_bytes: 9,
+                    line_count: 1,
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let (content, is_error) = output(&message, &shell_call()).unwrap();
+        assert!(is_error);
+        assert!(content.contains("killed"), "{content}");
+        assert!(
+            content.contains(
+                "Exit code: 137\nSignal: SIGKILL\nFull output: /tmp/outputs/killed.txt\nOutput size: 9 bytes\nOutput lines: 1"
+            ),
+            "signal and location must pass through together: {content}"
         );
     }
 }

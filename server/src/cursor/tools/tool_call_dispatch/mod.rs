@@ -1,4 +1,5 @@
 //! Dispatches Tool calls to their execution adapters.
+mod await_shell;
 mod edit;
 mod exec;
 mod interaction;
@@ -9,16 +10,21 @@ use std::collections::BTreeMap;
 
 use crate::{
     cursor::protocol::proto::agent::v1 as pb,
-    model::ToolCall,
+    model::{CanonicalMessage, ToolCall},
     search::{WebFetch, WebSearch},
     store::Store,
-    Error, Result,
+    Result,
 };
 
 use super::{
     compat,
     runtime::{CursorToolRuntime, ExecContext, PendingInteraction},
     tool_call_result::{ToolCompletion, ToolResultSender},
+};
+
+pub(crate) use await_shell::{
+    advance_poll as advance_shell_await_poll, complete_shell_awaits, MatchedShellAwaits,
+    ShellAwaitPoll,
 };
 
 pub(super) struct ToolStart {
@@ -39,6 +45,7 @@ pub(super) async fn start(
     dynamic_mcp: &BTreeMap<String, pb::McpToolDefinition>,
     context: &ExecContext,
     store: Option<&Store>,
+    messages: &[CanonicalMessage],
 ) -> Result<ToolStart> {
     if let Some(definition) = dynamic_mcp.get(&call.name) {
         return exec::start_dynamic(runtime, call, definition, context).await;
@@ -52,17 +59,24 @@ pub(super) async fn start(
         return local::subagents_disabled(call);
     }
 
-    let normalized_call = normalize_block_until_ms(call)?;
-    let call = normalized_call.as_ref().unwrap_or(call);
-
     match normalized(&call.name).as_str() {
-        "shell" | "bash" | "read" | "delete" | "grep" | "glob" | "readlints" | "task"
-        | "createagent" | "sendmessagetoagent" | "await" | "callmcptool" | "fetchmcpresource"
-        | "getmcptools" => exec::start(runtime, call, context).await,
+        "readlints" => Ok(ToolStart {
+            messages: vec![super::diagnostics::start(runtime, call, context).await?],
+            completion: None,
+        }),
+        "shell" | "read" | "delete" | "grep" | "glob" | "task" | "sendmessagetoagent"
+        | "callmcptool" | "fetchmcpresource" | "getmcptools" => {
+            exec::start(runtime, call, context).await
+        }
+        "await" if call.arguments.get("shell_id").is_some() => {
+            await_shell::start(runtime, results, call, context, messages).await
+        }
+        "await" => exec::start(runtime, call, context).await,
         "write" | "strreplace" | "editnotebook" => edit::start(runtime, call, context).await,
-        "askquestion" | "websearch" | "webfetch" | "switchmode" | "createplan"
-        | "generateimage" => interaction::start(runtime, call).await,
-        "todowrite" | "updatecurrentstep" => local::start(call, message_index),
+        "askquestion" | "websearch" | "webfetch" | "switchmode" | "createplan" => {
+            interaction::start(runtime, call).await
+        }
+        "updatecurrentstep" => local::start(call, message_index),
         "semblesearch" | "semblefindrelated" => search::start(results, call, store.cloned()),
         _ => Ok(unavailable_tool(call)),
     }
@@ -73,55 +87,6 @@ fn unavailable_tool(call: &ToolCall) -> ToolStart {
         messages: Vec::new(),
         completion: Some(compat::failure(call)),
     }
-}
-
-fn normalize_block_until_ms(call: &ToolCall) -> Result<Option<ToolCall>> {
-    if !is_shell_tool(&call.name) {
-        return Ok(None);
-    }
-    let Some(value) = call.arguments.get("block_until_ms") else {
-        return Ok(None);
-    };
-
-    let integer = if let Some(value) = value.as_i64() {
-        value
-    } else {
-        let value = value.as_f64().ok_or_else(|| {
-            Error::Protocol(format!("{} block_until_ms must be an integer", call.name))
-        })?;
-        if !value.is_finite() || value.fract() != 0.0 {
-            return Err(Error::Protocol(format!(
-                "{} block_until_ms must be an integer",
-                call.name
-            )));
-        }
-        if value < i64::MIN as f64 || value > i64::MAX as f64 {
-            return Err(Error::Protocol(format!(
-                "{} block_until_ms is out of range",
-                call.name
-            )));
-        }
-        value as i64
-    };
-
-    if integer < 0 {
-        return Err(Error::Protocol(format!(
-            "{} block_until_ms is out of range",
-            call.name
-        )));
-    }
-
-    if value.as_i64().is_some() {
-        return Ok(None);
-    }
-
-    let mut normalized_call = call.clone();
-    normalized_call
-        .arguments
-        .as_object_mut()
-        .ok_or_else(|| Error::Protocol(format!("{} arguments must be a JSON object", call.name)))?
-        .insert("block_until_ms".into(), serde_json::Value::from(integer));
-    Ok(Some(normalized_call))
 }
 
 fn is_mcp_auth(call: &ToolCall) -> bool {
@@ -141,10 +106,6 @@ pub(super) async fn resume_interaction(
     response: &pb::InteractionResponse,
 ) -> Result<InteractionContinuation> {
     interaction::resume(results, search, fetch, pending, response).await
-}
-
-fn is_shell_tool(name: &str) -> bool {
-    matches!(normalized(name).as_str(), "shell" | "bash")
 }
 
 pub(super) fn normalized(name: &str) -> String {
@@ -167,60 +128,6 @@ mod tests {
             arguments,
             argument_error: None,
         }
-    }
-
-    #[test]
-    fn shell_accepts_integer_valued_float_timeout() {
-        let call = tool(
-            "Shell",
-            serde_json::json!({"command": "echo ok", "block_until_ms": 45_000.0}),
-        );
-
-        let call = normalize_block_until_ms(&call).unwrap().unwrap();
-
-        assert_eq!(call.arguments["block_until_ms"].as_i64(), Some(45_000));
-    }
-
-    #[test]
-    fn bash_accepts_integer_valued_float_timeout() {
-        let call = tool(
-            "Bash",
-            serde_json::json!({"command": "echo ok", "block_until_ms": 45_000.0}),
-        );
-
-        let call = normalize_block_until_ms(&call).unwrap().unwrap();
-
-        assert_eq!(call.arguments["block_until_ms"].as_i64(), Some(45_000));
-    }
-
-    #[test]
-    fn shell_rejects_fractional_timeout() {
-        let call = tool(
-            "Shell",
-            serde_json::json!({"command": "echo ok", "block_until_ms": 30_000.5}),
-        );
-
-        let error = normalize_block_until_ms(&call).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "protocol error: Shell block_until_ms must be an integer"
-        );
-    }
-
-    #[test]
-    fn shell_rejects_negative_timeout_instead_of_defaulting() {
-        let call = tool(
-            "Shell",
-            serde_json::json!({"command": "echo ok", "block_until_ms": -1}),
-        );
-
-        let error = normalize_block_until_ms(&call).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "protocol error: Shell block_until_ms is out of range"
-        );
     }
 
     #[test]

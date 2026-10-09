@@ -95,7 +95,6 @@ impl CheckpointBuilder {
                     request_id: Some(self.sync.request_id().into()),
                     encrypted_model: None,
                     dynamic_tool_count: None,
-                    send_message_step_indices: Vec::new(),
                 },
             });
             return Ok(());

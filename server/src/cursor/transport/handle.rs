@@ -109,20 +109,66 @@ impl TransportHandle {
         let _ = self.commands.send(TransportCommand::Disconnect).await;
     }
 
-    pub fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<Bytes> {
+    pub fn subscribe(&self) -> Option<super::OutputReceiver> {
         self.output.subscribe()
     }
 
+    pub(crate) fn has_subscribers(&self) -> bool {
+        self.output.has_subscribers()
+    }
+
     pub fn emit_frame(&self, frame: Bytes) -> bool {
-        self.output.emit(frame)
+        let status = self.output.emit_status(frame);
+        if status.last_subscriber_evicted {
+            let command = TransportCommand::OutputDetached;
+            if let Err(mpsc::error::TrySendError::Full(command)) = self.commands.try_send(command) {
+                let commands = self.commands.clone();
+                tokio::spawn(async move {
+                    let _ = commands.send(command).await;
+                });
+            }
+        }
+        status.accepted
     }
 
     pub fn emit(&self, message: &pb::AgentServerMessage) -> Result<()> {
-        if self.emit_frame(connect::encode_message(message)?) {
+        let frame = connect::encode_message(message)?;
+        let emitted = self.emit_frame(frame);
+        self.trace_server_message(message, emitted);
+        if emitted {
             Ok(())
         } else {
             Err(Error::RunNotFound(self.request_id.clone()))
         }
+    }
+
+    /// Records low-frequency server messages used to reconstruct tool and lifecycle ordering.
+    fn trace_server_message(&self, message: &pb::AgentServerMessage, emitted: bool) {
+        if !self.trace.is_enabled() {
+            return;
+        }
+        let Some(kind) = server_message_kind(message) else {
+            return;
+        };
+        let Some(rendered) = crate::cursor::protocol::json::render_server(message) else {
+            tracing::warn!(
+                request_id = %self.request_id,
+                message_type = kind,
+                "cannot render Cursor server message for its trace"
+            );
+            return;
+        };
+        self.trace.artifact(
+            "server_message",
+            "byok_server",
+            &rendered.json,
+            serde_json::json!({
+                "message_type": kind,
+                "emit_status": if emitted { "accepted" } else { "rejected" },
+                "truncated": rendered.truncated,
+                "total_bytes": rendered.total_bytes,
+            }),
+        );
     }
 
     pub(crate) fn close_output(&self) -> bool {
@@ -167,7 +213,7 @@ impl TransportHandle {
         self.lifecycle.close();
     }
 
-    pub(crate) async fn wait_transport_closed(&self) {
+    pub async fn wait_transport_closed(&self) {
         self.lifecycle.wait_closed().await;
     }
 
@@ -177,5 +223,54 @@ impl TransportHandle {
 
     pub(crate) fn mark_disconnected(&self) {
         self.disconnect.cancel();
+    }
+}
+
+/// 分类需要持久化的 server→client 消息;高频增量返回 None 不记录。
+fn server_message_kind(message: &pb::AgentServerMessage) -> Option<&'static str> {
+    use pb::agent_server_message::Message;
+    match message.message.as_ref()? {
+        Message::ExecServerMessage(_) => Some("exec_server_message"),
+        Message::ExecServerControlMessage(_) => Some("exec_server_control_message"),
+        Message::InteractionQuery(_) => Some("interaction_query"),
+        // 检查点状态已由 checkpoint artifact 记录(含发送结果),不重复落库。
+        Message::ConversationCheckpointUpdate(_) => None,
+        // KV 消息已由 blob_sync 的 linked_blob artifact 覆盖。
+        Message::KvServerMessage(_) => None,
+        Message::InteractionUpdate(update) => interaction_update_kind(update),
+    }
+}
+
+fn interaction_update_kind(update: &pb::InteractionUpdate) -> Option<&'static str> {
+    use pb::interaction_update::Message;
+    match update.message.as_ref()? {
+        // 参数流式 delta 高频;空 delta 的 partial 是工具卡片渲染(Task 卡片、
+        // Edit 路径占位等),低频且对还原工具顺序有用,保留。
+        Message::PartialToolCall(partial) => partial
+            .args_text_delta
+            .is_empty()
+            .then_some("interaction_update:partial_tool_call"),
+        Message::ToolCallStarted(_) => Some("interaction_update:tool_call_started"),
+        Message::ToolCallCompleted(_) => Some("interaction_update:tool_call_completed"),
+        Message::ThinkingCompleted(_) => Some("interaction_update:thinking_completed"),
+        Message::UserMessageAppended(_) => Some("interaction_update:user_message_appended"),
+        Message::Summary(_) => Some("interaction_update:summary"),
+        Message::SummaryStarted(_) => Some("interaction_update:summary_started"),
+        Message::SummaryCompleted(_) => Some("interaction_update:summary_completed"),
+        Message::TurnEnded(_) => Some("interaction_update:turn_ended"),
+        Message::StepStarted(_) => Some("interaction_update:step_started"),
+        Message::StepCompleted(_) => Some("interaction_update:step_completed"),
+        Message::PromptSuggestion(_) => Some("interaction_update:prompt_suggestion"),
+        Message::PostRequestPrompt(_) => Some("interaction_update:post_request_prompt"),
+        Message::ActiveBranchChange(_) => Some("interaction_update:active_branch_change"),
+        Message::FeedbackRequest(_) => Some("interaction_update:feedback_request"),
+        Message::ResponseComparison(_) => Some("interaction_update:response_comparison"),
+        Message::ContextInjectionState(_) => Some("interaction_update:context_injection_state"),
+        Message::TextDelta(_)
+        | Message::ToolCallDelta(_)
+        | Message::ThinkingDelta(_)
+        | Message::TokenDelta(_)
+        | Message::ShellOutputDelta(_)
+        | Message::Heartbeat(_) => None,
     }
 }

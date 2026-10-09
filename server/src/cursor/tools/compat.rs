@@ -89,19 +89,9 @@ pub(crate) fn failure_with_message(call: &ToolCall, error: String) -> ToolComple
 }
 
 fn failure_message(name: &str) -> String {
-    if normalized(name) == "awaitshell" {
-        return "Tool \"AwaitShell\" is no longer available in this Cursor BYOK version. The model emitted a tool name that is not part of the current advertised tool set. Treat the tool call as failed and continue using a tool advertised in the current prompt; for background shell work, use the current Shell/background completion flow.".into();
-    }
     format!(
         "Tool \"{name}\" is not available in this Cursor BYOK version. The model emitted a tool name that is not part of the current advertised tool set. Treat the tool call as failed and continue using a tool advertised in the current prompt."
     )
-}
-
-fn normalized(name: &str) -> String {
-    name.chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 #[cfg(test)]

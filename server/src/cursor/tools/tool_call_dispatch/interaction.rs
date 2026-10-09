@@ -15,9 +15,13 @@ use crate::cursor::tools::{
 };
 
 pub(super) async fn start(runtime: &CursorToolRuntime, call: &ToolCall) -> Result<ToolStart> {
+    let mut message = interaction::tool_query(0, call)?;
     let id = runtime.reserve_interaction(call).await?;
+    if let Some(pb::agent_server_message::Message::InteractionQuery(query)) = &mut message.message {
+        query.id = id;
+    }
     Ok(ToolStart {
-        messages: vec![interaction::tool_query(id, call)?],
+        messages: vec![message],
         completion: None,
     })
 }
@@ -83,19 +87,20 @@ fn start_web_fetch(
     Ok(())
 }
 
+fn web_search_term(call: &ToolCall) -> Result<&str> {
+    call.arguments
+        .get("search_term")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Protocol("WebSearch is missing search_term".into()))
+}
+
 fn start_web_search(
     results: ToolResultSender,
     search: WebSearch,
     pending: PendingInteraction,
 ) -> Result<()> {
-    let query = pending
-        .call
-        .arguments
-        .get("search_term")
-        .and_then(serde_json::Value::as_str)
-        .filter(|query| !query.trim().is_empty())
-        .ok_or_else(|| Error::Protocol("WebSearch is missing search_term".into()))?
-        .to_string();
+    let query = web_search_term(&pending.call)?.to_owned();
     tokio::spawn(async move {
         let outcome = search
             .search(&query)
@@ -107,4 +112,50 @@ fn start_web_search(
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn search_agrees_in_execution_query_and_display() {
+        for arguments in [
+            json!({"search_term": "primary"}),
+            json!({"search_term": " query with spaces "}),
+        ] {
+            let call = ToolCall {
+                index: 0,
+                call_id: "call".into(),
+                model_call_id: "model".into(),
+                name: "WebSearch".into(),
+                arguments_text: arguments.to_string(),
+                arguments,
+                argument_error: None,
+            };
+            let expected = web_search_term(&call).unwrap();
+            let message = interaction::tool_query(1, &call).unwrap();
+            let Some(pb::agent_server_message::Message::InteractionQuery(query)) = message.message
+            else {
+                panic!("expected query")
+            };
+            let Some(pb::interaction_query::Query::WebSearchRequestQuery(query)) = query.query
+            else {
+                panic!("expected search")
+            };
+            assert_eq!(query.args.unwrap().search_term, expected);
+            let rendered = interaction::render_tool_call(&call, false).unwrap();
+            let Some(pb::tool_call::Tool::WebSearchToolCall(tool)) = rendered.tool else {
+                panic!("expected search display")
+            };
+            assert_eq!(tool.args.unwrap().search_term, expected);
+            for value in [Value::Null, json!(42), json!(""), json!(" ")] {
+                let mut invalid = call.clone();
+                invalid.arguments["search_term"] = value;
+                assert!(web_search_term(&invalid).is_err());
+                assert!(interaction::tool_query(1, &invalid).is_err());
+            }
+        }
+    }
 }

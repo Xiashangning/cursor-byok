@@ -19,6 +19,8 @@ use crate::{
         transport::{OrderedInbox, TransportHandle},
     },
     run::{CommandResult, RunEngine, RunHandle, RunPhase},
+    store::Store,
+    Result,
 };
 
 use super::{
@@ -41,6 +43,9 @@ struct RunGeneration {
     runtime_actions: mpsc::UnboundedSender<compile::RuntimeAction>,
     tool_runtime: CursorToolRuntime,
     tools: ToolDispatcher,
+    tasks: super::task::Tasks,
+    prepared:
+        Arc<parking_lot::Mutex<Option<(crate::model::PreparedRun, compile::CursorRunContext)>>>,
 }
 
 struct FinishGeneration(CancellationToken);
@@ -82,7 +87,32 @@ impl ConversationRuntime {
             let mut pending_finish = None::<(u64, TransportFinish)>;
             let mut draining = false;
             let mut waiting_for_action = false;
+            let mut continuation_needed = false;
             loop {
+                if waiting_for_action && continuation_needed {
+                    if let Some(previous) = current
+                        .as_ref()
+                        .filter(|generation| !generation.tasks.is_cancelled())
+                    {
+                        let mut request = previous.request.clone();
+                        request.pre_fetched_blobs.clear();
+                        waiting_for_action = false;
+                        continuation_needed = false;
+                        start_generation(
+                            &registry,
+                            &handle,
+                            &dependencies,
+                            &blob_sync,
+                            &context_sync,
+                            &tool_runtime_factory,
+                            &mut current,
+                            &mut next_generation,
+                            request,
+                            true,
+                        )
+                        .await;
+                    }
+                }
                 let command = if draining {
                     if !handle.admissions_drained() {
                         tokio::select! {
@@ -116,7 +146,7 @@ impl ConversationRuntime {
                                 break;
                             }
                         },
-                        _ = tokio::time::sleep(CONTINUATION_IDLE_TIMEOUT) => {
+                        _ = tokio::time::sleep(CONTINUATION_IDLE_TIMEOUT), if current.as_ref().is_none_or(|generation| !generation.tasks.has_pending()) => {
                             let Some(generation) = current.as_ref() else {
                                 super::finish_success(&handle);
                                 break;
@@ -145,9 +175,11 @@ impl ConversationRuntime {
                     }
                 };
                 match command {
-                    TransportCommand::Disconnect => {
+                    TransportCommand::OutputDetached if handle.has_subscribers() => continue,
+                    TransportCommand::Disconnect | TransportCommand::OutputDetached => {
                         handle.mark_disconnected();
                         if let Some(generation) = current.as_ref() {
+                            generation.tasks.cancel();
                             generation.superseded.cancel();
                             if let Some(run) = generation.run.lock().clone() {
                                 run.cancel();
@@ -171,6 +203,96 @@ impl ConversationRuntime {
                         }
                         break;
                     }
+                    TransportCommand::OfficialTaskOwner {
+                        tool_call_id,
+                        reply,
+                    } => {
+                        let owner = if let Some(generation) = current
+                            .as_ref()
+                            .filter(|generation| !generation.tasks.is_cancelled())
+                        {
+                            generation
+                                .tool_runtime
+                                .task_exec_id(&tool_call_id)
+                                .await
+                                .map(|id| (generation.tasks.owner, id))
+                        } else {
+                            None
+                        };
+                        let _ = reply.send(owner);
+                    }
+                    TransportCommand::OfficialTaskFailed {
+                        owner,
+                        exec_id,
+                        message,
+                    } => {
+                        let Some(generation) = current.as_ref().filter(|generation| {
+                            generation.tasks.owner == owner && !generation.tasks.is_cancelled()
+                        }) else {
+                            continue;
+                        };
+                        let Some(pending) = generation.tool_runtime.take_exec(exec_id).await else {
+                            continue;
+                        };
+                        let wire =
+                            pb::exec_client_message::Message::SubagentResult(pb::SubagentResult {
+                                result: Some(pb::subagent_result::Result::Error(
+                                    pb::SubagentError {
+                                        error: message,
+                                        ..Default::default()
+                                    },
+                                )),
+                            });
+                        match crate::cursor::tools::tool_call_result::from_exec(pending, &wire) {
+                            Ok(mut completion) => {
+                                completion.exec_id = Some(exec_id);
+                                generation
+                                    .tasks
+                                    .receive(completion, &generation.results, &handle);
+                            }
+                            Err(error) => generation.results.send_error(error),
+                        }
+                    }
+                    TransportCommand::TaskCompleted { owner, message } => {
+                        let Some(generation) = current.as_ref().filter(|generation| {
+                            generation.tasks.owner == owner && !generation.tasks.is_cancelled()
+                        }) else {
+                            continue;
+                        };
+                        let run = generation.run.lock().clone();
+                        let handle = handle.clone();
+                        tokio::spawn(async move {
+                            let event_id = message
+                                .runtime_event_id
+                                .clone()
+                                .expect("Task completion identity");
+                            let result = match run {
+                                Some(run) => {
+                                    run.insert_messages(event_id.clone(), vec![message]).await
+                                }
+                                None => CommandResult::RunEnded,
+                            };
+                            let _ = handle
+                                .command(TransportCommand::TaskDelivered {
+                                    owner,
+                                    event_id,
+                                    result,
+                                })
+                                .await;
+                        });
+                    }
+                    TransportCommand::TaskDelivered {
+                        owner,
+                        event_id,
+                        result,
+                    } => {
+                        let Some(generation) = current.as_ref().filter(|generation| {
+                            generation.tasks.owner == owner && !generation.tasks.is_cancelled()
+                        }) else {
+                            continue;
+                        };
+                        continuation_needed |= generation.tasks.delivered(&event_id, result);
+                    }
                     TransportCommand::RunFinished { generation, finish } => {
                         if current
                             .as_ref()
@@ -179,12 +301,21 @@ impl ConversationRuntime {
                             continue;
                         }
                         match finish {
-                            RunFinish::TurnCompleted => {
+                            RunFinish::TurnCompleted(checkpoint) => {
+                                if let Some(current) = current.as_mut() {
+                                    current.request.conversation_state = Some(*checkpoint);
+                                }
                                 pending_finish = None;
                                 draining = false;
                                 waiting_for_action = true;
                             }
                             RunFinish::Transport(finish) => {
+                                if let Some(current) = current.as_ref() {
+                                    current.tasks.cancel();
+                                    for id in current.tool_runtime.drain_running().await {
+                                        let _ = handle.emit(&codec::abort(id));
+                                    }
+                                }
                                 waiting_for_action = false;
                                 handle.begin_close();
                                 pending_finish = Some((generation, finish));
@@ -199,7 +330,35 @@ impl ConversationRuntime {
                                     Some(pb::agent_client_message::Message::RunRequest(
                                         request,
                                     )) => {
+                                        if let Some(action) = request
+                                            .action
+                                            .as_ref()
+                                            .and_then(|action| action.action.as_ref())
+                                            .and_then(|action| match action {
+                                                pb::conversation_action::Action::BackgroundTaskCompletionAction(action) => Some(action),
+                                                _ => None,
+                                            })
+                                        {
+                                            if let Some(generation) = current.as_ref() {
+                                                match complete_shell_awaits(
+                                                    generation,
+                                                    action,
+                                                    &dependencies.store,
+                                                    handle.request_id(),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(true) => continue,
+                                                    Ok(false) => {}
+                                                    Err(error) => {
+                                                        generation.results.send_error(error);
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         waiting_for_action = false;
+                                        continuation_needed = false;
                                         if draining {
                                             handle.reopen();
                                             draining = false;
@@ -230,6 +389,7 @@ impl ConversationRuntime {
                                             &mut current,
                                             &mut next_generation,
                                             request,
+                                            false,
                                         )
                                         .await;
                                     }
@@ -254,8 +414,50 @@ impl ConversationRuntime {
                                             Ok(codec::ClientExecEvent::Message(message)) => {
                                                 let _ = handle.emit(&message);
                                             }
-                                            Ok(codec::ClientExecEvent::Completed(result)) => {
-                                                generation.results.send(*result)
+                                            Ok(codec::ClientExecEvent::DelayedMessage {
+                                                delay,
+                                                exec_id,
+                                                message,
+                                            }) => {
+                                                let handle = handle.clone();
+                                                let tool_runtime = generation.tool_runtime.clone();
+                                                tokio::spawn(async move {
+                                                    tokio::time::sleep(delay).await;
+                                                    if tool_runtime.exec_call(exec_id).await.is_some()
+                                                    {
+                                                        let _ = handle.emit(&message);
+                                                    }
+                                                });
+                                            }
+                                            Ok(codec::ClientExecEvent::Completed(mut result)) => {
+                                                result.exec_id = Some(message.id);
+                                                // 轮询先于通知判定 shell 终态:落账,
+                                                // 使随后到达的同一完成通知走 noop。
+                                                if let Some(consumed) =
+                                                    result.consumed_background.take()
+                                                {
+                                                    if let Err(error) = dependencies
+                                                        .store
+                                                        .record_consumed_background_completions(
+                                                            &compile::conversation_key(
+                                                                &generation.request,
+                                                                handle.request_id(),
+                                                            ),
+                                                            pb::BackgroundTaskKind::Shell
+                                                                .as_str_name(),
+                                                            &[consumed],
+                                                        )
+                                                        .await
+                                                    {
+                                                        generation.results.send_error(error);
+                                                        continue;
+                                                    }
+                                                }
+                                                generation.tasks.receive(
+                                                    *result,
+                                                    &generation.results,
+                                                    &handle,
+                                                );
                                             }
                                             Ok(codec::ClientExecEvent::Pending) => {}
                                             Err(error) => generation.results.send_error(error),
@@ -282,8 +484,13 @@ impl ConversationRuntime {
                                                 )
                                                 .await
                                                 {
-                                                    Ok(Some(completion)) => {
-                                                        generation.results.send(completion)
+                                                    Ok(Some(mut completion)) => {
+                                                        completion.exec_id = Some(close.id);
+                                                        generation.tasks.receive(
+                                                            completion,
+                                                            &generation.results,
+                                                            &handle,
+                                                        );
                                                     }
                                                     Ok(None) => {}
                                                     Err(error) => {
@@ -323,15 +530,22 @@ impl ConversationRuntime {
                                                     .take_exec(throw.id)
                                                     .await
                                                 {
-                                                    Some(pending) => generation.results.send(
-                                                        compat::failure_with_message(
+                                                    Some(pending)
+                                                        if matches!(
+                                                            pending.stage,
+                                                            crate::cursor::tools::runtime::ExecStage::ShellAwaitPoll
+                                                        ) => {}
+                                                    Some(pending) => {
+                                                        let mut completion = compat::failure_with_message(
                                                             &pending.call,
                                                             format!(
                                                                 "Exec {} failed: {}",
                                                                 pending.call.call_id, throw.error
                                                             ),
-                                                        ),
-                                                    ),
+                                                        );
+                                                        completion.exec_id = Some(throw.id);
+                                                        generation.tasks.receive(completion, &generation.results, &handle);
+                                                    },
                                                     None => tracing::warn!(
                                                         id = throw.id,
                                                         "ignoring failure for unknown tool execution"
@@ -419,9 +633,9 @@ impl ConversationRuntime {
                                             };
                                             let mut request = previous.request.clone();
                                             request.action = Some(conversation_action);
-                                            request.conversation_state = None;
                                             request.pre_fetched_blobs.clear();
                                             waiting_for_action = false;
+                                            continuation_needed = false;
                                             start_generation(
                                                 &registry,
                                                 &handle,
@@ -432,13 +646,53 @@ impl ConversationRuntime {
                                                 &mut current,
                                                 &mut next_generation,
                                                 request,
+                                                false,
                                             )
                                             .await;
                                         }
+                                        Some(
+                                            pb::conversation_action::Action::BackgroundTaskCompletionAction(
+                                                action,
+                                            ),
+                                        ) => {
+                                            let Some(generation) = current.as_ref() else {
+                                                continue;
+                                            };
+                                            match complete_shell_awaits(
+                                                generation,
+                                                &action,
+                                                &dependencies.store,
+                                                handle.request_id(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(true) => {}
+                                                Ok(false) => {
+                                                    generation.results.send_error(
+                                                        unsupported_runtime_action_error(
+                                                            &pb::conversation_action::Action::BackgroundTaskCompletionAction(action),
+                                                        ),
+                                                    );
+                                                }
+                                                Err(error) => generation.results.send_error(error),
+                                            }
+                                        }
                                         Some(pb::conversation_action::Action::CancelAction(_)) => {
+                                            continuation_needed = false;
                                             if let Some(generation) = current.as_ref() {
+                                                generation.tasks.cancel();
                                                 if let Some(run) = generation.run.lock().clone() {
                                                     run.cancel();
+                                                } else if !waiting_for_action {
+                                                    // Cancellation also owns the preparation window
+                                                    // before a continuation publishes its RunHandle.
+                                                    generation.superseded.cancel();
+                                                    handle.begin_close();
+                                                    pending_finish = Some((
+                                                        generation.id,
+                                                        TransportFinish::Cancelled,
+                                                    ));
+                                                    draining = true;
                                                 }
                                                 for id in
                                                     generation.tool_runtime.drain_running().await
@@ -482,20 +736,23 @@ impl ConversationRuntime {
                                             }
                                         }
                                         Some(action) => {
-                                            tracing::warn!(
-                                                request_id = handle.request_id(),
-                                                action = runtime_action_name(&action),
-                                                "ignoring unsupported runtime ConversationAction"
-                                            );
+                                            let error = unsupported_runtime_action_error(&action);
+                                            if let Some(generation) = current.as_ref() {
+                                                generation.results.send_error(error);
+                                            } else {
+                                                let _ = super::finish_failed(&handle, &error);
+                                                return;
+                                            }
                                         }
                                         None => {
+                                            let error = crate::Error::Protocol(
+                                                "runtime ConversationAction has no action".into(),
+                                            );
                                             if let Some(generation) = current.as_ref() {
-                                                generation.results.send_error(
-                                                    crate::Error::Protocol(
-                                                        "runtime ConversationAction has no action"
-                                                            .into(),
-                                                    ),
-                                                );
+                                                generation.results.send_error(error);
+                                            } else {
+                                                let _ = super::finish_failed(&handle, &error);
+                                                return;
                                             }
                                         }
                                     },
@@ -510,6 +767,28 @@ impl ConversationRuntime {
     }
 }
 
+async fn complete_shell_awaits(
+    generation: &RunGeneration,
+    action: &pb::BackgroundTaskCompletionAction,
+    store: &Store,
+    request_id: &str,
+) -> Result<bool> {
+    let Some(matched) = generation.tools.complete_shell_awaits(action).await? else {
+        return Ok(false);
+    };
+    store
+        .record_consumed_background_completions(
+            &compile::conversation_key(&generation.request, request_id),
+            pb::BackgroundTaskKind::Shell.as_str_name(),
+            &matched.consumed,
+        )
+        .await?;
+    for completion in matched.completions {
+        generation.results.send(completion);
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_generation(
     registry: &ConversationRegistry,
@@ -521,14 +800,25 @@ async fn start_generation(
     current: &mut Option<RunGeneration>,
     next_generation: &mut u64,
     request: pb::AgentRunRequest,
+    continuation: bool,
 ) {
+    let mut retained = None;
     let previous_finished = if let Some(previous) = current.take() {
-        previous.superseded.cancel();
-        if let Some(run) = previous.run.lock().clone() {
-            run.cancel();
-        }
-        for id in previous.tool_runtime.interrupt_for_run_replacement().await {
-            let _ = handle.emit(&codec::abort(id));
+        if continuation {
+            retained = Some((
+                previous.tool_runtime.clone(),
+                previous.tasks.clone(),
+                previous.prepared.clone(),
+            ));
+        } else {
+            previous.tasks.cancel();
+            previous.superseded.cancel();
+            if let Some(run) = previous.run.lock().clone() {
+                run.cancel();
+            }
+            for id in previous.tool_runtime.interrupt_for_run_replacement().await {
+                let _ = handle.emit(&codec::abort(id));
+            }
         }
         Some(previous.finished.clone())
     } else {
@@ -537,7 +827,13 @@ async fn start_generation(
     let (results, result_receiver) = tool_result_channel();
     let (runtime_actions, runtime_action_receiver) =
         mpsc::unbounded_channel::<compile::RuntimeAction>();
-    let tool_runtime = tool_runtime_factory.next_run();
+    let (tool_runtime, tasks, prepared) = retained.unwrap_or_else(|| {
+        (
+            tool_runtime_factory.next_run(),
+            super::task::Tasks::new(*next_generation),
+            Arc::default(),
+        )
+    });
     let tools = ToolDispatcher::with_results(
         tool_runtime.clone(),
         results.clone(),
@@ -554,6 +850,8 @@ async fn start_generation(
         runtime_actions,
         tool_runtime,
         tools,
+        tasks,
+        prepared,
     };
     *next_generation = next_generation.saturating_add(1);
     *current = Some(generation.clone());
@@ -603,7 +901,7 @@ fn finish_transport(handle: &TransportHandle, finish: TransportFinish) {
 fn spawn_run_request(
     registry: ConversationRegistry,
     handle: TransportHandle,
-    mut request: pb::AgentRunRequest,
+    request: pb::AgentRunRequest,
     dependencies: ConversationDependencies,
     blob_sync: BlobSynchronizer,
     context_sync: RequestContextSynchronizer,
@@ -624,51 +922,52 @@ fn spawn_run_request(
         if generation.superseded.is_cancelled() {
             return;
         }
-        if let Err(error) =
-            hydrate_consumed_subagent_completions(&dependencies.store, &mut request).await
-        {
-            let _ = handle
-                .command(TransportCommand::RunFinished {
-                    generation: generation.id,
-                    finish: RunFinish::Transport(TransportFinish::Failed(error)),
-                })
-                .await;
-            return;
-        }
-        if compile::background_completion_fully_consumed(&request) {
-            let _ = handle
-                .command(TransportCommand::RunFinished {
-                    generation: generation.id,
-                    finish: RunFinish::Transport(TransportFinish::Success),
-                })
-                .await;
-            return;
-        }
 
         let mut checkpoint = CheckpointBuilder::new(
             dependencies.store.clone(),
-            crate::model::ConversationId::new(
-                request.conversation_id.as_deref().unwrap_or_default(),
-            ),
+            compile::conversation_key(&request, handle.request_id()),
             blob_sync.clone(),
             handle.parent().map(|parent| parent.tool_call_id.clone()),
             request.conversation_state.clone(),
         );
-        let prepared = tokio::select! {
-            biased;
-            _ = generation.superseded.cancelled() => return,
-            prepared = compile::prepare(
-                handle.request_id(),
-                &request,
-                compile::PrepareDependencies {
-                    compiler: &dependencies.compiler,
-                    store: &dependencies.store,
-                    checkpoint: &checkpoint,
-                    blob_sync: &blob_sync,
-                    context_sync: &context_sync,
-                    local_rules_dir: dependencies.local_rules_dir.as_deref(),
-                },
-            ) => prepared,
+        let continuation = generation.prepared.lock().clone();
+        let prepared = if let Some((mut prepared, mut context)) = continuation {
+            prepared.run_id = compile::execution_run_id(handle.request_id());
+            prepared.initial_messages = generation.tasks.take_ready();
+            prepared.action = crate::model::RunAction::Resume {
+                pending_tool_round: None,
+            };
+            context.turn_user = None;
+            context.background_completion = false;
+            context.compacting = false;
+            dependencies
+                .store
+                .ensure_conversation(&prepared.conversation_id)
+                .await
+                .map(|checkpoint| {
+                    prepared.base_checkpoint_id = checkpoint;
+                    (prepared, context)
+                })
+        } else {
+            let prepared = tokio::select! {
+                biased;
+                _ = generation.superseded.cancelled() => return,
+                prepared = compile::prepare(
+                    handle.request_id(),
+                    &request,
+                    compile::PrepareDependencies {
+                        compiler: &dependencies.compiler,
+                        store: &dependencies.store,
+                        parent: handle.parent(),
+                        plugins: dependencies.plugins.as_ref(),
+                        checkpoint: &checkpoint,
+                        blob_sync: &blob_sync,
+                        context_sync: &context_sync,
+                        local_rules_dir: dependencies.local_rules_dir.as_deref(),
+                    },
+                ) => prepared,
+            };
+            prepared
         };
         let (mut prepared, context) = match prepared {
             Ok(prepared) => prepared,
@@ -690,6 +989,19 @@ fn spawn_run_request(
                 return;
             }
         };
+        if context.background_noop {
+            // 通知与总结都已提交:at-least-once 重投。不建 Run、不写
+            // checkpoint,直接 Success 收尾,避免零新增材料的模型激活。
+            if !generation.superseded.is_cancelled() {
+                let _ = handle
+                    .command(TransportCommand::RunFinished {
+                        generation: generation.id,
+                        finish: RunFinish::Transport(TransportFinish::Success),
+                    })
+                    .await;
+            }
+            return;
+        }
         checkpoint.configure(
             prepared.model.model_id.clone(),
             prepared.model.context_window_tokens,
@@ -758,7 +1070,22 @@ fn spawn_run_request(
                 }
             }
         }
-        let pending = registry.take_pending(&prepared.conversation_id).await;
+        if generation.superseded.is_cancelled() {
+            return;
+        }
+
+        let run_id = prepared.run_id.clone();
+        let conversation_id = prepared.conversation_id.clone();
+        let (port, core, run_handle) = crate::run::channel(run_id.clone(), 256);
+        *generation.run.lock() = Some(run_handle.clone());
+        if generation.superseded.is_cancelled() {
+            run_handle.cancel();
+            *generation.run.lock() = None;
+            return;
+        }
+        let pending = registry
+            .activate(conversation_id.clone(), run_id.clone(), run_handle.clone())
+            .await;
         if !pending.is_empty() {
             let mut messages = pending
                 .into_iter()
@@ -775,22 +1102,13 @@ fn spawn_run_request(
             }
         }
         if generation.superseded.is_cancelled() {
-            return;
-        }
-
-        let run_id = prepared.run_id.clone();
-        let conversation_id = prepared.conversation_id.clone();
-        let (port, core, run_handle) = crate::run::channel(run_id.clone(), 256);
-        *generation.run.lock() = Some(run_handle.clone());
-        if generation.superseded.is_cancelled() {
             run_handle.cancel();
+            registry.release(&conversation_id, &run_id).await;
             *generation.run.lock() = None;
             return;
         }
-        registry
-            .activate(conversation_id.clone(), run_id.clone(), run_handle.clone())
-            .await;
         let cancellation = run_handle.cancellation();
+        *generation.prepared.lock() = Some((prepared.clone(), context.clone()));
         let engine = RunEngine::new(dependencies.store.clone(), dependencies.provider.clone());
         let core_run = tokio::spawn(async move { engine.run(prepared, port, cancellation).await });
         let output = ConversationOutput::new(
@@ -801,6 +1119,10 @@ fn spawn_run_request(
             run_handle,
             registry.clone(),
             ConversationOutputDependencies {
+                injections: super::injection::InjectionTracker::for_run(
+                    request.run_id.as_deref(),
+                    handle.request_id(),
+                ),
                 superseded: generation.superseded.clone(),
                 tools: generation.tools.clone(),
                 results,
@@ -809,6 +1131,7 @@ fn spawn_run_request(
                 blob_sync,
                 checkpoint,
                 tool_runtime: generation.tool_runtime.clone(),
+                tasks: generation.tasks.clone(),
             },
         );
         let finish = match output.run().await {
@@ -847,109 +1170,11 @@ fn spawn_run_request(
     });
 }
 
-async fn hydrate_consumed_subagent_completions(
-    store: &crate::store::Store,
-    request: &mut pb::AgentRunRequest,
-) -> crate::Result<()> {
-    let Some(pb::conversation_action::Action::BackgroundTaskCompletionAction(action)) = request
-        .action
-        .as_ref()
-        .and_then(|action| action.action.as_ref())
-    else {
-        return Ok(());
-    };
-    let completions = action
-        .completions
-        .iter()
-        .filter(|completion| {
-            completion.kind == pb::BackgroundTaskKind::Subagent as i32
-                && completion.reason == pb::BackgroundTaskCompletionReason::TaskFinished as i32
-        })
-        .filter_map(|completion| {
-            let subagent_id = completion
-                .subagent_id
-                .as_deref()
-                .filter(|id| !id.is_empty())?;
-            let parent_tool_call_id = completion
-                .tool_call_id
-                .as_deref()
-                .filter(|id| !id.is_empty())?;
-            let status = match pb::BackgroundTaskStatus::try_from(completion.status).ok()? {
-                pb::BackgroundTaskStatus::Success => pb::SubagentRunStatus::Success,
-                pb::BackgroundTaskStatus::Error => pb::SubagentRunStatus::Error,
-                pb::BackgroundTaskStatus::Aborted => pb::SubagentRunStatus::Aborted,
-                pb::BackgroundTaskStatus::Unspecified => return None,
-            };
-            Some((
-                subagent_id.to_owned(),
-                parent_tool_call_id.to_owned(),
-                status,
-                completion.title.clone(),
-                completion.detail.clone(),
-                completion.output_path.clone(),
-            ))
-        })
-        .collect::<Vec<_>>();
-    let conversation_id =
-        crate::model::ConversationId::new(request.conversation_id.as_deref().unwrap_or_default());
-    for (subagent_id, parent_tool_call_id, status, title, detail, output_path) in completions {
-        let state_consumed = request
-            .conversation_state
-            .as_ref()
-            .and_then(|state| {
-                state
-                    .subagent_runs_by_parent_tool_call_id
-                    .get(&parent_tool_call_id)
-            })
-            .is_some_and(|run| {
-                run.subagent_id.as_deref() == Some(subagent_id.as_str())
-                    && run.completion_reason
-                        == Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32)
-                    && matches!(
-                        pb::SubagentRunStatus::try_from(run.status),
-                        Ok(pb::SubagentRunStatus::Success
-                            | pb::SubagentRunStatus::Error
-                            | pb::SubagentRunStatus::Aborted)
-                    )
-            });
-        if state_consumed {
-            store.ensure_conversation(&conversation_id).await?;
-            store
-                .record_consumed_subagent_completion(
-                    &conversation_id,
-                    &subagent_id,
-                    &parent_tool_call_id,
-                )
-                .await?;
-            continue;
-        }
-        let persisted_consumed = store
-            .consumed_subagent_completion(&conversation_id, &subagent_id, &parent_tool_call_id)
-            .await?;
-        if !persisted_consumed {
-            continue;
-        }
-        request
-            .conversation_state
-            .get_or_insert_with(Default::default)
-            .subagent_runs_by_parent_tool_call_id
-            .insert(
-                parent_tool_call_id.clone(),
-                pb::SubagentRunState {
-                    parent_tool_call_id,
-                    subagent_id: Some(subagent_id),
-                    status: status as i32,
-                    title: Some(title),
-                    detail,
-                    output_path,
-                    completion_reason: Some(
-                        pb::BackgroundTaskCompletionReason::TaskFinished as i32,
-                    ),
-                    ..Default::default()
-                },
-            );
-    }
-    Ok(())
+fn unsupported_runtime_action_error(action: &pb::conversation_action::Action) -> crate::Error {
+    crate::Error::Protocol(format!(
+        "runtime ConversationAction does not support {}",
+        runtime_action_name(action)
+    ))
 }
 
 fn runtime_action_name(action: &pb::conversation_action::Action) -> &'static str {
@@ -971,5 +1196,20 @@ fn runtime_action_name(action: &pb::conversation_action::Action) -> &'static str
         Action::SubscriptionNotificationAction(_) => "SubscriptionNotificationAction",
         Action::GoalContinuationAction(_) => "GoalContinuationAction",
         Action::InjectContextAction(_) => "InjectContextAction",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_runtime_actions_become_protocol_errors() {
+        let action = pb::conversation_action::Action::ResumeAction(pb::ResumeAction::default());
+        let error = unsupported_runtime_action_error(&action);
+        assert_eq!(
+            error.to_string(),
+            "protocol error: runtime ConversationAction does not support ResumeAction"
+        );
     }
 }

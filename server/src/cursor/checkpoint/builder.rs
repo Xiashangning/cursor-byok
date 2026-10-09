@@ -1,5 +1,5 @@
 //! Coordinates construction of a complete Cursor checkpoint.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use prost::Message;
 
@@ -11,7 +11,7 @@ use crate::{
         transport::TransportHandle,
     },
     model::{CanonicalMessage, ConversationId, ToolCall, ToolDefinition, ToolRoundAssistant},
-    store::Store,
+    store::{BlobId, Store},
     Result,
 };
 
@@ -34,6 +34,26 @@ pub struct CheckpointBuilder {
     pub(super) roots: Option<RootFrontier>,
     pub(super) turn: Option<TurnFrontier>,
     pub(super) turns_initialized: bool,
+    /// resume 重置时被替换掉的原始派发 call id(subagent_id → 旧 call id):
+    /// 客户端对原始后台运行的完成通知仍携带旧 id,消费登记必须同时覆盖。
+    pub(super) superseded_subagent_calls: HashMap<String, Vec<String>>,
+}
+
+/// A fully built checkpoint plus the completion identities that become safe to
+/// suppress only after this exact checkpoint has entered the output stream.
+#[derive(Debug)]
+pub(crate) struct BuiltCheckpoint {
+    pub(crate) state: pb::ConversationStateStructure,
+    consumed_background_completions: Vec<(String, String)>,
+}
+
+impl BuiltCheckpoint {
+    pub(super) fn without_consumptions(state: pb::ConversationStateStructure) -> Self {
+        Self {
+            state,
+            consumed_background_completions: Vec::new(),
+        }
+    }
 }
 
 impl CheckpointBuilder {
@@ -60,6 +80,7 @@ impl CheckpointBuilder {
             roots: None,
             turn: None,
             turns_initialized: false,
+            superseded_subagent_calls: HashMap::new(),
         }
     }
 
@@ -100,20 +121,67 @@ impl CheckpointBuilder {
         }
         details.max_tokens = max_tokens.min(u32::MAX as u64) as u32;
         details.prompt_context_usage_tree = None;
-        details.prompt_context_usage_snapshot_blob_id = None;
     }
 
-    pub async fn settled(
+    pub(crate) async fn settled(
         &mut self,
         messages: &[CanonicalMessage],
         mode: i32,
         presentation: &PendingSteps,
-    ) -> Result<pb::ConversationStateStructure> {
+    ) -> Result<BuiltCheckpoint> {
         self.build_state(messages, mode, Vec::new(), presentation)
             .await
     }
 
-    pub async fn staged_tool_round(
+    pub(crate) async fn todo_updated(
+        &mut self,
+        current: &pb::ConversationStateStructure,
+        todos: &[pb::TodoItem],
+        completed_messages: &[CanonicalMessage],
+        mode: i32,
+        presentation: &PendingSteps,
+    ) -> Result<BuiltCheckpoint> {
+        let mut todo_ids = Vec::with_capacity(todos.len());
+        for (index, todo) in todos.iter().enumerate() {
+            let encoded = todo.encode_to_vec();
+            let id = BlobId::digest(&encoded);
+            if current.todos.get(index).map(Vec::as_slice) == Some(id.as_bytes()) {
+                todo_ids.push(id);
+            } else {
+                todo_ids.push(self.sync.persist(&encoded, &[]).await?);
+            }
+        }
+        let raw_todo_ids = todo_ids
+            .iter()
+            .map(|id| id.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let [pending] = current.pending_tool_calls.as_slice() else {
+            return Err(crate::Error::Protocol(
+                "TodoWrite progress requires one pending assistant".into(),
+            ));
+        };
+        let consumed_background_completions = self.absorb_presentation(presentation);
+        let turn_ids = self.project_turns(mode, presentation).await?;
+        self.base.todos = raw_todo_ids.clone();
+
+        let mut state = current.clone();
+        state.todos = raw_todo_ids;
+        state.turns = turn_ids.iter().map(|id| id.as_bytes().to_vec()).collect();
+        state.read_paths = self.base.read_paths.clone();
+        state.subagent_states = self.base.subagent_states.clone();
+        state.subagent_runs_by_parent_tool_call_id =
+            self.base.subagent_runs_by_parent_tool_call_id.clone();
+        state.pending_tool_calls = vec![messages::with_completed_tool_messages(
+            pending,
+            completed_messages,
+        )?];
+        Ok(BuiltCheckpoint {
+            state,
+            consumed_background_completions,
+        })
+    }
+
+    pub(crate) async fn staged_tool_round(
         &mut self,
         stable_messages: &[CanonicalMessage],
         mode: i32,
@@ -121,8 +189,8 @@ impl CheckpointBuilder {
         calls: &[ToolCall],
         started_at_ms: u64,
         presentation: &PendingSteps,
-    ) -> Result<pb::ConversationStateStructure> {
-        reset_resumed_subagent_runs(&mut self.base, calls);
+    ) -> Result<BuiltCheckpoint> {
+        reset_resumed_subagent_runs(&mut self.base, calls, &mut self.superseded_subagent_calls);
         let pending = messages::staged_tool_round(
             assistant,
             calls,
@@ -135,14 +203,14 @@ impl CheckpointBuilder {
             .await
     }
 
-    pub async fn staged_final(
+    pub(crate) async fn staged_final(
         &mut self,
         stable_messages: &[CanonicalMessage],
         mode: i32,
         assistant: &CanonicalMessage,
         started_at_ms: u64,
         presentation: &PendingSteps,
-    ) -> Result<pb::ConversationStateStructure> {
+    ) -> Result<BuiltCheckpoint> {
         let pending = messages::staged_final(
             assistant,
             &self.model,
@@ -160,18 +228,8 @@ impl CheckpointBuilder {
         mode: i32,
         pending_tool_calls: Vec<String>,
         presentation: &PendingSteps,
-    ) -> Result<pb::ConversationStateStructure> {
-        self.record_background_subagents(presentation);
-        let consumed = self.record_consumed_subagent_completions(presentation);
-        for (subagent_id, parent_tool_call_id) in consumed {
-            self.store
-                .record_consumed_subagent_completion(
-                    &self.conversation_id,
-                    &subagent_id,
-                    &parent_tool_call_id,
-                )
-                .await?;
-        }
+    ) -> Result<BuiltCheckpoint> {
+        let consumed_background_completions = self.absorb_presentation(presentation);
         let root_ids = self.project_roots(messages).await?;
         let turn_ids = self.project_turns(mode, presentation).await?;
         let (todo_ids, plan_id) = self.build_derived_state(messages).await?;
@@ -186,11 +244,6 @@ impl CheckpointBuilder {
             .into_iter()
             .collect();
 
-        for path in &presentation.read_paths {
-            if !self.base.read_paths.contains(path) {
-                self.base.read_paths.push(path.clone());
-            }
-        }
         let mut checkpoint = self.base.clone();
         checkpoint.root_prompt_messages_json =
             root_ids.iter().map(|id| id.as_bytes().to_vec()).collect();
@@ -210,7 +263,23 @@ impl CheckpointBuilder {
                 messages,
             )?);
         }
-        Ok(checkpoint)
+        Ok(BuiltCheckpoint {
+            state: checkpoint,
+            consumed_background_completions,
+        })
+    }
+
+    /// Incremental projection of one step's presentation into the base state:
+    /// background subagent states, consumed completions, and read paths.
+    fn absorb_presentation(&mut self, presentation: &PendingSteps) -> Vec<(String, String)> {
+        self.record_background_subagents(presentation);
+        let consumed = self.record_consumed_subagent_completions(presentation);
+        for path in &presentation.read_paths {
+            if !self.base.read_paths.contains(path) {
+                self.base.read_paths.push(path.clone());
+            }
+        }
+        consumed
     }
 
     fn record_background_subagents(&mut self, presentation: &PendingSteps) {
@@ -254,7 +323,6 @@ impl CheckpointBuilder {
                     cloud_subagent: None,
                     first_class_bc_id: None,
                     cloud_requested_environment_build_id: None,
-                    machine: args.machine.clone(),
                 });
             self.base.subagent_runs_by_parent_tool_call_id.insert(
                 tool_call_id.clone(),
@@ -300,45 +368,74 @@ impl CheckpointBuilder {
                 .or_else(|| Some(crate::cursor::tools::runtime::now_ms()));
             state.completion_reason = Some(pb::BackgroundTaskCompletionReason::TaskFinished as i32);
             consumed.push((agent_id.to_owned(), state.parent_tool_call_id.clone()));
+            // 同一子代理经 resume 重置过生命周期的,原始派发 call id 一并登记:
+            // 客户端对原始后台运行的迟到通知仍携带旧 id。
+            if let Some(superseded) = self.superseded_subagent_calls.get(agent_id) {
+                consumed.extend(
+                    superseded
+                        .iter()
+                        .map(|call_id| (agent_id.to_owned(), call_id.clone())),
+                );
+            }
         }
         consumed
     }
 
-    pub async fn publish(
+    pub(crate) async fn publish(
         &self,
         handle: &TransportHandle,
-        checkpoint: &pb::ConversationStateStructure,
+        checkpoint: &BuiltCheckpoint,
     ) -> Result<()> {
         tracing::debug!(
             request_id = self.sync.request_id(),
-            stable_roots = checkpoint.root_prompt_messages_json.len(),
-            pending_assistants = checkpoint.pending_tool_calls.len(),
+            stable_roots = checkpoint.state.root_prompt_messages_json.len(),
+            pending_assistants = checkpoint.state.pending_tool_calls.len(),
             "publishing Cursor checkpoint"
         );
         let result = handle.emit(&pb::AgentServerMessage {
             ttft_breakdown: None,
             message: Some(
-                pb::agent_server_message::Message::ConversationCheckpointUpdate(checkpoint.clone()),
+                pb::agent_server_message::Message::ConversationCheckpointUpdate(
+                    checkpoint.state.clone(),
+                ),
             ),
         });
-        if let Some(trace) = handle.trace() {
-            trace.artifact(
-                "checkpoint",
-                "byok_server",
-                &checkpoint.encode_to_vec(),
-                serde_json::json!({
-                    "root_message_count": checkpoint.root_prompt_messages_json.len(),
-                    "turn_count": checkpoint.turns.len(),
-                    "pending_tool_call_count": checkpoint.pending_tool_calls.len(),
-                    "emit_status": if result.is_ok() { "sent" } else { "error" },
-                }),
-            );
+        // Rendering the whole state is only worth its cost when the trace is recording.
+        if let Some(trace) = handle.trace().filter(|trace| trace.is_enabled()) {
+            let mut metadata = serde_json::json!({
+                "root_message_count": checkpoint.state.root_prompt_messages_json.len(),
+                "turn_count": checkpoint.state.turns.len(),
+                "pending_tool_call_count": checkpoint.state.pending_tool_calls.len(),
+                "emit_status": if result.is_ok() { "sent" } else { "error" },
+            });
+            match crate::cursor::protocol::json::render_state(&checkpoint.state) {
+                Some(rendered) => {
+                    metadata["truncated"] = rendered.truncated.into();
+                    metadata["total_bytes"] = rendered.total_bytes.into();
+                    trace.artifact("checkpoint", "byok_server", &rendered.json, metadata);
+                }
+                None => tracing::warn!(
+                    request_id = self.sync.request_id(),
+                    "cannot render Cursor checkpoint for its trace"
+                ),
+            }
         }
-        result
+        result?;
+        self.store
+            .record_consumed_background_completions(
+                &self.conversation_id,
+                pb::BackgroundTaskKind::Subagent.as_str_name(),
+                &checkpoint.consumed_background_completions,
+            )
+            .await
     }
 }
 
-fn reset_resumed_subagent_runs(state: &mut pb::ConversationStateStructure, calls: &[ToolCall]) {
+fn reset_resumed_subagent_runs(
+    state: &mut pb::ConversationStateStructure,
+    calls: &[ToolCall],
+    superseded_subagent_calls: &mut HashMap<String, Vec<String>>,
+) {
     for call in calls {
         let normalized = call
             .name
@@ -367,9 +464,24 @@ fn reset_resumed_subagent_runs(state: &mut pb::ConversationStateStructure, calls
         else {
             continue;
         };
+        let mut superseded = Vec::new();
         state
             .subagent_runs_by_parent_tool_call_id
-            .retain(|_, run| run.subagent_id.as_deref() != Some(subagent_id));
+            .retain(|key, run| {
+                let remove = run.subagent_id.as_deref() == Some(subagent_id);
+                if remove {
+                    superseded.push(key.clone());
+                }
+                !remove
+            });
+        let known = superseded_subagent_calls
+            .entry(subagent_id.to_owned())
+            .or_default();
+        for key in superseded {
+            if !known.contains(&key) {
+                known.push(key);
+            }
+        }
         state.subagent_runs_by_parent_tool_call_id.insert(
             call.call_id.clone(),
             pb::SubagentRunState {
@@ -436,7 +548,288 @@ fn context_limit(selected: Option<u64>, previous: Option<u64>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc;
+
+    use crate::cursor::{
+        services::{blob_sync::BlobSynchronizer, observability::CursorTraceService},
+        transport::{OutputHub, TransportHandle},
+    };
+
     use super::*;
+
+    struct BuilderFixture {
+        _directory: tempfile::TempDir,
+        url: String,
+        store: Store,
+        conversation_id: ConversationId,
+        builder: CheckpointBuilder,
+        handle: TransportHandle,
+    }
+
+    async fn builder_fixture(
+        base: Option<pb::ConversationStateStructure>,
+        turn_user: Option<pb::UserMessage>,
+    ) -> BuilderFixture {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("test.db").display());
+        let store = Store::connect(&url).await.unwrap();
+        let conversation_id = ConversationId::new("conversation-1");
+        store.ensure_conversation(&conversation_id).await.unwrap();
+        let (commands, _receiver) = mpsc::channel(1);
+        let output = Arc::new(OutputHub::default());
+        let trace = CursorTraceService::new(store.clone()).recorder("request-1");
+        let handle = TransportHandle::new("request-1".into(), commands, output, trace);
+        let sync = BlobSynchronizer::new("request-1".into(), store.clone(), handle.clone());
+        let mut builder =
+            CheckpointBuilder::new(store.clone(), conversation_id.clone(), sync, None, base);
+        builder.configure(
+            "test-model".into(),
+            None,
+            String::new(),
+            Vec::new(),
+            HashSet::new(),
+            turn_user,
+        );
+        BuilderFixture {
+            _directory: directory,
+            url,
+            store,
+            conversation_id,
+            builder,
+            handle,
+        }
+    }
+
+    fn consumed_checkpoint() -> BuiltCheckpoint {
+        BuiltCheckpoint {
+            state: pb::ConversationStateStructure::default(),
+            consumed_background_completions: vec![("agent-1".into(), "task-call-1".into())],
+        }
+    }
+
+    fn consumed_presentation() -> PendingSteps {
+        PendingSteps {
+            steps: vec![pb::ConversationStep {
+                message: Some(pb::conversation_step::Message::ToolCall(pb::ToolCall {
+                    tool_call_id: Some("await-call-1".into()),
+                    tool: Some(pb::tool_call::Tool::AwaitToolCall(pb::AwaitToolCall {
+                        args: Some(pb::AwaitArgs {
+                            task_id: "agent-1".into(),
+                            ..Default::default()
+                        }),
+                        result: Some(pb::AwaitResult {
+                            result: Some(pb::await_result::Result::Complete(
+                                pb::AwaitTaskComplete::default(),
+                            )),
+                        }),
+                    })),
+                    ..Default::default()
+                })),
+            }],
+            read_paths: Vec::new(),
+        }
+    }
+
+    fn completion_action() -> pb::BackgroundTaskCompletionAction {
+        pb::BackgroundTaskCompletionAction {
+            completions: vec![pb::BackgroundTaskCompletion {
+                task_id: "agent-1".into(),
+                kind: pb::BackgroundTaskKind::Subagent as i32,
+                status: pb::BackgroundTaskStatus::Success as i32,
+                title: "Agent result".into(),
+                reason: pb::BackgroundTaskCompletionReason::TaskFinished as i32,
+                subagent_id: Some("agent-1".into()),
+                tool_call_id: Some("task-call-1".into()),
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_checkpoint_build_does_not_consume_background_completion() {
+        let base = pb::ConversationStateStructure {
+            subagent_runs_by_parent_tool_call_id: std::collections::HashMap::from([(
+                "task-call-1".into(),
+                pb::SubagentRunState {
+                    parent_tool_call_id: "task-call-1".into(),
+                    subagent_id: Some("agent-1".into()),
+                    status: pb::SubagentRunStatus::Running as i32,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let turn_user = pb::UserMessage {
+            text: "collect result".into(),
+            message_id: "user-1".into(),
+            ..Default::default()
+        };
+        let mut fixture = builder_fixture(Some(base), Some(turn_user)).await;
+        fixture.handle.close_output();
+
+        fixture
+            .builder
+            .settled(&[], pb::AgentMode::Agent as i32, &consumed_presentation())
+            .await
+            .expect_err("closed output must fail Blob synchronization");
+
+        assert!(fixture
+            .store
+            .consumed_background_identities(&fixture.conversation_id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_checkpoint_publication_does_not_consume_background_completion_after_restart() {
+        let BuilderFixture {
+            _directory,
+            url,
+            store,
+            conversation_id,
+            builder,
+            handle,
+        } = builder_fixture(None, None).await;
+        handle.close_output();
+        builder
+            .publish(&handle, &consumed_checkpoint())
+            .await
+            .expect_err("closed output must reject checkpoint publication");
+        drop(builder);
+        drop(handle);
+        drop(store);
+
+        let restarted = Store::connect(&url).await.unwrap();
+        let suppressed = restarted
+            .consumed_background_identities(&conversation_id)
+            .await
+            .unwrap();
+        assert!(suppressed.is_empty());
+        assert!(
+            crate::cursor::compile::project_background_completion_for_test(
+                &completion_action(),
+                &suppressed,
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_checkpoint_publication_persists_consumption_once_across_restart() {
+        let BuilderFixture {
+            _directory,
+            url,
+            store,
+            conversation_id,
+            builder,
+            handle,
+        } = builder_fixture(None, None).await;
+        let checkpoint = consumed_checkpoint();
+        builder.publish(&handle, &checkpoint).await.unwrap();
+        builder.publish(&handle, &checkpoint).await.unwrap();
+        drop(builder);
+        drop(handle);
+        drop(store);
+
+        let restarted = Store::connect(&url).await.unwrap();
+        assert_eq!(
+            restarted
+                .consumed_background_identities(&conversation_id)
+                .await
+                .unwrap(),
+            HashSet::from(["BACKGROUND_TASK_KIND_SUBAGENT:agent-1:task-call-1".to_owned()])
+        );
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM background_consumed WHERE conversation_id = ?",
+        )
+        .bind(conversation_id.as_str())
+        .fetch_one(restarted.pool())
+        .await
+        .unwrap();
+        assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn foreground_resume_consumption_covers_the_original_dispatch_identity() {
+        let base = pb::ConversationStateStructure {
+            subagent_runs_by_parent_tool_call_id: std::collections::HashMap::from([(
+                "task-call-1".into(),
+                pb::SubagentRunState {
+                    parent_tool_call_id: "task-call-1".into(),
+                    subagent_id: Some("agent-1".into()),
+                    status: pb::SubagentRunStatus::Backgrounded as i32,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let mut fixture = builder_fixture(Some(base), None).await;
+        let resume_call = ToolCall {
+            index: 0,
+            call_id: "resume-task-call".into(),
+            model_call_id: "model-call".into(),
+            name: "Task".into(),
+            arguments_text: "{}".into(),
+            arguments: serde_json::json!({"resume": "agent-1", "description": "Continue"}),
+            argument_error: None,
+        };
+        // 前台 resume 派发时的重置:re-key 到 resume 调用,并记录被替换的原始 id。
+        reset_resumed_subagent_runs(
+            &mut fixture.builder.base,
+            &[resume_call],
+            &mut fixture.builder.superseded_subagent_calls,
+        );
+        let presentation = PendingSteps {
+            steps: vec![pb::ConversationStep {
+                message: Some(pb::conversation_step::Message::ToolCall(pb::ToolCall {
+                    tool_call_id: Some("resume-task-call".into()),
+                    tool: Some(pb::tool_call::Tool::TaskToolCall(pb::TaskToolCall {
+                        args: Some(pb::TaskArgs {
+                            resume: Some("agent-1".into()),
+                            ..Default::default()
+                        }),
+                        result: Some(pb::TaskResult {
+                            result: Some(pb::task_result::Result::Success(pb::TaskSuccess {
+                                agent_id: Some("agent-1".into()),
+                                is_background: false,
+                                ..Default::default()
+                            })),
+                        }),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+            }],
+            read_paths: Vec::new(),
+        };
+        let checkpoint = fixture
+            .builder
+            .settled(&[], pb::AgentMode::Agent as i32, &presentation)
+            .await
+            .unwrap();
+        fixture
+            .builder
+            .publish(&fixture.handle, &checkpoint)
+            .await
+            .unwrap();
+
+        // 迟到的原始通知(tool_call_id = task-call-1)与针对 resume 运行的通知
+        // (tool_call_id = resume-task-call)都必须被台账抑制。
+        assert_eq!(
+            fixture
+                .store
+                .consumed_background_identities(&fixture.conversation_id)
+                .await
+                .unwrap(),
+            HashSet::from([
+                "BACKGROUND_TASK_KIND_SUBAGENT:agent-1:task-call-1".to_owned(),
+                "BACKGROUND_TASK_KIND_SUBAGENT:agent-1:resume-task-call".to_owned(),
+            ])
+        );
+    }
 
     #[test]
     fn resumed_subagent_starts_a_new_running_lifecycle() {
@@ -470,8 +863,9 @@ mod tests {
             }),
             argument_error: None,
         }];
+        let mut superseded = HashMap::new();
 
-        reset_resumed_subagent_runs(&mut state, &calls);
+        reset_resumed_subagent_runs(&mut state, &calls, &mut superseded);
 
         assert!(!state
             .subagent_runs_by_parent_tool_call_id
@@ -483,6 +877,11 @@ mod tests {
         assert_eq!(resumed.detail, None);
         assert_eq!(resumed.completed_timestamp_ms, None);
         assert_eq!(resumed.completion_reason, None);
+        // 被替换的原始派发 call id 被记录,供消费登记时一并落账。
+        assert_eq!(
+            superseded,
+            HashMap::from([("agent-1".to_owned(), vec!["old-task-call".to_owned()])])
+        );
     }
 
     #[test]

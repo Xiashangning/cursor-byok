@@ -10,7 +10,7 @@ use prost::Message;
 use crate::{
     api::cursor::proxy::{self, CursorProxy},
     cursor::{protocol::proto::agent::v1 as agent, transport::TransportRegistry},
-    model::{format_token_count, parse_token_count, ModelConfig},
+    model::{format_token_count, parse_token_count, ModelConfig, ModelVariantAxis},
     plugin::PluginModelDescriptor,
     Error, Result,
 };
@@ -216,31 +216,15 @@ struct DefaultModelNudgeDataResponse {
 }
 
 const CLI_LOCAL_MODEL_API_KEY: &str = "cursor-byok-local";
-const DEFAULT_CONTEXT: &str = "200k";
 
-fn context_options(model: &ModelConfig) -> Vec<(String, String)> {
-    let configured = model.context_window_tokens;
-    let mut contexts =
-        Vec::with_capacity(model.context_options.len() + usize::from(configured.is_some()));
-    if let Some(tokens) = configured {
-        match model
-            .context_options
-            .iter()
-            .find(|value| parse_token_count(value) == Some(tokens))
-        {
-            // A named option matching the configured window leads the list as-is.
-            Some(value) => contexts.push((value.clone(), display_token_count(value))),
-            // Without a matching named option the window is exposed as a bare token count.
-            None => contexts.push((tokens.to_string(), format_token_count(tokens))),
-        }
-    }
-    for value in &model.context_options {
-        if configured.is_some_and(|tokens| parse_token_count(value) == Some(tokens)) {
-            continue;
-        }
-        contexts.push((value.clone(), display_token_count(value)));
-    }
-    contexts
+fn context_options(axis: &ModelVariantAxis) -> Vec<(String, String)> {
+    axis.context_options
+        .iter()
+        .map(|value| {
+            let display_name = display_token_count(value);
+            (value.clone(), display_name)
+        })
+        .collect()
 }
 
 fn display_token_count(value: &str) -> String {
@@ -249,9 +233,8 @@ fn display_token_count(value: &str) -> String {
         .unwrap_or_else(|| value.to_owned())
 }
 
-fn effort_options(model: &ModelConfig) -> Vec<(String, String)> {
-    model
-        .effort_options
+fn effort_options(values: &[String]) -> Vec<(String, String)> {
+    values
         .iter()
         .map(|value| (value.clone(), effort_display_name(value)))
         .collect()
@@ -273,7 +256,7 @@ pub async fn available_models(
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let models = registry.store().models().await?;
+    let models = configured_builtin_models(registry.store()).await?;
     let plugin_models = match registry.plugins() {
         Some(plugins) => plugins.configured_models().await,
         None => Vec::new(),
@@ -283,8 +266,22 @@ pub async fn available_models(
         plugin_model_count = plugin_models.len(),
         "appending BYOK models to Cursor AvailableModels"
     );
+    let quota_summaries = plugin_quota_summaries(&registry, &plugin_models).await;
+    let model_notes = plugin_model_notes(&registry, &plugin_models).await;
     let mut available_models = models.iter().map(available_model).collect::<Vec<_>>();
-    available_models.extend(plugin_models.iter().map(available_plugin_model));
+    available_models.extend(plugin_models.iter().map(|model| {
+        let quota = quota_summaries
+            .get(&format!("{}/{}", model.plugin_id, model.provider_id))
+            .map(String::as_str);
+        let note = model_notes
+            .get(&model_note_key(
+                &model.plugin_id,
+                &model.provider_id,
+                &model.model_id,
+            ))
+            .map(String::as_str);
+        available_plugin_model(model, quota, note)
+    }));
     let local = AvailableModelsAddition {
         model_names: models
             .iter()
@@ -308,7 +305,7 @@ pub async fn usable_models(
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let models = registry.store().models().await?;
+    let models = configured_builtin_models(registry.store()).await?;
     let plugin_models = match registry.plugins() {
         Some(plugins) => plugins.configured_models().await,
         None => Vec::new(),
@@ -338,7 +335,7 @@ pub async fn usable_models(
 pub async fn default_model_for_cli(
     State(registry): State<TransportRegistry>,
 ) -> Result<Response<Body>> {
-    let models = registry.store().models().await?;
+    let models = configured_builtin_models(registry.store()).await?;
     let plugin_models = configured_plugin_models(&registry).await;
     Ok(local_response(
         agent::GetDefaultModelForCliResponse {
@@ -349,7 +346,7 @@ pub async fn default_model_for_cli(
 }
 
 pub async fn default_model(State(registry): State<TransportRegistry>) -> Result<Response<Body>> {
-    let models = registry.store().models().await?;
+    let models = configured_builtin_models(registry.store()).await?;
     let plugin_models = configured_plugin_models(&registry).await;
     Ok(local_response(
         default_model_response(&models, &plugin_models).encode_to_vec(),
@@ -359,11 +356,20 @@ pub async fn default_model(State(registry): State<TransportRegistry>) -> Result<
 pub async fn default_model_nudge(
     State(registry): State<TransportRegistry>,
 ) -> Result<Response<Body>> {
-    let models = registry.store().models().await?;
+    let models = configured_builtin_models(registry.store()).await?;
     let plugin_models = configured_plugin_models(&registry).await;
     Ok(local_response(
         default_model_nudge_response(&models, &plugin_models).encode_to_vec(),
     ))
+}
+
+async fn configured_builtin_models(store: &crate::store::Store) -> Result<Vec<ModelConfig>> {
+    Ok(store
+        .models()
+        .await?
+        .into_iter()
+        .filter(|model| !model.is_draft())
+        .collect())
 }
 
 async fn configured_plugin_models(registry: &TransportRegistry) -> Vec<PluginModelDescriptor> {
@@ -473,8 +479,10 @@ fn unary_payload(body: &Bytes) -> Result<(bool, &[u8])> {
 }
 
 fn available_model(model: &ModelConfig) -> AvailableModel {
-    let contexts = context_options(model);
-    let efforts = effort_options(model);
+    let axis = model.variant_axis();
+    let defaults = axis.default_parts();
+    let contexts = context_options(&axis);
+    let efforts = effort_options(&model.effort_options);
     let context_token_limit = model
         .context_window_tokens
         .map(|tokens| tokens.min(i32::MAX as u64) as i32);
@@ -485,6 +493,7 @@ fn available_model(model: &ModelConfig) -> AvailableModel {
         &tooltip,
         &contexts,
         &efforts,
+        defaults.as_ref(),
     );
     let legacy_slugs = variants
         .iter()
@@ -538,40 +547,6 @@ fn provider_host(base_url: &str) -> String {
         .ok()
         .and_then(|url| url.host_str().map(str::to_lowercase))
         .unwrap_or_else(|| base_url.trim().into())
-}
-
-/// 插件模型的固定 Effort 轴(插件描述符没有可配置 effort_options)。
-const PLUGIN_EFFORTS: [(&str, &str); 5] = [
-    ("low", "Low"),
-    ("medium", "Medium"),
-    ("high", "High"),
-    ("xhigh", "Extra High"),
-    ("max", "Max"),
-];
-
-/// 插件模型的固定 Context 轴(插件描述符没有可配置 context_options)。
-fn plugin_context_options(context_window_tokens: Option<u64>) -> Vec<(String, String)> {
-    const CONTEXTS: [(&str, &str); 5] = [
-        ("200k", "200K"),
-        ("356k", "356K"),
-        ("500k", "500K"),
-        ("800k", "800K"),
-        ("1m", "1M"),
-    ];
-    let mut contexts = CONTEXTS
-        .into_iter()
-        .map(|(value, display_name)| (value.to_owned(), display_name.to_owned()))
-        .collect::<Vec<_>>();
-    if let Some(tokens) = context_window_tokens {
-        let value = tokens.to_string();
-        let duplicate = contexts
-            .iter()
-            .any(|(existing, _)| parse_token_count(existing) == Some(tokens));
-        if !duplicate {
-            contexts.insert(0, (value, format_token_count(tokens)));
-        }
-    }
-    contexts
 }
 
 fn model_parameters(
@@ -648,17 +623,10 @@ fn model_variants(
     tooltip: &TooltipData,
     contexts: &[(String, String)],
     efforts: &[(String, String)],
+    defaults: Option<&crate::model::ModelVariantParts>,
 ) -> Vec<ModelVariant> {
-    let default_context = contexts
-        .iter()
-        .find(|(value, _)| value == DEFAULT_CONTEXT)
-        .or_else(|| contexts.first())
-        .map(|(value, _)| value.as_str());
-    let default_effort = efforts
-        .iter()
-        .find(|(value, _)| value == "high")
-        .or_else(|| efforts.first())
-        .map(|(value, _)| value.as_str());
+    let default_context = defaults.map(|parts| parts.context.as_str());
+    let default_effort = defaults.and_then(|parts| parts.effort.as_deref());
     // 没有 Effort 轴的模型(非思考插件模型)变体网格只剩 Context × Fast。
     let effort_axis = if efforts.is_empty() {
         vec![None]
@@ -765,22 +733,122 @@ fn model_tooltip(model: &ModelConfig) -> TooltipData {
     }
 }
 
-fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
-    let tooltip = TooltipData {
-        markdown_content: model.description.clone(),
+/// 各插件模型的单行额度摘要,key 为 `{plugin_id}/{provider_id}`。
+async fn plugin_quota_summaries(
+    registry: &TransportRegistry,
+    models: &[PluginModelDescriptor],
+) -> std::collections::HashMap<String, String> {
+    let mut summaries = std::collections::HashMap::new();
+    let Some(plugins) = registry.plugins() else {
+        return summaries;
     };
-    // Effort 与上下文档位由宿主统一提供,与内置模型一致;插件不再声明这两项。
-    let contexts = plugin_context_options(None);
-    let efforts = PLUGIN_EFFORTS
-        .into_iter()
-        .map(|(value, display_name)| (value.to_owned(), display_name.to_owned()))
-        .collect::<Vec<_>>();
+    for model in models {
+        let key = format!("{}/{}", model.plugin_id, model.provider_id);
+        if summaries.contains_key(&key) {
+            continue;
+        }
+        if let Some(line) = plugins
+            .quota_summary(&model.plugin_id, &model.provider_id)
+            .await
+        {
+            summaries.insert(key, line);
+        }
+    }
+    summaries
+}
+
+/// 模型备注表的 key:`{plugin_id}/{provider_id}/{model_id}`。
+fn model_note_key(plugin_id: &str, provider_id: &str, model_id: &str) -> String {
+    format!("{plugin_id}/{provider_id}/{model_id}")
+}
+
+/// 各插件模型的动态备注,key 为 `{plugin_id}/{provider_id}/{model_id}`。
+/// 按 provider 分组,每个 provider 只取一次整张备注表,再逐模型本地查找。
+async fn plugin_model_notes(
+    registry: &TransportRegistry,
+    models: &[PluginModelDescriptor],
+) -> std::collections::HashMap<String, String> {
+    let mut notes = std::collections::HashMap::new();
+    let Some(plugins) = registry.plugins() else {
+        return notes;
+    };
+    // 同一 provider 的模型共享一张备注表;按 provider 去重后各取一次。
+    let mut providers: Vec<(&str, &str)> = Vec::new();
+    for model in models {
+        let pair = (model.plugin_id.as_str(), model.provider_id.as_str());
+        if !providers.contains(&pair) {
+            providers.push(pair);
+        }
+    }
+    for (plugin_id, provider_id) in providers {
+        let Some(by_model) = plugins.model_notes(plugin_id, provider_id).await else {
+            continue;
+        };
+        for model in models
+            .iter()
+            .filter(|m| m.plugin_id == plugin_id && m.provider_id == provider_id)
+        {
+            if let Some(text) = by_model.get(&model.model_id) {
+                notes.insert(
+                    model_note_key(plugin_id, provider_id, &model.model_id),
+                    text.clone(),
+                );
+            }
+        }
+    }
+    notes
+}
+
+/// 插件模型的 hover markdown:静态备注一段,与动态内容之间用 `<br><br>` 强制空一行
+/// (普通 `\n\n` 在 Cursor hover 里会被折叠);额度块整段斜体且自身含多行列表,
+/// 其余动态行(限免、额度消耗倍率等)各自用 `<u></u>` 包裹;三者皆无保持 None。
+fn plugin_tooltip(
+    description: Option<&str>,
+    quota: Option<&str>,
+    note: Option<&str>,
+) -> Option<String> {
+    let description = description
+        .map(str::trim_end)
+        .filter(|text| !text.trim().is_empty());
+    // hover 中的换行必须显式写成 `<br>`,`\n` 会被折叠;斜体包裹整段列表。
+    let dynamic = {
+        let mut rows: Vec<String> = Vec::new();
+        if let Some(quota) = quota {
+            rows.push(format!("<i>{}</i>", quota.replace('\n', "<br>")));
+        }
+        if let Some(note) = note {
+            rows.push(format!("<u>{note}</u>"));
+        }
+        rows.join("\n\n")
+    };
+    match (description, dynamic.is_empty()) {
+        (Some(description), false) => Some(format!("{description}<br><br>{dynamic}")),
+        (None, false) => Some(dynamic),
+        (Some(description), true) => Some(description.to_owned()),
+        (None, true) => None,
+    }
+}
+
+fn available_plugin_model(
+    model: &PluginModelDescriptor,
+    quota: Option<&str>,
+    note: Option<&str>,
+) -> AvailableModel {
+    let tooltip = TooltipData {
+        markdown_content: plugin_tooltip(model.description.as_deref(), quota, note),
+    };
+    // Effort 与 Context 档位取自描述符的生效轴(已并入用户覆盖)。
+    let axis = model.variant_axis();
+    let defaults = axis.default_parts();
+    let contexts = context_options(&axis);
+    let efforts = effort_options(&model.effort_options);
     let variants = model_variants(
         &model.id,
         &model.display_name,
         &tooltip,
         &contexts,
         &efforts,
+        defaults.as_ref(),
     );
     let legacy_slugs = variants
         .iter()
@@ -859,37 +927,35 @@ mod tests {
     use axum::body::{to_bytes, Bytes};
 
     use super::*;
-    use crate::model::{ModelType, OPENAI_CHAT_ENDPOINT};
+    use crate::model::OPENAI_CHAT_ENDPOINT;
+
+    #[tokio::test]
+    async fn copied_drafts_are_not_published_as_available_models() {
+        let store = crate::store::Store::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let input = model().into_input();
+        let configured = store.create_model(&input).await.unwrap();
+        let mut draft = input;
+        draft.display_name = "Draft copy".into();
+        draft.model_id.clear();
+        store.create_model(&draft).await.unwrap();
+        let available = configured_builtin_models(&store).await.unwrap();
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].model_hash, configured.model_hash);
+    }
 
     fn model() -> ModelConfig {
         ModelConfig {
             model_hash: "local-model-hash".into(),
-            sort_order: 0,
             display_name: "Local Model".into(),
-            group_name: None,
-            model_type: ModelType::OpenAi,
             base_url: "https://provider.example/v1/chat/completions".into(),
             use_full_url: true,
             api_key: "provider-secret".into(),
             tooltip_data: "Local Model".into(),
             model_id: "upstream-model".into(),
-            reasoning_effort: None,
-            effort_options: vec![],
-            context_options: vec![],
             openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
-            openai_extra_params_enabled: false,
-            openai_extra_params: serde_json::json!({}),
-            custom_headers_enabled: false,
-            custom_headers: serde_json::json!({}),
-            anthropic_extra_params_enabled: false,
-            anthropic_extra_params: serde_json::json!({}),
-            context_window_tokens: None,
-            max_completion_tokens: None,
-            anthropic_max_tokens: None,
-            anthropic_thinking_effort: None,
-            thinking_budget_tokens: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
+            ..Default::default()
         }
     }
 
@@ -917,11 +983,11 @@ mod tests {
             provider_id: "provider".into(),
             model_id: "model".into(),
             display_name: "Plugin Model".into(),
-            description: None,
-            icon: String::new(),
             provider_type: "test".into(),
-            max_output_tokens: None,
-            images: false,
+            enabled: true,
+            effort_options: vec!["low".into(), "medium".into(), "high".into()],
+            context_options: vec!["200k".into(), "1m".into()],
+            ..Default::default()
         });
         assert_eq!(details.model_id, "plugin:test/provider/model");
         let agent::model_details::Credentials::ApiKeyCredentials(credentials) =
@@ -954,32 +1020,17 @@ mod tests {
     fn maps_byok_model_to_cursor_catalog_fields() {
         let model = ModelConfig {
             model_hash: "33ceed20".into(),
-            sort_order: 0,
             display_name: "DeepSeek V4 Flash".into(),
-            group_name: None,
-            model_type: ModelType::OpenAi,
             base_url: "https://example.com/v1/responses".into(),
             use_full_url: true,
             api_key: "secret".into(),
             tooltip_data: "DeepSeek V4 Flash".into(),
             model_id: "deepseek-v4-flash".into(),
-            reasoning_effort: None,
             effort_options: vec!["low".into(), "high".into()],
             context_options: vec!["272k".into(), "1m".into()],
             openai_endpoint: "/v1/responses".into(),
-            openai_extra_params_enabled: false,
-            openai_extra_params: serde_json::json!({}),
-            custom_headers_enabled: false,
-            custom_headers: serde_json::json!({}),
-            anthropic_extra_params_enabled: false,
-            anthropic_extra_params: serde_json::json!({}),
             context_window_tokens: Some(272_000),
-            max_completion_tokens: None,
-            anthropic_max_tokens: None,
-            anthropic_thinking_effort: None,
-            thinking_budget_tokens: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
+            ..Default::default()
         };
 
         let mapped = available_model(&model);
@@ -1057,7 +1108,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             default.variant_string_representation.as_deref(),
-            Some("33ceed20[context=272k,reasoning=high,fast=false]")
+            Some("33ceed20[context=272k,reasoning=low,fast=false]")
         );
         assert_eq!(
             default
@@ -1069,6 +1120,40 @@ mod tests {
         );
         assert_eq!(mapped.vendor.unwrap().display_name, "Cursor");
         assert!(usable_model(&model).thinking_details.is_some());
+    }
+
+    #[test]
+    fn plugin_tooltip_renders_quota_as_italic_list_and_notes_underlined() {
+        let quota = "额度：\n- 5 小时窗口 100%（2026-10-05 19:48 重置）\n- 周额度 89%（2026-10-10 23:48 重置）";
+        // 备注与动态内容之间用 <br><br> 强制空一行;空白备注等同于无备注。
+        assert_eq!(
+            plugin_tooltip(Some("Kimi K2"), Some(quota), None),
+            Some(format!(
+                "Kimi K2<br><br><i>{}</i>",
+                quota.replace('\n', "<br>")
+            ))
+        );
+        assert_eq!(
+            plugin_tooltip(Some("  "), Some(quota), None),
+            Some(format!("<i>{}</i>", quota.replace('\n', "<br>")))
+        );
+        // 额度块整段斜体,促销/额度消耗文案仍各自下划线,两者之间空一行。
+        assert_eq!(
+            plugin_tooltip(
+                Some("Qoder"),
+                Some("额度：\n- 周额度 70%"),
+                Some("限免 · 1x 额度消耗")
+            ),
+            Some(
+                "Qoder<br><br><i>额度：<br>- 周额度 70%</i>\n\n<u>限免 · 1x 额度消耗</u>"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            plugin_tooltip(Some("Kimi K2"), None, None),
+            Some("Kimi K2".to_owned())
+        );
+        assert_eq!(plugin_tooltip(None, None, None), None);
     }
 
     #[tokio::test]

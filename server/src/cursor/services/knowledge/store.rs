@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Result};
 
 const META_FILE: &str = "meta.json";
+const TRANSACTION_FILE: &str = ".transaction.json";
 const RULE_EXTENSION: &str = "md";
 pub const LOCAL_ID_PREFIX: &str = "local-";
 
@@ -36,6 +37,9 @@ pub enum JournalOp {
 pub struct JournalEntry {
     pub op: JournalOp,
     pub id: String,
+    /// 被上游明确拒绝的累计次数;不可达不计数。
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -44,6 +48,18 @@ struct Meta {
     rules: BTreeMap<String, RuleMeta>,
     #[serde(default)]
     journal: Vec<JournalEntry>,
+}
+
+/// A write-ahead transaction makes the Markdown projection and replay metadata
+/// one recoverable mutation. Applying it is idempotent, so startup can finish an
+/// interrupted commit before serving reads.
+#[derive(Serialize, Deserialize)]
+struct Transaction {
+    meta: Meta,
+    #[serde(default)]
+    writes: BTreeMap<String, String>,
+    #[serde(default)]
+    deletes: Vec<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -66,11 +82,13 @@ pub struct RuleStore {
 impl RuleStore {
     pub fn open(root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        let store = Self { root };
+        store.recover()?;
+        Ok(store)
     }
 
     pub fn list(&self) -> Result<Vec<RuleRecord>> {
-        let meta = self.read_meta();
+        let meta = self.read_meta()?;
         let mut records = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
             let path = entry?.path();
@@ -96,86 +114,152 @@ impl RuleStore {
 
     pub fn get(&self, id: &str) -> Result<Option<RuleRecord>> {
         validate_id(id)?;
+        let meta = self.read_meta()?;
         let path = self.rule_path(id);
         let knowledge = match std::fs::read_to_string(&path) {
             Ok(knowledge) => knowledge,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let meta = self.read_meta();
         Ok(Some(assemble(id, knowledge, meta.rules.get(id), &path)))
     }
 
     pub fn upsert(&self, record: &RuleRecord) -> Result<()> {
         validate_id(&record.id)?;
-        write_atomic(&self.rule_path(&record.id), record.knowledge.as_bytes())?;
-        let mut meta = self.read_meta();
+        let mut meta = self.read_meta()?;
         meta.rules.insert(record.id.clone(), rule_meta(record));
-        self.write_meta(&meta)
+        self.commit(Transaction {
+            meta,
+            writes: BTreeMap::from([(record.id.clone(), record.knowledge.clone())]),
+            deletes: Vec::new(),
+        })
+    }
+
+    pub fn upsert_and_record_add(&self, record: &RuleRecord) -> Result<()> {
+        validate_id(&record.id)?;
+        let mut meta = self.read_meta()?;
+        meta.rules.insert(record.id.clone(), rule_meta(record));
+        meta.journal.push(JournalEntry {
+            op: JournalOp::Add,
+            id: record.id.clone(),
+            attempts: 0,
+        });
+        self.commit(Transaction {
+            meta,
+            writes: BTreeMap::from([(record.id.clone(), record.knowledge.clone())]),
+            deletes: Vec::new(),
+        })
+    }
+
+    pub fn upsert_and_record_update(&self, record: &RuleRecord) -> Result<()> {
+        validate_id(&record.id)?;
+        let mut meta = self.read_meta()?;
+        meta.rules.insert(record.id.clone(), rule_meta(record));
+        if !journal_contains(&meta.journal, &record.id, JournalOp::Add) {
+            let op = if record.id.starts_with(LOCAL_ID_PREFIX) {
+                JournalOp::Add
+            } else {
+                JournalOp::Update
+            };
+            if !journal_contains(&meta.journal, &record.id, op) {
+                meta.journal.push(JournalEntry {
+                    op,
+                    id: record.id.clone(),
+                    attempts: 0,
+                });
+            }
+        }
+        self.commit(Transaction {
+            meta,
+            writes: BTreeMap::from([(record.id.clone(), record.knowledge.clone())]),
+            deletes: Vec::new(),
+        })
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
         validate_id(id)?;
-        remove_file_if_exists(&self.rule_path(id))?;
-        let mut meta = self.read_meta();
-        if meta.rules.remove(id).is_some() {
-            self.write_meta(&meta)?;
-        }
-        Ok(())
+        let mut meta = self.read_meta()?;
+        meta.rules.remove(id);
+        self.commit(Transaction {
+            meta,
+            writes: BTreeMap::new(),
+            deletes: vec![id.into()],
+        })
     }
 
-    /// 离线新增的规则在上游落地后,把本地临时 id 换成上游分配的真实 id。
-    pub fn promote(&self, old_id: &str, new_id: &str) -> Result<()> {
-        validate_id(old_id)?;
-        validate_id(new_id)?;
-        let source = self.rule_path(old_id);
-        let target = self.rule_path(new_id);
-        #[cfg(windows)]
-        remove_file_if_exists(&target)?;
-        std::fs::rename(&source, &target)?;
-        let mut meta = self.read_meta();
-        if let Some(rule) = meta.rules.remove(old_id) {
-            meta.rules.insert(new_id.into(), rule);
+    pub fn remove_and_record(&self, id: &str) -> Result<()> {
+        validate_id(id)?;
+        let mut meta = self.read_meta()?;
+        meta.rules.remove(id);
+        let never_synced = journal_contains(&meta.journal, id, JournalOp::Add);
+        meta.journal.retain(|entry| entry.id != id);
+        if !never_synced && !id.starts_with(LOCAL_ID_PREFIX) {
+            meta.journal.push(JournalEntry {
+                op: JournalOp::Remove,
+                id: id.into(),
+                attempts: 0,
+            });
         }
-        for entry in &mut meta.journal {
-            if entry.id == old_id {
-                entry.id = new_id.into();
-            }
-        }
-        self.write_meta(&meta)
+        self.commit(Transaction {
+            meta,
+            writes: BTreeMap::new(),
+            deletes: vec![id.into()],
+        })
     }
 
     /// 用上游的完整列表覆盖本地镜像;仅应在日志为空(已全部回放)时调用。
     pub fn replace_all(&self, records: &[RuleRecord]) -> Result<()> {
-        let mut meta = self.read_meta();
+        let mut meta = self.read_meta()?;
         meta.rules.clear();
+        let mut writes = BTreeMap::new();
         for record in records {
             validate_id(&record.id)?;
-            write_atomic(&self.rule_path(&record.id), record.knowledge.as_bytes())?;
+            writes.insert(record.id.clone(), record.knowledge.clone());
             meta.rules.insert(record.id.clone(), rule_meta(record));
         }
+        let mut deletes = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
             let path = entry?.path();
             if path.extension().and_then(|value| value.to_str()) != Some(RULE_EXTENSION) {
                 continue;
             }
-            let keep = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .is_some_and(|id| meta.rules.contains_key(id));
-            if !keep {
-                remove_file_if_exists(&path)?;
+            let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            // 与 list 一致:跳过非法文件名(手写的 "My Notes.md" 等)。它们从未进入
+            // 元数据,也不该在镜像时被删除,否则一次全量镜像会因这个文件名而失败。
+            if validate_id(id).is_err() {
+                continue;
+            }
+            if !meta.rules.contains_key(id) {
+                deletes.push(id.to_owned());
             }
         }
-        self.write_meta(&meta)
+        self.commit(Transaction {
+            meta,
+            writes,
+            deletes,
+        })
     }
 
     pub fn journal_front(&self) -> Result<Option<JournalEntry>> {
-        Ok(self.read_meta().journal.first().cloned())
+        Ok(self.read_meta()?.journal.first().cloned())
+    }
+
+    /// 记录队头条目被上游明确拒绝一次,返回累计拒绝次数;不可达不计数。
+    pub fn record_rejection(&self) -> Result<u32> {
+        let mut meta = self.read_meta()?;
+        let Some(front) = meta.journal.first_mut() else {
+            return Ok(0);
+        };
+        front.attempts += 1;
+        let attempts = front.attempts;
+        self.write_meta(&meta)?;
+        Ok(attempts)
     }
 
     pub fn pop_journal(&self) -> Result<()> {
-        let mut meta = self.read_meta();
+        let mut meta = self.read_meta()?;
         if !meta.journal.is_empty() {
             meta.journal.remove(0);
             self.write_meta(&meta)?;
@@ -183,45 +267,26 @@ impl RuleStore {
         Ok(())
     }
 
-    pub fn record_add(&self, id: &str) -> Result<()> {
-        let mut meta = self.read_meta();
-        meta.journal.push(JournalEntry {
-            op: JournalOp::Add,
-            id: id.into(),
-        });
-        self.write_meta(&meta)
-    }
-
-    pub fn record_update(&self, id: &str) -> Result<()> {
-        let mut meta = self.read_meta();
-        if journal_contains(&meta.journal, id, JournalOp::Add) {
-            // 回放 add 时会读取最新内容,无需单独的 update 日志。
-            return Ok(());
+    pub fn promote_and_pop(&self, old_id: &str, new_id: &str) -> Result<()> {
+        validate_id(old_id)?;
+        validate_id(new_id)?;
+        let knowledge = std::fs::read_to_string(self.rule_path(old_id))?;
+        let mut meta = self.read_meta()?;
+        if let Some(rule) = meta.rules.remove(old_id) {
+            meta.rules.insert(new_id.into(), rule);
         }
-        let op = if id.starts_with(LOCAL_ID_PREFIX) {
-            // 本地临时 id 没有对应的 add 日志(如镜像覆盖后的残留),按新增回放。
-            JournalOp::Add
-        } else {
-            JournalOp::Update
-        };
-        if !journal_contains(&meta.journal, id, op) {
-            meta.journal.push(JournalEntry { op, id: id.into() });
-            self.write_meta(&meta)?;
+        if meta
+            .journal
+            .first()
+            .is_some_and(|entry| entry.id == old_id && entry.op == JournalOp::Add)
+        {
+            meta.journal.remove(0);
         }
-        Ok(())
-    }
-
-    pub fn record_remove(&self, id: &str) -> Result<()> {
-        let mut meta = self.read_meta();
-        let never_synced = journal_contains(&meta.journal, id, JournalOp::Add);
-        meta.journal.retain(|entry| entry.id != id);
-        if !never_synced && !id.starts_with(LOCAL_ID_PREFIX) {
-            meta.journal.push(JournalEntry {
-                op: JournalOp::Remove,
-                id: id.into(),
-            });
-        }
-        self.write_meta(&meta)
+        self.commit(Transaction {
+            meta,
+            writes: BTreeMap::from([(new_id.into(), knowledge)]),
+            deletes: vec![old_id.into()],
+        })
     }
 
     fn rule_path(&self, id: &str) -> PathBuf {
@@ -232,18 +297,73 @@ impl RuleStore {
         self.root.join(META_FILE)
     }
 
-    fn read_meta(&self) -> Meta {
-        match std::fs::read(self.meta_path()) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-                tracing::warn!(%error, "rules meta.json is corrupt; starting from empty metadata");
-                Meta::default()
-            }),
-            Err(_) => Meta::default(),
+    fn transaction_path(&self) -> PathBuf {
+        self.root.join(TRANSACTION_FILE)
+    }
+
+    fn read_meta(&self) -> Result<Meta> {
+        self.recover()?;
+        let bytes = match std::fs::read(self.meta_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Meta::default())
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(meta) => Ok(meta),
+            // 元数据损坏时整个规则功能都不可用。md 文件本身仍完整,把损坏文件改名保留
+            // 现场后从空元数据继续,用户手动放回的 md 会以文件名为标题重新列出。
+            Err(error) => {
+                let backup = format!(
+                    "{META_FILE}.corrupt-{}",
+                    chrono::Utc::now().timestamp_millis()
+                );
+                tracing::error!(
+                    backup,
+                    %error,
+                    "rules metadata is corrupt; moving it aside and continuing with empty metadata"
+                );
+                std::fs::rename(self.meta_path(), self.root.join(&backup))?;
+                Ok(Meta::default())
+            }
         }
     }
 
     fn write_meta(&self, meta: &Meta) -> Result<()> {
         write_atomic(&self.meta_path(), &serde_json::to_vec_pretty(meta)?)
+    }
+
+    fn commit(&self, transaction: Transaction) -> Result<()> {
+        write_atomic(
+            &self.transaction_path(),
+            &serde_json::to_vec_pretty(&transaction)?,
+        )?;
+        self.apply_transaction(&transaction)?;
+        remove_file_if_exists(&self.transaction_path())
+    }
+
+    fn recover(&self) -> Result<()> {
+        let bytes = match std::fs::read(self.transaction_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let transaction: Transaction = serde_json::from_slice(&bytes)?;
+        self.apply_transaction(&transaction)?;
+        remove_file_if_exists(&self.transaction_path())
+    }
+
+    fn apply_transaction(&self, transaction: &Transaction) -> Result<()> {
+        for (id, knowledge) in &transaction.writes {
+            validate_id(id)?;
+            write_atomic(&self.rule_path(id), knowledge.as_bytes())?;
+        }
+        for id in &transaction.deletes {
+            validate_id(id)?;
+            remove_file_if_exists(&self.rule_path(id))?;
+        }
+        self.write_meta(&transaction.meta)
     }
 }
 
@@ -324,9 +444,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    #[cfg(windows)]
-    remove_file_if_exists(path)?;
-    std::fs::rename(&temporary, path).inspect_err(|_| {
+    crate::fs::replace_file(&temporary, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temporary);
     })?;
     Ok(())
@@ -348,7 +466,7 @@ mod tests {
     }
 
     fn journal(store: &RuleStore) -> Vec<JournalEntry> {
-        store.read_meta().journal
+        store.read_meta().unwrap().journal
     }
 
     #[test]
@@ -395,38 +513,43 @@ mod tests {
 
         // 离线新增后再更新:回放 add 即可携带最新内容,不产生 update 日志。
         store
-            .upsert(&record("local-a", "v1", "2026-01-01T00:00:00.000Z"))
+            .upsert_and_record_add(&record("local-a", "v1", "2026-01-01T00:00:00.000Z"))
             .unwrap();
-        store.record_add("local-a").unwrap();
-        store.record_update("local-a").unwrap();
+        store
+            .upsert_and_record_update(&record("local-a", "v2", "2026-01-01T00:00:00.000Z"))
+            .unwrap();
         assert_eq!(
             journal(&store),
             vec![JournalEntry {
                 op: JournalOp::Add,
-                id: "local-a".into()
+                id: "local-a".into(),
+                attempts: 0,
             }]
         );
 
         // 离线新增后又删除:上游从未见过它,日志清空。
-        store.record_remove("local-a").unwrap();
+        store.remove_and_record("local-a").unwrap();
         assert!(journal(&store).is_empty());
 
         // 更新上游已有规则:多次更新合并为一条;删除后 update 日志被顶替。
-        store.record_update("42").unwrap();
-        store.record_update("42").unwrap();
+        let existing = record("42", "v1", "2026-01-01T00:00:00.000Z");
+        store.upsert_and_record_update(&existing).unwrap();
+        store.upsert_and_record_update(&existing).unwrap();
         assert_eq!(
             journal(&store),
             vec![JournalEntry {
                 op: JournalOp::Update,
-                id: "42".into()
+                id: "42".into(),
+                attempts: 0,
             }]
         );
-        store.record_remove("42").unwrap();
+        store.remove_and_record("42").unwrap();
         assert_eq!(
             journal(&store),
             vec![JournalEntry {
                 op: JournalOp::Remove,
-                id: "42".into()
+                id: "42".into(),
+                attempts: 0,
             }]
         );
     }
@@ -436,17 +559,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = RuleStore::open(root.path().join("rules")).unwrap();
         store
-            .upsert(&record("local-a", "content", "2026-01-01T00:00:00.000Z"))
+            .upsert_and_record_add(&record("local-a", "content", "2026-01-01T00:00:00.000Z"))
             .unwrap();
-        store.record_add("local-a").unwrap();
 
-        store.promote("local-a", "17353272").unwrap();
+        store.promote_and_pop("local-a", "17353272").unwrap();
 
         assert!(store.get("local-a").unwrap().is_none());
         let promoted = store.get("17353272").unwrap().unwrap();
         assert_eq!(promoted.knowledge, "content");
         assert_eq!(promoted.title, "title-local-a");
-        assert_eq!(journal(&store)[0].id, "17353272");
+        assert!(journal(&store).is_empty());
     }
 
     #[test]
@@ -470,6 +592,108 @@ mod tests {
         assert_eq!(listed[0].id, "17353272");
         assert_eq!(listed[0].knowledge, "from upstream");
         assert!(store.get("stale").unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_metadata_is_moved_aside_and_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let rules = root.path().join("rules");
+        let store = RuleStore::open(rules.clone()).unwrap();
+        store
+            .upsert(&record("100", "kept", "2026-01-01T00:00:00.000Z"))
+            .unwrap();
+        std::fs::write(rules.join(META_FILE), b"{broken").unwrap();
+
+        // md 文件仍然列出,损坏的元数据被改名保留以便人工恢复。
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].knowledge, "kept");
+        let backups = std::fs::read_dir(&rules)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("meta.json.corrupt-"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(rules.join(&backups[0])).unwrap(),
+            "{broken"
+        );
+
+        // 重置后仍可正常写入。
+        store
+            .upsert(&record("200", "newer", "2026-02-01T00:00:00.000Z"))
+            .unwrap();
+        assert_eq!(store.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn replace_all_ignores_invalid_markdown_names() {
+        let root = tempfile::tempdir().unwrap();
+        let rules = root.path().join("rules");
+        let store = RuleStore::open(rules.clone()).unwrap();
+        std::fs::write(rules.join("My Notes.md"), "hand written").unwrap();
+
+        store
+            .replace_all(&[record(
+                "17353272",
+                "from upstream",
+                "2026-02-01T00:00:00.000Z",
+            )])
+            .unwrap();
+
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "17353272");
+        // 非法文件名不是本地镜像的一部分,原样保留而不是让镜像失败。
+        assert!(rules.join("My Notes.md").exists());
+    }
+
+    #[test]
+    fn metadata_io_errors_are_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let rules = root.path().join("rules");
+        let store = RuleStore::open(rules.clone()).unwrap();
+        std::fs::create_dir(rules.join(META_FILE)).unwrap();
+
+        assert!(store.list().is_err());
+    }
+
+    #[test]
+    fn recovers_interrupted_markdown_and_journal_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let rules = root.path().join("rules");
+        let store = RuleStore::open(rules.clone()).unwrap();
+        let pending = record("local-a", "durable", "2026-01-01T00:00:00.000Z");
+        let transaction = Transaction {
+            meta: Meta {
+                rules: BTreeMap::from([(pending.id.clone(), rule_meta(&pending))]),
+                journal: vec![JournalEntry {
+                    op: JournalOp::Add,
+                    id: pending.id.clone(),
+                    attempts: 0,
+                }],
+            },
+            writes: BTreeMap::from([(pending.id.clone(), pending.knowledge.clone())]),
+            deletes: Vec::new(),
+        };
+        write_atomic(
+            &rules.join(TRANSACTION_FILE),
+            &serde_json::to_vec(&transaction).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+
+        let recovered = RuleStore::open(rules.clone()).unwrap();
+        assert_eq!(
+            recovered.get("local-a").unwrap().unwrap().knowledge,
+            "durable"
+        );
+        assert_eq!(
+            recovered.journal_front().unwrap().unwrap().op,
+            JournalOp::Add
+        );
+        assert!(!rules.join(TRANSACTION_FILE).exists());
     }
 
     #[test]
