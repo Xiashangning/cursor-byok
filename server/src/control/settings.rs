@@ -1,14 +1,31 @@
 //! Implements settings management endpoints.
 use crate::Result;
-use axum::{extract::State, Json};
-use serde::{Deserialize, Serialize};
+use axum::{
+    extract::State,
+    http::{header, HeaderMap},
+    Json,
+};
+use serde::Serialize;
 
 use crate::store::{
-    CommitSettings, DesktopSettings, PortSettings, ProxySettings, ProxySettingsInput,
-    StatisticsStorage, StatisticsStorageScope, TabSettings, DEFAULT_COMMIT_PROMPT,
+    AppApiSettings, CommitPromptLocale, CommitSettings, DesktopSettings, PortSettings,
+    ProxySettings, ProxySettingsInput, TabSettings,
 };
 
-use super::{ControlService, ObservabilitySettings};
+use super::{
+    AccessTokenView, ControlService, ObservabilitySettings, StorageCleanup, StorageCleanupRequest,
+    StorageStatistics,
+};
+
+pub async fn get_access_token(State(service): State<ControlService>) -> Json<AccessTokenView> {
+    Json(service.access_token_view())
+}
+
+pub async fn regenerate_access_token(
+    State(service): State<ControlService>,
+) -> Result<Json<AccessTokenView>> {
+    Ok(Json(service.regenerate_access_token().await?))
+}
 
 pub async fn get(State(service): State<ControlService>) -> Result<Json<ObservabilitySettings>> {
     Ok(Json(service.observability().await?))
@@ -19,6 +36,17 @@ pub async fn update(
     Json(settings): Json<ObservabilitySettings>,
 ) -> Result<Json<ObservabilitySettings>> {
     Ok(Json(service.set_observability(settings).await?))
+}
+
+pub async fn get_app_api(State(service): State<ControlService>) -> Result<Json<AppApiSettings>> {
+    Ok(Json(service.app_api_settings().await?))
+}
+
+pub async fn update_app_api(
+    State(service): State<ControlService>,
+    Json(settings): Json<AppApiSettings>,
+) -> Result<Json<AppApiSettings>> {
+    Ok(Json(service.set_app_api_settings(settings).await?))
 }
 
 pub async fn get_ports(State(service): State<ControlService>) -> Result<Json<PortSettings>> {
@@ -32,26 +60,15 @@ pub async fn update_ports(
     Ok(Json(service.set_ports(settings).await?))
 }
 
-pub async fn get_storage(State(service): State<ControlService>) -> Result<Json<StatisticsStorage>> {
+pub async fn get_storage(State(service): State<ControlService>) -> Result<Json<StorageStatistics>> {
     Ok(Json(service.statistics_storage().await?))
 }
 
-pub async fn clear_storage(
+pub async fn clean_storage(
     State(service): State<ControlService>,
-    input: Option<Json<ClearStorageInput>>,
-) -> Result<Json<StatisticsStorage>> {
-    let scope = input.map(|Json(input)| input.scope).unwrap_or_default();
-    let storage = match scope {
-        StatisticsStorageScope::Details => service.clear_statistics_storage().await?,
-        StatisticsStorageScope::All => service.clear_all_statistics_storage().await?,
-    };
-    Ok(Json(storage))
-}
-
-#[derive(Deserialize)]
-pub struct ClearStorageInput {
-    #[serde(default)]
-    pub scope: StatisticsStorageScope,
+    Json(request): Json<StorageCleanupRequest>,
+) -> Result<Json<StorageCleanup>> {
+    Ok(Json(service.clean_storage_by_mode(request).await?))
 }
 
 pub async fn get_proxy(State(service): State<ControlService>) -> Result<Json<ProxySettings>> {
@@ -90,27 +107,37 @@ pub async fn update_desktop(
 
 /// Settings view for commit message generation. Empty `model_id` means 直连
 /// (forward the original Cursor RPC). A non-empty value is a configured
-/// Cursor model hash. Empty `prompt` means "use the built-in default".
+/// built-in or plugin model identifier. Empty `prompt` means "use the built-in default".
 #[derive(Serialize)]
 pub struct CommitSettingsView {
     pub model_id: String,
+    pub parameters: crate::model::SelectionParameters,
     pub prompt: String,
+    pub prompt_locale: CommitPromptLocale,
     pub default_prompt: &'static str,
 }
 
-impl From<CommitSettings> for CommitSettingsView {
-    fn from(settings: CommitSettings) -> Self {
+impl CommitSettingsView {
+    fn new(settings: CommitSettings, default_locale: CommitPromptLocale) -> Self {
         Self {
             model_id: settings.model_id,
+            parameters: settings.parameters,
             prompt: settings.prompt,
-            default_prompt: DEFAULT_COMMIT_PROMPT.trim(),
+            prompt_locale: settings.prompt_locale,
+            default_prompt: default_locale.default_prompt(),
         }
     }
 }
 
-pub async fn get_commit(State(service): State<ControlService>) -> Result<Json<CommitSettingsView>> {
+pub async fn get_commit(
+    State(service): State<ControlService>,
+    headers: HeaderMap,
+) -> Result<Json<CommitSettingsView>> {
     let settings = service.commit_settings().await?;
-    Ok(Json(CommitSettingsView::from(settings)))
+    Ok(Json(CommitSettingsView::new(
+        settings,
+        requested_commit_locale(&headers),
+    )))
 }
 
 pub async fn update_commit(
@@ -118,5 +145,31 @@ pub async fn update_commit(
     Json(settings): Json<CommitSettings>,
 ) -> Result<Json<CommitSettingsView>> {
     let saved = service.set_commit_settings(settings).await?;
-    Ok(Json(CommitSettingsView::from(saved)))
+    let default_locale = saved.prompt_locale;
+    Ok(Json(CommitSettingsView::new(saved, default_locale)))
+}
+
+fn requested_commit_locale(headers: &HeaderMap) -> CommitPromptLocale {
+    match headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) if value.eq_ignore_ascii_case("zh-CN") => CommitPromptLocale::ZhCn,
+        _ => CommitPromptLocale::EnUs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_default_prompt_locale_comes_from_interface_language() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT_LANGUAGE, "zh-CN".parse().unwrap());
+        assert_eq!(requested_commit_locale(&headers), CommitPromptLocale::ZhCn);
+
+        headers.insert(header::ACCEPT_LANGUAGE, "en-US".parse().unwrap());
+        assert_eq!(requested_commit_locale(&headers), CommitPromptLocale::EnUs);
+    }
 }

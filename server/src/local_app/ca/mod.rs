@@ -33,6 +33,11 @@ pub struct LoadedCa {
 }
 
 impl CaManager {
+    #[cfg(test)]
+    pub(super) fn at(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
     pub fn managed() -> Result<Self> {
         Ok(Self {
             dir: managed_data_dir()?.join("ca"),
@@ -68,6 +73,10 @@ impl CaManager {
             }
             _ => Ok(CaState::Invalid),
         }
+    }
+
+    pub fn certificate_pem(&self) -> Result<String> {
+        Ok(fs::read_to_string(self.cert_path())?)
     }
 
     pub fn load(&self) -> Result<LoadedCa> {

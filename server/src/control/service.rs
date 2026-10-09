@@ -1,111 +1,45 @@
 //! Implements control API routing and shared state.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::Instant,
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use futures_util::StreamExt;
-use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
-use url::Url;
-
-use super::ads::{
-    AdDismissalInput, AdRuntime, ADS_ENDPOINT, APP_VERSION_HEADER, DEVICE_ID_HEADER,
-    DISABLED_AD_IDS_HEADER, LANGUAGE_HEADER, OS_HEADER,
-};
 
 use crate::{
+    control::auth::{AccessToken, AccessTokenSource},
     local_app::CursorHarness,
     model::{
-        ContentPart, CursorRunTraceArtifact, CursorRunTraceSummary, LlmCallRequest,
-        LlmCallResponseChunk, LlmCallSummary, ModelConfig, ModelConfigInput, ModelInvocation,
-        ModelRequest, ModelSpec, ModelType, Overview, ProjectedContent, ProjectedMessage,
-        PromptSpec, ProviderType, Role,
+        CursorRunTraceArtifact, CursorRunTraceSummary, LlmCallRequest, LlmCallResponseChunk,
+        LlmCallSummary, ModelConfig, ModelConfigInput, Overview,
     },
     plugin::{PluginDescriptor, PluginRegistry, PluginRuntime, PluginRuntimeStatus},
-    provider::{is_valid_response_event, ModelEvent, Provider},
+    provider::Provider,
     store::{
-        CommitSettings, DesktopSettings, PortSettings, ProxySettings, ProxySettingsInput,
-        StatisticsStorage, Store, TabSettings,
+        AppApiSettings, CommitSettings, DesktopSettings, PluginModelOverride, PortSettings,
+        ProxySettings, ProxySettingsInput, Store, TabSettings,
     },
     Error, Result,
 };
 
 #[derive(Clone)]
 pub struct ControlService {
-    store: Store,
-    cursor_harness: CursorHarness,
-    provider: Arc<dyn Provider>,
-    plugin_runtime: PluginRuntime,
-    plugins: PluginRegistry,
-    clients: crate::network::NetworkClients,
-    app_version: String,
-    model_tests: Arc<Mutex<BTreeMap<String, CancellationToken>>>,
+    pub(super) store: Store,
+    pub(super) cursor_harness: CursorHarness,
+    pub(super) provider: Arc<dyn Provider>,
+    pub(super) plugin_runtime: PluginRuntime,
+    pub(super) plugins: PluginRegistry,
+    pub(super) clients: crate::network::NetworkClients,
+    access_token: AccessToken,
+    pub(super) model_tests: Arc<Mutex<BTreeMap<String, CancellationToken>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct DiscoveredModels {
-    pub models: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct LegacyModelImportResult {
-    pub imported: usize,
-    pub skipped: usize,
-    pub total: usize,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct LegacyModelImportPreview {
-    pub source: String,
-    pub total: usize,
-    pub new_models: usize,
-    pub existing_models: usize,
-    pub models: Vec<LegacyModelImportPreviewItem>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct LegacyModelImportPreviewItem {
-    pub model_hash: String,
-    pub display_name: String,
-    pub model_id: String,
-    #[serde(rename = "type")]
-    pub model_type: ModelType,
-    pub existing: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct ModelDiscoveryInput {
-    #[serde(rename = "type")]
-    pub model_type: ModelType,
-    pub base_url: String,
-    pub api_key: String,
-    #[serde(default)]
-    pub custom_headers_enabled: bool,
-    #[serde(default = "empty_json_object")]
-    pub custom_headers: serde_json::Value,
-}
-
-fn empty_json_object() -> serde_json::Value {
-    serde_json::json!({})
-}
-
-fn empty_json_object_ref() -> &'static serde_json::Value {
-    static EMPTY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(empty_json_object)
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ModelConnectivityResult {
-    pub duration_ms: u64,
-    pub first_valid_response_ms: Option<u64>,
-    pub output_tokens: u64,
-    pub tokens_per_second: f64,
-    pub tokens_estimated: bool,
-    pub output: String,
+pub struct AccessTokenView {
+    pub token: String,
+    pub source: AccessTokenSource,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -147,6 +81,35 @@ pub struct ObservabilitySettings {
     pub detailed: bool,
 }
 
+/// 本地存储占用：数据库文件与可重建缓存。
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct StorageStatistics {
+    /// 数据库文件占用（页数 × 页大小）。
+    pub bytes: i64,
+    /// 可重建缓存占用：semble 索引与克隆仓库、网页抓取结果。
+    pub cache_bytes: i64,
+}
+
+/// 手动触发的存储清理请求。
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum StorageCleanupRequest {
+    /// 仅清除缓存：数据库详细记录、不可达历史与可重建的本地缓存。
+    Cache,
+    /// 清除缓存和调用记录：清空全部调用与会话数据，保留模型配置、
+    /// 应用设置、插件环境/登录状态、用户规则与嵌入模型权重。
+    Reset,
+}
+
+/// 手动触发的存储清理结果。
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct StorageCleanup {
+    /// 清理后的存储占用。
+    pub storage: StorageStatistics,
+    /// 本次释放的字节数：数据库文件减少量与已删除缓存之和。
+    pub freed_bytes: i64,
+}
+
 impl ControlService {
     pub fn new(
         store: Store,
@@ -154,7 +117,7 @@ impl ControlService {
         plugin_runtime: PluginRuntime,
         plugins: PluginRegistry,
         clients: crate::network::NetworkClients,
-        app_version: String,
+        access_token: AccessToken,
     ) -> Result<Self> {
         Ok(Self {
             cursor_harness: CursorHarness::new(store.clone())?,
@@ -163,9 +126,28 @@ impl ControlService {
             plugin_runtime,
             plugins,
             clients,
-            app_version,
-            model_tests: Arc::new(Mutex::new(BTreeMap::new())),
+            access_token,
+            model_tests: super::connectivity::new_model_tests_registry(),
         })
+    }
+
+    pub fn access_token(&self) -> &AccessToken {
+        &self.access_token
+    }
+
+    pub async fn regenerate_access_token(&self) -> Result<AccessTokenView> {
+        let token = self.access_token.regenerate(&self.store).await?;
+        Ok(AccessTokenView {
+            token,
+            source: self.access_token.source(),
+        })
+    }
+
+    pub fn access_token_view(&self) -> AccessTokenView {
+        AccessTokenView {
+            token: self.access_token.current(),
+            source: self.access_token.source(),
+        }
     }
 
     pub fn cursor_harness(&self) -> &CursorHarness {
@@ -174,6 +156,14 @@ impl ControlService {
 
     pub async fn plugins(&self) -> Vec<PluginDescriptor> {
         self.plugins.plugins().await
+    }
+
+    pub async fn install_plugin(
+        &self,
+        path: &std::path::Path,
+        replace: bool,
+    ) -> Result<crate::plugin::InstallPluginResponse> {
+        self.plugins.install_plugin(path, replace).await
     }
 
     pub async fn plugin_oauth_begin(
@@ -226,6 +216,19 @@ impl ControlService {
             .await
     }
 
+    pub async fn plugin_resource_action(
+        &self,
+        plugin_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        action_id: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.plugins
+            .resource_action(plugin_id, resource_type, resource_id, action_id, input)
+            .await
+    }
+
     pub async fn plugin_delete_resource(
         &self,
         plugin_id: &str,
@@ -241,8 +244,8 @@ impl ControlService {
         self.plugins.sync_models(plugin_id, provider_id).await
     }
 
-    pub async fn remove_plugin_configuration(&self, plugin_id: &str) -> Result<()> {
-        self.plugins.remove(plugin_id).await
+    pub async fn clear_plugin_data(&self, plugin_id: &str) -> Result<()> {
+        self.plugins.clear_data(plugin_id).await
     }
 
     pub fn plugin_runtime_status(&self) -> PluginRuntimeStatus {
@@ -257,65 +260,55 @@ impl ControlService {
         self.plugin_runtime.cancel_initialization()
     }
 
-    pub(super) async fn ads(
-        &self,
-        disabled_ad_ids: Option<&str>,
-        language: &str,
-    ) -> Result<AdRuntime> {
-        let client = self.clients.default_client().await?;
-        let installation_id = self.store.installation_id().await?;
-        let mut request = client
-            .get(ADS_ENDPOINT)
-            .header(DEVICE_ID_HEADER, installation_id)
-            .header(OS_HEADER, std::env::consts::OS)
-            .header(APP_VERSION_HEADER, &self.app_version)
-            .header(LANGUAGE_HEADER, language)
-            .timeout(std::time::Duration::from_secs(60));
-        if let Some(disabled_ad_ids) = disabled_ad_ids.filter(|value| !value.is_empty()) {
-            request = request.header(DISABLED_AD_IDS_HEADER, disabled_ad_ids);
-        }
-        let response = request.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let message = response.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!(
-                "advertisement service failed ({status}): {}",
-                message.chars().take(200).collect::<String>()
-            )));
-        }
-        response.json::<AdRuntime>().await?.into_menu_slots()
+    pub async fn disabled_plugin_models(&self) -> Result<Vec<String>> {
+        let mut list: Vec<_> = self
+            .store
+            .disabled_plugin_models()
+            .await?
+            .into_iter()
+            .collect();
+        list.sort();
+        Ok(list)
     }
 
-    pub(super) async fn dismiss_ad(&self, ad_id: &str, input: &AdDismissalInput) -> Result<()> {
-        let client = self.clients.default_client().await?;
-        let installation_id = self.store.installation_id().await?;
-        let mut endpoint = Url::parse(ADS_ENDPOINT).map_err(|error| {
-            Error::Config(format!("advertisement endpoint is invalid: {error}"))
-        })?;
-        endpoint.set_query(None);
-        endpoint
-            .path_segments_mut()
-            .map_err(|_| Error::Config("advertisement endpoint cannot contain an ad id".into()))?
-            .push(ad_id)
-            .push("dismissals");
-        let response = client
-            .post(endpoint)
-            .header(DEVICE_ID_HEADER, installation_id)
-            .header(OS_HEADER, std::env::consts::OS)
-            .header(APP_VERSION_HEADER, &self.app_version)
-            .json(input)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let message = response.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!(
-                "advertisement dismissal failed ({status}): {}",
-                message.chars().take(200).collect::<String>()
-            )));
+    pub async fn set_disabled_plugin_models(&self, model_ids: Vec<String>) -> Result<()> {
+        let set = model_ids.into_iter().collect();
+        self.store.set_disabled_plugin_models(&set).await
+    }
+
+    pub async fn disabled_plugin_accounts(&self) -> Result<Vec<String>> {
+        let mut list: Vec<_> = self
+            .store
+            .disabled_plugin_accounts()
+            .await?
+            .into_iter()
+            .collect();
+        list.sort();
+        Ok(list)
+    }
+
+    pub async fn set_disabled_plugin_accounts(&self, account_ids: Vec<String>) -> Result<()> {
+        let set = account_ids.into_iter().collect();
+        self.store.set_disabled_plugin_accounts(&set).await
+    }
+
+    pub async fn set_plugin_model_override(
+        &self,
+        id: String,
+        mut over: PluginModelOverride,
+    ) -> Result<()> {
+        let _write = self.plugins.lock_model_writes().await;
+        if over.effort_options.is_none() && over.default_effort.is_some() {
+            let model = self
+                .plugins
+                .all_models()
+                .await?
+                .into_iter()
+                .find(|model| model.id == id)
+                .ok_or_else(|| Error::RunNotFound(format!("plugin model {id}")))?;
+            over.effort_options = Some(model.effort_options);
         }
-        Ok(())
+        self.store.set_plugin_model_override(&id, over).await
     }
 
     pub async fn models(&self) -> Result<Vec<ModelConfig>> {
@@ -328,14 +321,24 @@ impl ControlService {
         end_ms: Option<i64>,
         model_hashes: Option<&str>,
         bucket_ms: Option<i64>,
+        timezone_offset_minutes: Option<i32>,
     ) -> Result<Overview> {
         self.store
-            .overview(start_ms, end_ms, model_hashes, bucket_ms)
+            .overview(
+                start_ms,
+                end_ms,
+                model_hashes,
+                bucket_ms,
+                timezone_offset_minutes,
+            )
             .await
     }
 
     pub async fn create_models(&self, models: &[ModelConfigInput]) -> Result<Vec<ModelConfig>> {
-        self.store.create_models(models).await
+        let _write = self.plugins.lock_model_writes().await;
+        self.store
+            .create_models_checked(models, &self.plugins.all_models().await?)
+            .await
     }
 
     pub async fn reorder_models(&self, model_hashes: &[String]) -> Result<Vec<ModelConfig>> {
@@ -351,225 +354,52 @@ impl ControlService {
         model_hash: &str,
         input: &ModelConfigInput,
     ) -> Result<ModelConfig> {
-        self.store.update_model(model_hash, input).await
+        let mut input = input.clone();
+        let existing = self
+            .store
+            .model(model_hash)
+            .await?
+            .ok_or_else(|| Error::RunNotFound(format!("model {model_hash}")))?;
+        if input.api_key == crate::model::REDACTED_SECRET {
+            input.api_key = existing.api_key;
+        }
+        restore_redacted_headers(&mut input.custom_headers, &existing.custom_headers);
+        let _write = self.plugins.lock_model_writes().await;
+        self.store
+            .update_model_checked(model_hash, &input, &self.plugins.all_models().await?)
+            .await
     }
 
-    pub async fn test_model(
+    /// 分组设置整批保存:读现有配置 → 只合并用户编辑字段 → 占位符密钥回填 →
+    /// 统一归一校验 → 单事务全部生效或整体回滚。响应保持脱敏。
+    pub async fn update_model_group(
+        &self,
+        edits: &[crate::model::ModelGroupEdit],
+    ) -> Result<Vec<ModelConfig>> {
+        let _write = self.plugins.lock_model_writes().await;
+        let models = self
+            .store
+            .update_models_group(edits, &self.plugins.all_models().await?)
+            .await?;
+        Ok(models)
+    }
+
+    pub async fn duplicate_model(
         &self,
         model_hash: &str,
-        test_id: &str,
-    ) -> Result<ModelConnectivityResult> {
-        let cancellation = CancellationToken::new();
-        let cancellation = {
-            let mut tests = self
-                .model_tests
-                .lock()
-                .expect("model test registry mutex poisoned");
-            tests
-                .entry(test_id.to_owned())
-                .or_insert_with(|| cancellation.clone())
-                .clone()
-        };
-        let result = self.run_model_test(model_hash, cancellation).await;
-        self.model_tests
-            .lock()
-            .expect("model test registry mutex poisoned")
-            .remove(test_id);
-        result
-    }
-
-    pub fn cancel_model_test(&self, test_id: &str) {
-        let cancellation = {
-            let mut tests = self
-                .model_tests
-                .lock()
-                .expect("model test registry mutex poisoned");
-            tests.entry(test_id.to_owned()).or_default().clone()
-        };
-        cancellation.cancel();
-    }
-
-    async fn run_model_test(
-        &self,
-        model_hash: &str,
-        cancellation: CancellationToken,
-    ) -> Result<ModelConnectivityResult> {
-        const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
-        const TEST_PROMPT: &str = "Output the numbers 1 through 120 separated by a single space. No commas, no newlines, no explanation.";
-
-        let mut model = ModelSpec::new(model_hash);
-        if model_hash.starts_with(crate::plugin::ADAPTER_ID_PREFIX) {
-            let descriptor = self.plugins.model_descriptor(model_hash).await?;
-            model.display_name = Some(descriptor.display_name);
-            model.max_output_tokens = Some(descriptor.max_output_tokens.unwrap_or(65_536));
-        } else {
-            let configured = self
-                .store
-                .model(model_hash)
-                .await?
-                .ok_or_else(|| Error::RunNotFound(format!("model {model_hash}")))?;
-            configured.configure(&mut model);
-            model.max_output_tokens = Some(configured.max_output_tokens().unwrap_or(65_536));
-        }
-        let call_id = format!("model-test-{}", uuid::Uuid::new_v4());
-        let invocation = ModelInvocation {
-            call_id: call_id.clone(),
-            run_id: call_id.clone(),
-            conversation_id: call_id.clone(),
-            provider_call_index: 0,
-            request: ModelRequest {
-                prompt: PromptSpec {
-                    instructions: String::new(),
-                    tools: Vec::new(),
-                },
-                model,
-                history: vec![ProjectedMessage {
-                    message_id: "connectivity-test".into(),
-                    role: Role::User,
-                    content: ProjectedContent::Parts(vec![ContentPart::Text {
-                        text: TEST_PROMPT.into(),
-                    }]),
-                }],
-            },
-        };
-        let started = Instant::now();
-        let mut first_valid_response_at = None;
-        let mut output_tokens = None;
-        let mut output = String::new();
-        let stream = self.provider.stream(invocation, cancellation.clone());
-        let completed = tokio::time::timeout(TEST_TIMEOUT, async {
-            futures_util::pin_mut!(stream);
-            let mut finished = false;
-            while let Some(event) = stream.next().await {
-                let event = event?;
-                if first_valid_response_at.is_none() && is_valid_response_event(&event) {
-                    first_valid_response_at = Some(Instant::now());
-                }
-                match event {
-                    ModelEvent::TextDelta(delta) => {
-                        output.push_str(&delta);
-                    }
-                    ModelEvent::Usage(usage) => {
-                        if let Some(tokens) = usage.output_tokens.filter(|tokens| *tokens > 0) {
-                            output_tokens = Some(
-                                output_tokens.map_or(tokens, |current: u64| current.max(tokens)),
-                            );
-                        }
-                    }
-                    ModelEvent::Done(_) => finished = true,
-                    _ => {}
-                }
-            }
-            if cancellation.is_cancelled() {
-                return Err(Error::Cancelled);
-            }
-            if !finished {
-                return Err(Error::Protocol(
-                    "provider stream ended without Done during connectivity test".into(),
-                ));
-            }
-            Ok(())
-        })
-        .await;
-        match completed {
-            Ok(result) => result?,
-            Err(_) => {
-                cancellation.cancel();
-                self.store
-                    .finish_llm_call(
-                        &call_id,
-                        "error",
-                        None,
-                        started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-                        Some("timeout"),
-                        Some("model connectivity test timed out after 45 seconds"),
-                    )
-                    .await?;
-                return Err(Error::Provider(
-                    "model connectivity test timed out after 45 seconds".into(),
-                ));
-            }
-        }
-        let elapsed = started.elapsed();
-        let output = output.trim().to_string();
-        if first_valid_response_at.is_none() {
-            return Err(Error::Provider(
-                "model connectivity test received no valid response".into(),
-            ));
-        }
-        let tokens_estimated = output_tokens.is_none();
-        let output_tokens = output_tokens.unwrap_or_else(|| estimate_output_tokens(&output));
-        Ok(ModelConnectivityResult {
-            duration_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
-            first_valid_response_ms: first_valid_response_at.map(|first| {
-                first
-                    .duration_since(started)
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64
-            }),
-            output_tokens,
-            tokens_per_second: if elapsed.is_zero() {
-                0.0
-            } else {
-                output_tokens as f64 / elapsed.as_secs_f64()
-            },
-            tokens_estimated,
-            output,
-        })
-    }
-
-    pub async fn discover_models(&self, input: &ModelDiscoveryInput) -> Result<DiscoveredModels> {
-        let client = self.clients.default_client().await?;
-        let base_url = crate::model::normalize_request_url(&input.base_url)?;
-        discover_models_from_endpoint(
-            &client,
-            match input.model_type {
-                ModelType::OpenAi => ProviderType::OpenAiResponses,
-                ModelType::Anthropic => ProviderType::Anthropic,
-            },
-            &base_url,
-            &input.api_key,
-            if input.custom_headers_enabled {
-                &input.custom_headers
-            } else {
-                empty_json_object_ref()
-            },
-        )
-        .await
-    }
-
-    pub async fn import_v0049_models(&self) -> Result<LegacyModelImportResult> {
-        let path = crate::config::v0049_config_path()?;
-        let outcome = self.store.import_v0049_model_config(&path).await?;
-        Ok(LegacyModelImportResult {
-            imported: outcome.imported,
-            skipped: outcome.skipped,
-            total: outcome.total,
-        })
-    }
-
-    pub async fn preview_v0049_models(&self) -> Result<LegacyModelImportPreview> {
-        let path = crate::config::v0049_config_path()?;
-        let plan = self.store.preview_v0049_model_config(&path).await?;
-        let total = plan.models.len();
-        let existing_models = plan.models.iter().filter(|model| model.existing).count();
-        Ok(LegacyModelImportPreview {
-            source: path.display().to_string(),
-            total,
-            new_models: total - existing_models,
-            existing_models,
-            models: plan
-                .models
-                .into_iter()
-                .map(|model| LegacyModelImportPreviewItem {
-                    model_hash: model.model_hash,
-                    display_name: model.input.display_name,
-                    model_id: model.input.model_id,
-                    model_type: model.input.model_type,
-                    existing: model.existing,
-                })
-                .collect(),
-        })
+        display_name: String,
+        sort_order: i64,
+    ) -> Result<ModelConfig> {
+        let existing = self
+            .store
+            .model(model_hash)
+            .await?
+            .ok_or_else(|| Error::RunNotFound(format!("model {model_hash}")))?;
+        let mut input = existing.into_input();
+        input.display_name = display_name;
+        input.sort_order = sort_order;
+        input.model_id.clear();
+        Ok(self.create_models(&[input]).await?.remove(0))
     }
 
     pub async fn calls(&self, limit: i64) -> Result<Vec<CallSummary>> {
@@ -586,10 +416,10 @@ impl ControlService {
             .collect::<Vec<_>>();
         calls.extend(
             self.store
-                .official_cursor_traces(limit)
+                .standalone_cursor_traces(limit)
                 .await?
                 .into_iter()
-                .map(official_call),
+                .map(cursor_trace_call),
         );
         calls.sort_by_key(|call| std::cmp::Reverse(call.call.created_at_ms));
         calls.truncate(limit.clamp(1, 500) as usize);
@@ -598,7 +428,7 @@ impl ControlService {
 
     pub async fn call(&self, call_id: &str) -> Result<CallDetail> {
         if let Some(call) = self.store.llm_call(call_id).await? {
-            let cursor_trace = self.cursor_trace_detail(&call.run_id).await?;
+            let cursor_trace = self.cursor_trace_for_run(&call.run_id).await?;
             return Ok(CallDetail {
                 request: self.store.llm_call_request(call_id).await?,
                 response_chunks: self.store.llm_call_chunks(call_id).await?,
@@ -615,14 +445,21 @@ impl ControlService {
             .store
             .cursor_trace(request_id)
             .await?
-            .filter(|trace| trace.route == "cursor_official")
             .ok_or_else(|| Error::RunNotFound(format!("call {call_id}")))?;
         Ok(CallDetail {
-            call: official_call(trace.clone()),
+            call: cursor_trace_call(trace.clone()),
             request: None,
             response_chunks: Vec::new(),
             cursor_trace: Some(self.cursor_trace_detail_from(trace).await?),
         })
+    }
+
+    /// Provider 调用属于一次本地 Run;Run 通过 `cursor_request_id` 关联 Cursor 追踪。
+    async fn cursor_trace_for_run(&self, run_id: &str) -> Result<Option<CursorTraceDetail>> {
+        let Some(request_id) = self.store.run_cursor_request_id(run_id).await? else {
+            return Ok(None);
+        };
+        self.cursor_trace_detail(&request_id).await
     }
 
     async fn cursor_trace_detail(&self, request_id: &str) -> Result<Option<CursorTraceDetail>> {
@@ -669,16 +506,47 @@ impl ControlService {
         Ok(settings)
     }
 
-    pub async fn statistics_storage(&self) -> Result<StatisticsStorage> {
-        self.store.statistics_storage().await
+    pub async fn statistics_storage(&self) -> Result<StorageStatistics> {
+        Ok(StorageStatistics {
+            bytes: self.store.database_bytes().await?,
+            cache_bytes: crate::search::cache_bytes()? as i64,
+        })
     }
 
-    pub async fn clear_statistics_storage(&self) -> Result<StatisticsStorage> {
-        self.store.clear_statistics_storage().await
+    /// 清理数据库详细记录、不可达历史与空闲页，并删除可重建的本地缓存。
+    pub async fn clean_storage(&self) -> Result<StorageCleanup> {
+        let database = self.store.clean_database().await?;
+        let freed_cache = crate::search::clear_caches()? as i64;
+        Ok(StorageCleanup {
+            storage: StorageStatistics {
+                bytes: database.bytes,
+                cache_bytes: crate::search::cache_bytes()? as i64,
+            },
+            freed_bytes: database.freed_bytes + freed_cache,
+        })
     }
 
-    pub async fn clear_all_statistics_storage(&self) -> Result<StatisticsStorage> {
-        self.store.clear_all_statistics_storage().await
+    /// 按模式清理存储：`cache` 走常规清理；`reset` 在其基础上进一步
+    /// 清空全部调用与会话数据，只保留模型配置、应用设置、插件环境
+    /// （含登录账户）、用户规则与嵌入模型权重。
+    pub async fn clean_storage_by_mode(
+        &self,
+        request: StorageCleanupRequest,
+    ) -> Result<StorageCleanup> {
+        match request {
+            StorageCleanupRequest::Cache => self.clean_storage().await,
+            StorageCleanupRequest::Reset => {
+                let database = self.store.reset_database().await?;
+                let freed_cache = crate::search::clear_caches()? as i64;
+                Ok(StorageCleanup {
+                    storage: StorageStatistics {
+                        bytes: database.bytes,
+                        cache_bytes: crate::search::cache_bytes()? as i64,
+                    },
+                    freed_bytes: database.freed_bytes + freed_cache,
+                })
+            }
+        }
     }
 
     pub async fn proxy_settings(&self) -> Result<ProxySettings> {
@@ -687,11 +555,12 @@ impl ControlService {
 
     pub async fn set_proxy_settings(&self, settings: ProxySettingsInput) -> Result<ProxySettings> {
         if settings.mode.is_custom() {
-            let local_proxy_port = match self.cursor_harness.proxy_port().await {
-                Some(port) => port,
-                None => self.store.port_settings().await?.proxy_port,
-            };
-            crate::network::reject_self_proxy(&settings.address, local_proxy_port)?;
+            // 自环检查只用实际监听端口(运行中的 harness);
+            // 持久化端口在端口随机回退窗口内可能是上一轮的旧值,
+            // 不能作为本轮自环判定的依据(不为此新增持久化字段)。
+            if let Some(port) = self.cursor_harness.proxy_port().await {
+                crate::network::reject_self_proxy(&settings.address, port)?;
+            }
         }
         let settings = self.store.set_proxy_settings(settings).await?;
         self.clients.invalidate().await;
@@ -710,6 +579,14 @@ impl ControlService {
         self.store.desktop_settings().await
     }
 
+    pub async fn app_api_settings(&self) -> Result<AppApiSettings> {
+        self.store.app_api_settings().await
+    }
+
+    pub async fn set_app_api_settings(&self, settings: AppApiSettings) -> Result<AppApiSettings> {
+        self.store.set_app_api_settings(settings).await
+    }
+
     pub async fn set_desktop_settings(&self, settings: DesktopSettings) -> Result<()> {
         self.store.set_desktop_settings(settings).await
     }
@@ -719,11 +596,44 @@ impl ControlService {
     }
 
     pub async fn set_commit_settings(&self, settings: CommitSettings) -> Result<CommitSettings> {
-        self.store.set_commit_settings(settings).await
+        let _write = self.plugins.lock_model_writes().await;
+        self.store
+            .set_commit_settings_checked(settings, &self.plugins.configured_models().await)
+            .await
     }
 }
 
-fn official_call(trace: CursorRunTraceSummary) -> CallSummary {
+/// 控制 API 会把已保存的敏感头值替换为 REDACTED_SECRET 占位符;更新时占位符
+/// 视为「未修改」,从现有配置回填(头名按 HTTP 语义大小写不敏感),空串视为
+/// 「清除」。非敏感头原样往返,用户在编辑器里的增删直接生效。返回回填的头数量。
+pub(super) fn restore_redacted_headers(
+    next: &mut serde_json::Value,
+    previous: &serde_json::Value,
+) -> usize {
+    let (Some(next), Some(previous)) = (next.as_object_mut(), previous.as_object()) else {
+        return 0;
+    };
+    let mut restored = 0;
+    for (name, value) in next.iter_mut() {
+        if !crate::model::is_sensitive_header(name)
+            || value.as_str() != Some(crate::model::REDACTED_SECRET)
+        {
+            continue;
+        }
+        if let Some(previous_value) = previous
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value)
+        {
+            *value = previous_value.clone();
+            restored += 1;
+        }
+    }
+    restored
+}
+
+fn cursor_trace_call(trace: CursorRunTraceSummary) -> CallSummary {
+    let official = trace.route == "cursor_official";
     let model_id = trace.model_id.clone().unwrap_or_else(|| "Cursor".into());
     let ttfb = trace
         .first_response_at_ms
@@ -742,10 +652,26 @@ fn official_call(trace: CursorRunTraceSummary) -> CallSummary {
                 .unwrap_or_else(|| trace.request_id.clone()),
             provider_call_index: 0,
             model_hash: None,
-            provider_type: "cursor-official".into(),
-            provider_url: "https://api2.cursor.sh".into(),
-            request_type: "cursor-run-sse".into(),
-            request_url: "https://api2.cursor.sh/agent.v1.AgentService/RunSSE".into(),
+            provider_type: if official {
+                "cursor-official".into()
+            } else {
+                "cursor-transport".into()
+            },
+            provider_url: if official {
+                "https://api2.cursor.sh".into()
+            } else {
+                "local://cursor".into()
+            },
+            request_type: if official {
+                "cursor-run-sse".into()
+            } else {
+                "cursor-transport".into()
+            },
+            request_url: if official {
+                "https://api2.cursor.sh/agent.v1.AgentService/RunSSE".into()
+            } else {
+                "/aiserver.v1.BidiService/BidiAppend".into()
+            },
             model_id: model_id.clone(),
             display_name: model_id,
             reasoning_effort: None,
@@ -759,7 +685,6 @@ fn official_call(trace: CursorRunTraceSummary) -> CallSummary {
             first_text_at_ms: None,
             first_valid_response_at_ms: None,
             finished_at_ms: trace.finished_at_ms,
-            queue_ms: None,
             ttfb_ms: ttfb,
             ttft_ms: None,
             ttfr_ms: None,
@@ -777,12 +702,20 @@ fn official_call(trace: CursorRunTraceSummary) -> CallSummary {
             response_bytes: trace.response_bytes,
             stream_event_count: trace.response_event_count,
             http_status: trace.http_status,
-            error_kind: error.as_ref().map(|_| "cursor_official".into()),
+            error_kind: error.as_ref().map(|_| trace.route.clone()),
             error_message: error,
-            detailed: true,
+            detailed: trace.detailed,
         },
-        call_kind: "cursor_official",
-        route: "cursor_official",
+        call_kind: if official {
+            "cursor_official"
+        } else {
+            "cursor_transport"
+        },
+        route: if official {
+            "cursor_official"
+        } else {
+            "local_byok"
+        },
     }
 }
 
@@ -812,632 +745,282 @@ fn readable_utf8(data: &[u8]) -> Option<&str> {
         .then_some(value)
 }
 
-async fn discover_models_from_endpoint(
-    client: &reqwest::Client,
-    provider_type: ProviderType,
-    base_url: &str,
-    api_key: &str,
-    custom_headers: &serde_json::Value,
-) -> Result<DiscoveredModels> {
-    let mut models = match provider_type {
-        ProviderType::OpenAiChat | ProviderType::OpenAiResponses => {
-            openai_models(client, base_url, api_key, custom_headers).await?
-        }
-        ProviderType::Anthropic => {
-            anthropic_models(client, base_url, api_key, custom_headers).await?
-        }
-        ProviderType::Plugin => {
-            return Err(Error::Config(
-                "plugin providers discover models through their plugin".into(),
-            ))
-        }
-    };
-    models.sort();
-    models.dedup();
-    Ok(DiscoveredModels { models })
+pub(super) fn empty_json_object_ref() -> &'static serde_json::Value {
+    static EMPTY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| serde_json::json!({}))
 }
 
-fn model_discovery_url(base_url: &str) -> Result<Url> {
-    let mut url = Url::parse(base_url)
-        .map_err(|error| Error::Config(format!("invalid model request URL: {error}")))?;
-    if url.host_str().is_none() {
-        return Err(Error::Config(
-            "model request URL must contain a host".into(),
-        ));
-    }
-    // 在现有路径上追加，而不是整段替换：多数编程套餐的 API 挂在子路径下
-    // （/api/anthropic、/coding、/api/paas/v4 等），直接 set_path("/v1/models")
-    // 会把这些前缀吃掉，发现请求必然 404
-    let path = url.path().trim_end_matches('/');
-    let last = path.rsplit('/').next().unwrap_or("");
-    let versioned = last.len() > 1
-        && last.starts_with('v')
-        && last[1..].bytes().all(|byte| byte.is_ascii_digit());
-    let new_path = if let Some(parent) = path.strip_suffix("/chat/completions") {
-        // 完整请求 URL：剥掉端点段（chat/completions 是两段），换成 models
-        format!("{parent}/models")
-    } else if let Some(parent) = path
-        .strip_suffix("/responses")
-        .or_else(|| path.strip_suffix("/messages"))
-        .or_else(|| path.strip_suffix("/completions"))
-    {
-        format!("{parent}/models")
-    } else if path.is_empty() {
-        "/v1/models".to_string()
-    } else if versioned {
-        // 已带版本段（/v1、/api/v3、/api/paas/v4）：只补 models
-        format!("{path}/models")
-    } else {
-        format!("{path}/v1/models")
-    };
-    url.set_path(&new_path);
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url)
-}
-
-fn model_discovery_urls(base_url: &str) -> Result<Vec<Url>> {
-    let mut configured = Url::parse(base_url)
-        .map_err(|error| Error::Config(format!("invalid model request URL: {error}")))?;
-    let path = configured.path().trim_end_matches('/');
-    let tail = path.rsplit('/').next().unwrap_or_default();
-    if matches!(tail.to_ascii_lowercase().as_str(), "model" | "models") {
-        configured.set_query(None);
-        configured.set_fragment(None);
-        return Ok(vec![configured]);
-    }
-
-    let primary = model_discovery_url(base_url)?;
-    let versioned = tail.len() > 1
-        && tail.starts_with('v')
-        && tail[1..].bytes().all(|byte| byte.is_ascii_digit());
-    let complete_request_url = [
-        "/chat/completions",
-        "/responses",
-        "/messages",
-        "/completions",
-    ]
-    .iter()
-    .any(|suffix| path.to_ascii_lowercase().ends_with(suffix));
-    if versioned || complete_request_url {
-        return Ok(vec![primary]);
-    }
-
-    let Some(prefix) = primary.path().strip_suffix("/v1/models") else {
-        return Ok(vec![primary]);
-    };
-    let mut fallback = primary.clone();
-    fallback.set_path(&format!("{prefix}/models"));
-    Ok(vec![primary, fallback])
-}
-
-async fn openai_models(
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    custom_headers: &serde_json::Value,
-) -> Result<Vec<String>> {
-    let mut last_error = None;
-    for url in model_discovery_urls(base_url)? {
-        match openai_models_at(client, url, api_key, custom_headers).await {
-            Ok(models) => return Ok(models),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| Error::Provider("no model discovery URL available".into())))
-}
-
-async fn openai_models_at(
-    client: &reqwest::Client,
-    url: Url,
-    api_key: &str,
-    custom_headers: &serde_json::Value,
-) -> Result<Vec<String>> {
-    let mut request = client.get(url);
-    if !api_key.is_empty() {
-        request = request.bearer_auth(api_key);
-    }
-    let response = apply_discovery_headers(request, custom_headers)?
-        .send()
-        .await?;
-    let status = response.status();
-    let body: serde_json::Value = response.json().await?;
-    if !status.is_success() {
-        return Err(Error::Provider(format!(
-            "model discovery failed ({status}): {body}"
-        )));
-    }
-    Ok(model_ids(body.get("data").unwrap_or(&body)))
-}
-
-async fn anthropic_models(
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    custom_headers: &serde_json::Value,
-) -> Result<Vec<String>> {
-    let mut last_error = None;
-    for url in model_discovery_urls(base_url)? {
-        match anthropic_models_at(client, url, api_key, custom_headers).await {
-            Ok(models) => return Ok(models),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| Error::Provider("no model discovery URL available".into())))
-}
-
-async fn anthropic_models_at(
-    client: &reqwest::Client,
-    url: Url,
-    api_key: &str,
-    custom_headers: &serde_json::Value,
-) -> Result<Vec<String>> {
-    let mut after_id = None::<String>;
-    let mut found = BTreeSet::new();
-    loop {
-        let mut request = client
-            .get(url.clone())
-            .query(&[("limit", "100")])
-            .header("anthropic-version", "2023-06-01");
-        if !api_key.is_empty() {
-            request = request.header("x-api-key", api_key);
-        }
-        if let Some(after_id) = &after_id {
-            request = request.query(&[("after_id", after_id)]);
-        }
-        let response = apply_discovery_headers(request, custom_headers)?
-            .send()
-            .await?;
-        let status = response.status();
-        let body: serde_json::Value = response.json().await?;
-        if !status.is_success() {
-            return Err(Error::Provider(format!(
-                "model discovery failed ({status}): {body}"
-            )));
-        }
-        found.extend(model_ids(body.get("data").unwrap_or(&body)));
-        if body.get("has_more").and_then(serde_json::Value::as_bool) != Some(true) {
-            break;
-        }
-        after_id = body
-            .get("last_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        if after_id.is_none() {
-            return Err(Error::Provider(
-                "Anthropic model response has_more without last_id".into(),
-            ));
-        }
-    }
-    Ok(found.into_iter().collect())
-}
-
-fn model_ids(value: &serde_json::Value) -> Vec<String> {
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|item| match item {
-            serde_json::Value::String(id) => Some(id.clone()),
-            serde_json::Value::Object(object) => object
-                .get("id")
-                .or_else(|| object.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            _ => None,
-        })
-        .collect()
-}
-
-fn estimate_output_tokens(output: &str) -> u64 {
-    let words = output.split_whitespace().count() as u64;
-    if words > 0 {
-        words
-    } else if output.is_empty() {
-        0
-    } else {
-        (output.chars().count() as u64).div_ceil(4)
-    }
-}
-
-fn apply_discovery_headers(
-    mut request: reqwest::RequestBuilder,
-    headers: &serde_json::Value,
-) -> Result<reqwest::RequestBuilder> {
-    let object = headers
-        .as_object()
-        .ok_or_else(|| Error::Config("custom headers must be an object".into()))?;
-    for (name, value) in object {
-        if name.eq_ignore_ascii_case("user-agent") {
-            continue;
-        }
-        let value = value
-            .as_str()
-            .ok_or_else(|| Error::Config(format!("custom header {name} must be a string")))?;
-        let name = HeaderName::try_from(name)
-            .map_err(|error| Error::Config(format!("invalid header name: {error}")))?;
-        let value = HeaderValue::try_from(value)
-            .map_err(|error| Error::Config(format!("invalid header value: {error}")))?;
-        request = request.header(name, value);
-    }
-    Ok(request)
-}
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use tokio_util::sync::CancellationToken;
-
-    use crate::{
-        model::{ModelConfig, ModelConfigInput, ModelInvocation, ModelType, ProjectedContent},
-        plugin::{PluginRegistry, PluginRuntime},
-        provider::{FinishReason, ModelEvent, Provider, ProviderStream},
-        store::Store,
+    use crate::model::{
+        ConversationId, ModelSpec, NewLlmCall, PreparedRun, PromptSpec, ProviderType, RunAction,
+        RunId, RunKind,
     };
+    use crate::store::Store;
 
-    use super::{model_discovery_url, model_discovery_urls, ControlService};
-
-    #[test]
-    fn model_discovery_url_appends_to_path() {
-        let cases = [
-            (
-                "https://api.deepseek.com",
-                "https://api.deepseek.com/v1/models",
-            ),
-            (
-                "https://open.bigmodel.cn/api/anthropic",
-                "https://open.bigmodel.cn/api/anthropic/v1/models",
-            ),
-            (
-                "https://api.kimi.com/coding",
-                "https://api.kimi.com/coding/v1/models",
-            ),
-            (
-                "https://api.moonshot.cn/v1",
-                "https://api.moonshot.cn/v1/models",
-            ),
-            (
-                "https://ark.cn-beijing.volces.com/api/v3",
-                "https://ark.cn-beijing.volces.com/api/v3/models",
-            ),
-            (
-                "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
-                "https://open.bigmodel.cn/api/coding/paas/v4/models",
-            ),
-        ];
-        for (base, expected) in cases {
-            assert_eq!(
-                model_discovery_url(base).unwrap().as_str(),
-                expected,
-                "base: {base}"
-            );
-        }
-    }
-
-    #[test]
-    fn model_discovery_urls_fall_back_without_a_version() {
-        let cases = [
-            (
-                "https://opencode.ai/zen/go/v1",
-                vec!["https://opencode.ai/zen/go/v1/models"],
-            ),
-            (
-                "https://opencode.ai/zen/go",
-                vec![
-                    "https://opencode.ai/zen/go/v1/models",
-                    "https://opencode.ai/zen/go/models",
-                ],
-            ),
-            (
-                "https://api.example.com/openai/v1/models",
-                vec!["https://api.example.com/openai/v1/models"],
-            ),
-        ];
-        for (base, expected) in cases {
-            let actual = model_discovery_urls(base)
-                .unwrap()
-                .into_iter()
-                .map(|url| url.to_string())
-                .collect::<Vec<_>>();
-            assert_eq!(actual, expected, "base: {base}");
-        }
-    }
+    use super::super::test_support::{model_with_headers, service_for};
 
     #[tokio::test]
-    async fn openai_model_discovery_uses_the_unversioned_fallback() {
-        let app = axum::Router::new().route(
-            "/proxy/models",
-            axum::routing::get(|| async {
-                axum::Json(serde_json::json!({ "data": [{ "id": "model-a" }] }))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let models = super::openai_models(
-            &reqwest::Client::new(),
-            &format!("http://{address}/proxy"),
-            "secret",
-            &serde_json::json!({}),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(models, vec!["model-a"]);
-        server.abort();
-    }
-
-    struct TestProvider {
-        invocation: Arc<Mutex<Option<ModelInvocation>>>,
-    }
-
-    struct CancellationProvider {
-        started: Arc<tokio::sync::Notify>,
-    }
-
-    impl Provider for TestProvider {
-        fn stream(
-            &self,
-            invocation: ModelInvocation,
-            _cancellation: CancellationToken,
-        ) -> ProviderStream {
-            *self.invocation.lock().unwrap() = Some(invocation);
-            Box::pin(futures_util::stream::iter([
-                Ok(ModelEvent::Start {
-                    model_call_id: "test-call".into(),
-                }),
-                Ok(ModelEvent::TextStart),
-                Ok(ModelEvent::TextDelta("OK".into())),
-                Ok(ModelEvent::TextEnd),
-                Ok(ModelEvent::Usage(crate::model::Usage {
-                    output_tokens: Some(2),
-                    ..Default::default()
-                })),
-                Ok(ModelEvent::Done(FinishReason::Stop)),
-            ]))
-        }
-    }
-
-    impl Provider for CancellationProvider {
-        fn stream(
-            &self,
-            _invocation: ModelInvocation,
-            cancellation: CancellationToken,
-        ) -> ProviderStream {
-            let started = self.started.clone();
-            Box::pin(async_stream::try_stream! {
-                started.notify_one();
-                cancellation.cancelled().await;
-                if false { yield ModelEvent::TextStart; }
-            })
-        }
-    }
-
-    async fn create_test_model(store: &Store) -> ModelConfig {
+    async fn provider_call_detail_links_trace_through_the_runs_cursor_request_id() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store.set_detailed_logging(true).await.unwrap();
         store
-            .create_model(&ModelConfigInput {
-                model_id: "reasoning-model".into(),
-                display_name: "Reasoning Model".into(),
-                group_name: None,
-                model_type: ModelType::OpenAi,
-                base_url: "https://example.com/v1/responses".into(),
-                use_full_url: true,
-                api_key: "secret".into(),
-                tooltip_data: "Reasoning Model".into(),
-                sort_order: 0,
-                reasoning_effort: Some("medium".into()),
-                effort_options: vec!["low".into(), "high".into()],
-                context_options: vec!["200k".into(), "1m".into()],
-                openai_endpoint: "/v1/responses".into(),
-                openai_extra_params_enabled: false,
-                openai_extra_params: serde_json::json!({}),
-                custom_headers_enabled: false,
-                custom_headers: serde_json::json!({}),
-                anthropic_extra_params_enabled: false,
-                anthropic_extra_params: serde_json::json!({}),
-                context_window_tokens: None,
-                max_completion_tokens: None,
-                anthropic_max_tokens: None,
-                anthropic_thinking_effort: None,
-                thinking_budget_tokens: None,
-            })
+            .start_cursor_trace_if_detailed(
+                "cursor-request",
+                Some("conversation"),
+                "local_byok",
+                Some("cursor-model"),
+            )
             .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn connectivity_test_uses_the_configured_llm_provider() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::connect(&format!(
-            "sqlite://{}",
-            directory.path().join("control.db").display()
-        ))
-        .await
-        .unwrap();
-        let invocation = Arc::new(Mutex::new(None));
-        let model = create_test_model(&store).await;
-        let plugin_runtime = PluginRuntime::managed().unwrap();
-        let plugins =
-            PluginRegistry::managed(store.clone(), plugin_runtime.clone(), "test".into()).unwrap();
-        let clients = crate::network::NetworkClients::new(store.clone());
-        let service = ControlService::new(
-            store,
-            Arc::new(TestProvider {
-                invocation: invocation.clone(),
-            }),
-            plugin_runtime,
-            plugins,
-            clients,
-            "test".into(),
-        )
-        .unwrap();
-
-        let result = service
-            .test_model(&model.model_hash, "test-id")
+            .unwrap();
+        store
+            .append_cursor_trace_artifact(
+                "cursor-request",
+                "client_message",
+                "cursor_client",
+                br#"{"runRequest":{}}"#,
+                &serde_json::json!({"message_type": "run_request"}),
+            )
             .await
             .unwrap();
 
-        assert_eq!(result.output, "OK");
-        assert!(result.first_valid_response_ms.is_some());
-        assert_eq!(result.output_tokens, 2);
-        assert!(!result.tokens_estimated);
-        assert!(result.tokens_per_second > 0.0);
-        let invocation = invocation.lock().unwrap().clone().unwrap();
-        assert_eq!(invocation.request.model.model_id, model.model_hash);
-        assert!(invocation.request.model.reasoning.enabled);
-        assert_eq!(
-            invocation.request.model.reasoning.effort.as_deref(),
-            Some("medium")
-        );
-        assert!(invocation.request.prompt.tools.is_empty());
-        assert_eq!(invocation.request.history.len(), 1);
-        assert!(matches!(
-            &invocation.request.history[0].content,
-            ProjectedContent::Parts(parts)
-                if matches!(&parts[..], [crate::model::ContentPart::Text { text }] if text == "Output the numbers 1 through 120 separated by a single space. No commas, no newlines, no explanation.")
-        ));
-    }
-
-    #[tokio::test]
-    async fn connectivity_test_can_be_cancelled() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::connect(&format!(
-            "sqlite://{}",
-            directory.path().join("cancel.db").display()
-        ))
-        .await
-        .unwrap();
-        let model = create_test_model(&store).await;
-        let started = Arc::new(tokio::sync::Notify::new());
-        let plugin_runtime = PluginRuntime::managed().unwrap();
-        let plugins =
-            PluginRegistry::managed(store.clone(), plugin_runtime.clone(), "test".into()).unwrap();
-        let clients = crate::network::NetworkClients::new(store.clone());
-        let service = ControlService::new(
-            store,
-            Arc::new(CancellationProvider {
-                started: started.clone(),
-            }),
-            plugin_runtime,
-            plugins,
-            clients,
-            "test".into(),
-        )
-        .unwrap();
-        let running_service = service.clone();
-        let model_hash = model.model_hash.clone();
-        let task =
-            tokio::spawn(
-                async move { running_service.test_model(&model_hash, "cancel-test").await },
-            );
-
-        started.notified().await;
-        service.cancel_model_test("cancel-test");
-
-        assert!(matches!(task.await.unwrap(), Err(crate::Error::Cancelled)));
-        assert!(!service
-            .model_tests
-            .lock()
+        let conversation_id = ConversationId::new("conversation");
+        let base_checkpoint_id = store.ensure_conversation(&conversation_id).await.unwrap();
+        store
+            .claim_run(&PreparedRun {
+                run_id: RunId::new("provider-run"),
+                cursor_request_id: Some("cursor-request".into()),
+                conversation_id,
+                kind: RunKind::Root,
+                model: ModelSpec::new("provider-model"),
+                prompt: PromptSpec {
+                    instructions: String::new(),
+                    tools: Vec::new(),
+                },
+                initial_messages: Vec::new(),
+                action: RunAction::Start,
+                base_checkpoint_id,
+                background_follow_up: false,
+            })
+            .await
+            .unwrap();
+        let service = service_for(store.clone());
+        // 运行中的本地 trace 不单独成行:首个 provider 调用行出现前宁可无行,
+        // 也不让列表先显示 trace 之后再替换成调用行。
+        assert!(service.calls(10).await.unwrap().is_empty());
+        assert!(service
+            .call("cursor:cursor-request")
+            .await
             .unwrap()
-            .contains_key("cancel-test"));
-    }
+            .cursor_trace
+            .is_some());
 
-    #[test]
-    fn connectivity_output_token_estimate_handles_words_and_empty_text() {
-        assert_eq!(super::estimate_output_tokens("1 2 3"), 3);
-        assert_eq!(super::estimate_output_tokens(""), 0);
-    }
-
-    #[test]
-    fn model_discovery_url_keeps_provider_path_prefix() {
-        assert_eq!(
-            super::model_discovery_url("https://example.com:8443/arbitrary/v1/chat/completions")
-                .unwrap()
-                .as_str(),
-            "https://example.com:8443/arbitrary/v1/models"
-        );
-    }
-
-    #[tokio::test]
-    async fn model_discovery_does_not_inherit_user_agent_or_request_body_settings() {
-        type CapturedRequest = (
-            axum::http::Method,
-            axum::http::Uri,
-            axum::http::HeaderMap,
-            bytes::Bytes,
-        );
-
-        async fn models(
-            axum::extract::State(sender): axum::extract::State<
-                tokio::sync::mpsc::UnboundedSender<CapturedRequest>,
-            >,
-            request: axum::extract::Request,
-        ) -> axum::Json<serde_json::Value> {
-            let (parts, body) = request.into_parts();
-            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-            sender
-                .send((parts.method, parts.uri, parts.headers, body))
-                .unwrap();
-            axum::Json(serde_json::json!({ "data": [{ "id": "model-a" }] }))
-        }
-
-        let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
-        let app = axum::Router::new()
-            .route("/custom/models", axum::routing::get(models))
-            .with_state(sender);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::connect(&format!(
-            "sqlite://{}",
-            directory.path().join("discovery.db").display()
-        ))
-        .await
-        .unwrap();
-        let plugin_runtime = PluginRuntime::managed().unwrap();
-        let plugins =
-            PluginRegistry::managed(store.clone(), plugin_runtime.clone(), "test".into()).unwrap();
-        let clients = crate::network::NetworkClients::new(store.clone());
-        let service = ControlService::new(
-            store,
-            Arc::new(TestProvider {
-                invocation: Arc::new(Mutex::new(None)),
-            }),
-            plugin_runtime,
-            plugins,
-            clients,
-            "test".into(),
-        )
-        .unwrap();
-        let result = service
-            .discover_models(&super::ModelDiscoveryInput {
-                model_type: ModelType::OpenAi,
-                base_url: format!("http://{address}/custom/responses"),
-                api_key: "secret".into(),
-                custom_headers_enabled: true,
-                custom_headers: serde_json::json!({
-                    "uSeR-aGeNt": "inherited-user-agent",
-                    "x-tenant": "tenant-a"
-                }),
+        store
+            .start_llm_call(&NewLlmCall {
+                call_id: "provider-call".into(),
+                run_id: "provider-run".into(),
+                conversation_id: "conversation".into(),
+                provider_call_index: 0,
+                model_hash: "plugin:test/provider-model".into(),
+                provider_type: ProviderType::Plugin,
+                provider_url: "plugin://test".into(),
+                request_type: ProviderType::Plugin,
+                request_url: "plugin://test".into(),
+                model_id: "provider-model".into(),
+                display_name: "Provider Model".into(),
+                reasoning_effort: None,
+                fast: false,
+                message_count: 1,
+                tool_count: 0,
+                detailed: true,
             })
             .await
             .unwrap();
 
-        assert_eq!(result.models, vec!["model-a"]);
-        let (method, uri, headers, body) = requests.recv().await.unwrap();
-        assert_eq!(method, axum::http::Method::GET);
-        // /custom/responses 剥掉端点段后是 /custom，发现地址为 /custom/models
-        assert_eq!(uri.path(), "/custom/models");
-        assert!(body.is_empty());
-        assert!(headers.get(axum::http::header::USER_AGENT).is_none());
-        assert_eq!(headers.get("x-tenant").unwrap(), "tenant-a");
+        let linked = service.calls(10).await.unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].call.call_id, "provider-call");
+        let detail = service.call("provider-call").await.unwrap();
+        let trace = detail
+            .cursor_trace
+            .expect("provider call links to Cursor trace");
+        assert_eq!(trace.trace.request_id, "cursor-request");
+        assert_eq!(trace.artifacts.len(), 1);
+        assert_eq!(trace.artifacts[0].artifact_type, "client_message");
+    }
+
+    /// 编辑器往返:脱敏后的输入(占位符 api_key、占位符敏感头)不得改变已存密钥。
+    #[tokio::test]
+    async fn redacted_round_trip_preserves_api_key_and_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("update.db").display()
+        ))
+        .await
+        .unwrap();
+        let service = service_for(store.clone());
+        let created = model_with_headers(&store).await;
+        let mut input = created.clone().redact_secrets().into_input();
+
+        let updated = service
+            .update_model(&created.model_hash, &input)
+            .await
+            .unwrap();
+        assert_eq!(updated.api_key, "secret");
+        assert_eq!(updated.custom_headers["Authorization"], "Bearer token");
+        assert_eq!(updated.custom_headers["X-Tenant"], "tenant-a");
+
+        // 轮换 API Key 时同样保留自定义头。
+        input.api_key = "rotated".into();
+        let rotated = service
+            .update_model(&updated.model_hash, &input)
+            .await
+            .unwrap();
+        assert_eq!(rotated.api_key, "rotated");
+        assert_eq!(rotated.custom_headers["Authorization"], "Bearer token");
+        assert_eq!(rotated.custom_headers["X-Tenant"], "tenant-a");
+    }
+
+    /// 显式编辑直接生效:改值、删键、清空全部。
+    #[tokio::test]
+    async fn explicit_header_edits_apply_directly() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("headers.db").display()
+        ))
+        .await
+        .unwrap();
+        let service = service_for(store.clone());
+        let created = model_with_headers(&store).await;
+        let mut input = created.clone().redact_secrets().into_input();
+        input.custom_headers = serde_json::json!({
+            "Authorization": "Bearer new",
+            "X-Tenant": "tenant-b"
+        });
+
+        let updated = service
+            .update_model(&created.model_hash, &input)
+            .await
+            .unwrap();
+        assert_eq!(updated.custom_headers["Authorization"], "Bearer new");
+        assert_eq!(updated.custom_headers["X-Tenant"], "tenant-b");
+
+        input.custom_headers = serde_json::json!({"X-Tenant": "tenant-b"});
+        let deleted = service
+            .update_model(&updated.model_hash, &input)
+            .await
+            .unwrap();
+        assert!(deleted.custom_headers.get("Authorization").is_none());
+        assert_eq!(deleted.custom_headers["X-Tenant"], "tenant-b");
+    }
+
+    /// 显式清空语义:空串敏感头直接清除,不再回填;api_key 模型层要求非空,
+    /// 清空会被校验拒绝(而不是静默回填)。
+    #[tokio::test]
+    async fn empty_secrets_clear_headers_but_api_key_stays_required() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("clear.db").display()
+        ))
+        .await
+        .unwrap();
+        let service = service_for(store.clone());
+        let created = model_with_headers(&store).await;
+        let mut input = created.clone().redact_secrets().into_input();
+
+        input.custom_headers = serde_json::json!({
+            "Authorization": "",
+            "X-Tenant": "tenant-a"
+        });
+        let updated = service
+            .update_model(&created.model_hash, &input)
+            .await
+            .unwrap();
+        assert_eq!(updated.custom_headers["Authorization"], "");
+        assert_eq!(updated.custom_headers["X-Tenant"], "tenant-a");
+        assert_eq!(updated.api_key, "secret");
+
+        input.api_key = String::new();
+        let rejected = service.update_model(&created.model_hash, &input).await;
+        assert!(matches!(rejected, Err(crate::Error::Config(_))));
+    }
+
+    /// 复制模型从存储中的未脱敏配置克隆,不经编辑器往返。
+    /// 副本清空上游模型名，以随机身份原像创建可编辑草稿；填写上游模型后转为常规 ID。
+    #[tokio::test]
+    async fn duplicate_clones_secrets_from_the_stored_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("duplicate.db").display()
+        ))
+        .await
+        .unwrap();
+        let service = service_for(store.clone());
+        let created = model_with_headers(&store).await;
+
+        let copy = service
+            .duplicate_model(&created.model_hash, "Header Model 副本".into(), 2)
+            .await
+            .unwrap();
+        let second = service
+            .duplicate_model(&created.model_hash, "Another copy".into(), 3)
+            .await
+            .unwrap();
+        assert_ne!(copy.model_hash, second.model_hash);
+        assert!(copy.model_id.is_empty());
+        let mut draft = copy.clone().into_input();
+        draft.display_name = "Renamed draft".into();
+        let saved = service
+            .update_model(&copy.model_hash, &draft)
+            .await
+            .unwrap();
+        assert_eq!(saved.model_hash, copy.model_hash);
+        draft.model_id = "new-upstream-model".into();
+        let completed = service
+            .update_model(&copy.model_hash, &draft)
+            .await
+            .unwrap();
+        assert_ne!(completed.model_hash, copy.model_hash);
         assert_eq!(
-            headers.get(axum::http::header::AUTHORIZATION).unwrap(),
-            "Bearer secret"
+            completed.model_hash,
+            crate::model::model_hash(&draft).unwrap()
         );
-        server.abort();
+
+        assert_ne!(copy.model_hash, created.model_hash);
+        assert_eq!(copy.display_name, "Header Model 副本");
+        assert_eq!(copy.sort_order, 2);
+        assert_eq!(copy.api_key, "secret");
+        assert_eq!(copy.custom_headers["Authorization"], "Bearer token");
+        assert_eq!(copy.custom_headers["X-Tenant"], "tenant-a");
+    }
+
+    /// 保存自定义代理设置时,自环检查使用 harness 实际监听的端口:
+    /// 持久化端口在随机回退窗口内可能是上一轮的旧值,不参与判定。
+    #[tokio::test]
+    async fn proxy_settings_self_loop_check_uses_the_running_port_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("proxy.db").display()
+        ))
+        .await
+        .unwrap();
+        // 上一轮持久化过端口 40721,但本轮 harness 尚未启动(随机回退窗口)。
+        store.set_proxy_port(40721).await.unwrap();
+        let service = service_for(store.clone());
+        let address = crate::store::ProxySettingsInput {
+            mode: crate::store::ProxyMode::Custom,
+            address: "http://127.0.0.1:40721".into(),
+            auth_enabled: false,
+            username: String::new(),
+            password: None,
+        };
+        // harness 未运行:持久化端口不再参与判定,保存被放行
+        // (本轮 harness 可能绑定任意随机端口,旧值无法代表实际监听端口)。
+        assert!(service.set_proxy_settings(address.clone()).await.is_ok());
     }
 }

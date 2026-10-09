@@ -1,12 +1,16 @@
 //! Exposes the local control API.
-mod ads;
+mod app_api;
+mod auth;
 mod calls;
+mod connectivity;
+mod discovery;
 mod harness;
 mod models;
 mod overview;
 mod plugins;
 mod service;
 mod settings;
+pub(super) mod test_support;
 
 use axum::{
     body::{to_bytes, Body},
@@ -21,9 +25,12 @@ use tower_http::{
 };
 use url::{Host, Url};
 
+pub use auth::{AccessToken, AccessTokenSource};
+pub use connectivity::ModelConnectivityResult;
+pub use discovery::{DiscoveredModels, ModelDiscoveryInput};
 pub use service::{
-    CallDetail, CallSummary, ControlService, DiscoveredModels, LegacyModelImportPreview,
-    LegacyModelImportResult, ModelConnectivityResult, ModelDiscoveryInput, ObservabilitySettings,
+    AccessTokenView, CallDetail, CallSummary, ControlService, ObservabilitySettings,
+    StorageCleanup, StorageCleanupRequest, StorageStatistics,
 };
 
 pub fn web_router(service: ControlService, assets: impl AsRef<std::path::Path>) -> Router {
@@ -110,22 +117,21 @@ fn proxy_error(error: impl std::fmt::Display) -> Response<Body> {
 }
 
 pub fn api_router(service: ControlService) -> Router {
-    Router::new()
-        .route("/__byok-api__/api/ads", get(ads::get))
-        .route(
-            "/__byok-api__/api/ads/{ad_id}/dismissals",
-            post(ads::dismiss),
-        )
+    let api = Router::new()
         .route(
             "/__byok-api__/api/models",
             get(models::list).post(models::create),
         )
         .route("/__byok-api__/api/models/discover", post(models::discover))
-        .route(
-            "/__byok-api__/api/models/import-v0049",
-            get(models::preview_v0049).post(models::import_v0049),
-        )
         .route("/__byok-api__/api/models/order", put(models::reorder))
+        .route(
+            "/__byok-api__/api/models/group-batch",
+            put(models::update_group),
+        )
+        .route(
+            "/__byok-api__/api/models/{model_hash}/duplicate",
+            post(models::duplicate),
+        )
         .route("/__byok-api__/api/overview", get(overview::get))
         .route(
             "/__byok-api__/api/models/{model_hash}",
@@ -138,6 +144,19 @@ pub fn api_router(service: ControlService) -> Router {
         .route("/__byok-api__/api/llm-calls", get(calls::list))
         .route("/__byok-api__/api/llm-calls/{call_id}", get(calls::detail))
         .route("/__byok-api__/api/plugins", get(plugins::list))
+        .route("/__byok-api__/api/plugins/install", post(plugins::install))
+        .route(
+            "/__byok-api__/api/plugins/disabled-models",
+            get(plugins::get_disabled_models).put(plugins::set_disabled_models),
+        )
+        .route(
+            "/__byok-api__/api/plugins/model-overrides",
+            put(plugins::set_model_override),
+        )
+        .route(
+            "/__byok-api__/api/plugins/disabled-accounts",
+            get(plugins::get_disabled_accounts).put(plugins::set_disabled_accounts),
+        )
         .route(
             "/__byok-api__/api/plugins/runtime",
             get(plugins::runtime_status)
@@ -149,8 +168,8 @@ pub fn api_router(service: ControlService) -> Router {
             post(plugins::oauth_poll),
         )
         .route(
-            "/__byok-api__/api/plugins/{plugin_id}",
-            axum::routing::delete(plugins::remove),
+            "/__byok-api__/api/plugins/{plugin_id}/data",
+            axum::routing::delete(plugins::clear_data),
         )
         .route(
             "/__byok-api__/api/plugins/{plugin_id}/resources/{resource_type}/add/{method_id}/begin",
@@ -167,6 +186,10 @@ pub fn api_router(service: ControlService) -> Router {
         .route(
             "/__byok-api__/api/plugins/{plugin_id}/resources/{resource_type}/{resource_id}",
             axum::routing::delete(plugins::delete_resource),
+        )
+        .route(
+            "/__byok-api__/api/plugins/{plugin_id}/resources/{resource_type}/{resource_id}/actions/{action_id}",
+            post(plugins::action),
         )
         .route(
             "/__byok-api__/api/plugins/{plugin_id}/resources/{resource_type}/{resource_id}/refresh",
@@ -186,7 +209,11 @@ pub fn api_router(service: ControlService) -> Router {
         )
         .route(
             "/__byok-api__/api/settings/storage/statistics",
-            get(settings::get_storage).delete(settings::clear_storage),
+            get(settings::get_storage),
+        )
+        .route(
+            "/__byok-api__/api/settings/storage/cleanup",
+            post(settings::clean_storage),
         )
         .route(
             "/__byok-api__/api/settings/proxy",
@@ -205,6 +232,18 @@ pub fn api_router(service: ControlService) -> Router {
             get(settings::get_commit).put(settings::update_commit),
         )
         .route(
+            "/__byok-api__/api/settings/access-token",
+            get(settings::get_access_token),
+        )
+        .route(
+            "/__byok-api__/api/settings/access-token/regenerate",
+            post(settings::regenerate_access_token),
+        )
+        .route(
+            "/__byok-api__/api/settings/app-api",
+            get(settings::get_app_api).put(settings::update_app_api),
+        )
+        .route(
             "/__byok-api__/api/harness/cursor/status",
             get(harness::status),
         )
@@ -216,7 +255,14 @@ pub fn api_router(service: ControlService) -> Router {
             "/__byok-api__/api/harness/cursor/enabled",
             put(harness::set_enabled),
         )
-        .with_state(service)
+        .with_state(service.clone());
+    // 本机 Agent 管理入口(/byok/app/v1);与内部管理路由共用下方的访问令牌鉴权。
+    app_api::attach(service.clone(), api)
+        // 鉴权只约束 API;静态控制台页面保持可直接打开,由页面引导输入令牌。
+        .layer(axum::middleware::from_fn_with_state(
+            service.access_token().clone(),
+            auth::require,
+        ))
         .layer(desktop_cors())
 }
 
@@ -224,11 +270,7 @@ fn desktop_cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin, _| local_origin(origin)))
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers([
-            CONTENT_TYPE,
-            header::ACCEPT_LANGUAGE,
-            header::HeaderName::from_static("disable-ad-ids"),
-        ])
+        .allow_headers([CONTENT_TYPE, header::AUTHORIZATION])
 }
 
 fn local_origin(origin: &HeaderValue) -> bool {
@@ -254,12 +296,39 @@ fn local_origin(origin: &HeaderValue) -> bool {
         Some(Host::Domain(host)) => {
             host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("tauri.localhost")
         }
-        Some(Host::Ipv4(address)) => {
-            address.is_loopback() || address.is_private() || address.is_link_local()
-        }
-        Some(Host::Ipv6(address)) => {
-            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
-        }
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_cors_accepts_only_local_application_origins() {
+        for origin in [
+            "tauri://localhost",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+            "http://[::1]:3000",
+        ] {
+            assert!(
+                local_origin(&HeaderValue::from_str(origin).unwrap()),
+                "{origin}"
+            );
+        }
+        for origin in [
+            "https://example.com",
+            "http://192.168.1.10:3000",
+            "http://10.0.0.2",
+            "http://[fd00::1]:3000",
+        ] {
+            assert!(
+                !local_origin(&HeaderValue::from_str(origin).unwrap()),
+                "{origin}"
+            );
+        }
     }
 }

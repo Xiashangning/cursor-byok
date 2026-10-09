@@ -4,12 +4,14 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use serde::Deserialize;
 
 use crate::{
     plugin::{
-        ImportResponse, OAuthBeginResponse, OAuthPollResponse, PluginDescriptor,
-        PluginRuntimeStatus,
+        ImportResponse, InstallPluginResponse, OAuthBeginResponse, OAuthPollResponse,
+        PluginDescriptor, PluginRuntimeStatus,
     },
+    store::PluginModelOverride,
     Result,
 };
 
@@ -19,11 +21,29 @@ pub async fn list(State(service): State<ControlService>) -> Result<Json<Vec<Plug
     Ok(Json(service.plugins().await))
 }
 
-pub async fn remove(
+pub async fn install(
+    State(service): State<ControlService>,
+    Json(request): Json<InstallPluginRequest>,
+) -> Result<Json<InstallPluginResponse>> {
+    Ok(Json(
+        service
+            .install_plugin(std::path::Path::new(&request.path), request.replace)
+            .await?,
+    ))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct InstallPluginRequest {
+    path: String,
+    replace: bool,
+}
+
+pub async fn clear_data(
     State(service): State<ControlService>,
     Path(plugin_id): Path<String>,
 ) -> Result<StatusCode> {
-    service.remove_plugin_configuration(&plugin_id).await?;
+    service.clear_plugin_data(&plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -87,6 +107,23 @@ pub async fn refresh_resource(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn action(
+    State(service): State<ControlService>,
+    Path((plugin_id, resource_type, resource_id, action_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    Json(input): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>> {
+    Ok(Json(
+        service
+            .plugin_resource_action(&plugin_id, &resource_type, &resource_id, &action_id, input)
+            .await?,
+    ))
+}
+
 pub async fn delete_resource(
     State(service): State<ControlService>,
     Path((plugin_id, resource_type, resource_id)): Path<(String, String, String)>,
@@ -121,4 +158,82 @@ pub async fn cancel_runtime_initialization(
     State(service): State<ControlService>,
 ) -> Result<Json<PluginRuntimeStatus>> {
     Ok(Json(service.cancel_plugin_runtime_initialization()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDisabledModelsInput {
+    pub model_ids: Vec<String>,
+}
+
+pub async fn get_disabled_models(
+    State(service): State<ControlService>,
+) -> Result<Json<Vec<String>>> {
+    Ok(Json(service.disabled_plugin_models().await?))
+}
+
+pub async fn set_disabled_models(
+    State(service): State<ControlService>,
+    Json(input): Json<SetDisabledModelsInput>,
+) -> Result<Json<Vec<String>>> {
+    service.set_disabled_plugin_models(input.model_ids).await?;
+    Ok(Json(service.disabled_plugin_models().await?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDisabledAccountsInput {
+    pub account_ids: Vec<String>,
+}
+
+pub async fn get_disabled_accounts(
+    State(service): State<ControlService>,
+) -> Result<Json<Vec<String>>> {
+    Ok(Json(service.disabled_plugin_accounts().await?))
+}
+
+pub async fn set_disabled_accounts(
+    State(service): State<ControlService>,
+    Json(input): Json<SetDisabledAccountsInput>,
+) -> Result<Json<Vec<String>>> {
+    service
+        .set_disabled_plugin_accounts(input.account_ids)
+        .await?;
+    Ok(Json(service.disabled_plugin_accounts().await?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelOverrideInput {
+    /// 插件模型的统一 8 位 ID。
+    pub id: String,
+    pub display_name: String,
+    pub tooltip: String,
+    pub effort_options: Vec<String>,
+    pub context_options: Vec<String>,
+    pub max_output_tokens: Option<u64>,
+    pub default_effort: Option<String>,
+    pub default_context: Option<String>,
+}
+
+/// 保存模型覆盖;Effort 显式空轴与内置模型一样回填五档。
+pub async fn set_model_override(
+    State(service): State<ControlService>,
+    Json(input): Json<SetModelOverrideInput>,
+) -> Result<StatusCode> {
+    service
+        .set_plugin_model_override(
+            input.id,
+            PluginModelOverride {
+                display_name: Some(input.display_name),
+                tooltip: Some(input.tooltip),
+                effort_options: Some(input.effort_options),
+                context_options: Some(input.context_options),
+                max_output_tokens: input.max_output_tokens,
+                default_effort: input.default_effort,
+                default_context: input.default_context,
+            },
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

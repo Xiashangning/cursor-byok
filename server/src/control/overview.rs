@@ -17,6 +17,7 @@ pub struct OverviewRange {
     end_ms: Option<i64>,
     model_hashes: Option<String>,
     bucket_ms: Option<i64>,
+    timezone_offset_minutes: Option<i32>,
 }
 
 pub async fn get(
@@ -30,6 +31,7 @@ pub async fn get(
                 range.end_ms,
                 range.model_hashes.as_deref(),
                 range.bucket_ms,
+                range.timezone_offset_minutes,
             )
             .await?,
     ))
