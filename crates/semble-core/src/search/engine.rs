@@ -184,21 +184,25 @@ impl SearchEngine {
         let dimensions = index.metadata.dimensions;
         let source_start = source * dimensions;
         let source_vector = &index.vectors[source_start..source_start + dimensions];
-        let mut ranked =
-            rank_semantic(source_vector, &index.vectors, dimensions, request.top_k + 1)
-                .into_iter()
-                .filter(|position| *position != source)
-                .take(request.top_k)
-                .map(|position| {
-                    (
-                        position,
-                        quantized_cosine(
-                            source_vector,
-                            &index.vectors[position * dimensions..(position + 1) * dimensions],
-                        ),
-                    )
-                })
-                .collect::<Vec<_>>();
+        let mut ranked = rank_semantic(
+            source_vector,
+            &index.vectors,
+            dimensions,
+            request.top_k.saturating_add(1),
+        )
+        .into_iter()
+        .filter(|position| *position != source)
+        .take(request.top_k)
+        .map(|position| {
+            (
+                position,
+                quantized_cosine(
+                    source_vector,
+                    &index.vectors[position * dimensions..(position + 1) * dimensions],
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
         ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
         response(
             &format!("Chunks related to {}:{}", request.file_path, request.line),
