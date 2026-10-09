@@ -14,8 +14,8 @@ Keep the invariant in the provider-independent conversation layers:
 ```text
 server/
 ├── prompt/cursor/*/runtime.md       Per-turn runtime content
-├── src/cursor/request/              Request context and runtime compilation
-├── src/cursor/projection/           Canonical ↔ Cursor checkpoint projection
+├── src/cursor/compile/              Request context and runtime compilation
+├── src/cursor/checkpoint/messages/  Canonical ↔ Cursor checkpoint projection
 ├── src/cursor/checkpoint/           Stable roots, turns, and hydration
 ├── src/run/                         Provider-independent model history
 └── src/provider/                    Provider-specific serialization only

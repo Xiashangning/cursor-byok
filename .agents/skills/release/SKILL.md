@@ -40,13 +40,14 @@ cursor-byok/
 │   └── src-tauri/
 │       ├── Cargo.toml
 │       └── tauri.conf.json
-├── scripts/cursor-proto/proto/
+├── protocols/cursor/
 │   ├── agent_v1.proto
 │   └── aiserver_v1.proto
 └── .github/workflows/release.yml
 ```
 
-The two listed Proto files are required build inputs and must be committed. Keep the other locally extracted Proto files ignored unless the build starts depending on them.
+The two listed Proto files are required build inputs and must be committed. Keep the other Proto
+files in `protocols/cursor/` committed as well: they document the captured Cursor wire contracts.
 
 ## Prepare and validate
 

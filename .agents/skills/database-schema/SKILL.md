@@ -23,9 +23,10 @@ Before editing, inspect the complete table definition, every query that reads or
 
 ## Migration rules
 
-- `server/src/store/sqlite.rs` runs embedded SQLx migrations from `server/migrations`.
+- `server/src/store/sqlite.rs` opens SQLite; `server/src/store/migrations.rs` runs embedded SQLx migrations from `server/migrations`.
 - Never modify, rename, reorder, or delete a migration that may already have been applied. SQLx records its checksum; changing an applied file causes startup failure with `migration ... was previously applied but has been modified`.
-- Add the next numbered forward migration, using a descriptive filename such as `0003_add_request_protocol.sql`.
+- Add the next numbered forward migration, using a descriptive filename such as `0002_add_request_protocol.sql`.
+- Migration history was squashed into `0001_initial.sql`; databases created before the squash cannot upgrade and must be recreated. Add new schema changes as the next sequential migration, `0002_<description>.sql`, `0003_<description>.sql`, and so on.
 - A fresh database must reach the current schema by applying all migrations in order. Do not duplicate a new column or table in both the initial migration and a later migration.
 - Only squash or rewrite migration history when the user explicitly asks for a full database reset and accepts that existing databases will no longer start. Do not infer that permission from a development-only workflow.
 - Do not add compatibility views, triggers, shadow fields, or fallback reads. Migrate once, then make the application consume the new schema directly.

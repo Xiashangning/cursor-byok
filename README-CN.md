@@ -4,7 +4,7 @@
 
 cursor-byok 是一个运行在本机的 Cursor 模型网关，帮助你在 Cursor 中使用自己配置的模型服务。
 
-[English README](./README.md) · [使用指南](https://docs.leokun.cn) · [下载](https://github.com/leookun/cursor-byok/releases/latest) · [提交问题](https://github.com/leookun/cursor-byok/issues)
+[English README](./README.md) · [下载](https://github.com/leookun/cursor-byok/releases/latest) · [提交问题](https://github.com/leookun/cursor-byok/issues)
 
 [![Release](https://img.shields.io/github/v/release/leookun/cursor-byok?style=flat-square)](https://github.com/leookun/cursor-byok/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/leookun/cursor-byok/total?style=flat-square)](https://github.com/leookun/cursor-byok/releases)
@@ -44,8 +44,6 @@ cursor-byok 是一个开源的本地模型网关。它在你的设备上运行�
 3. 在模型设置中添加模型，填写服务地址、API Key 和模型名称，然后保存并运行 **测试**。
 4. 确认测试通过后，保持 cursor-byok 运行。
 5. **首次升级 Cursor 或首次配置模型后，完全退出并重新启动 Cursor，然后新开一个对话**。在模型列表中选择已配置的模型，开始使用 Agent。
-
-完整的安装步骤、配置说明和常见问题，请参阅[中文使用指南](https://docs.leokun.cn/zh/docs)。
 
 > [!TIP]
 > 首次升级 Cursor 或首次完成配置后，必须完全退出并重新启动 Cursor，再新开一个对话。配置前已经打开的对话不会加载新连接；使用自定义模型时，请在模型列表中手动选择该模型，不要选择 **Auto**。
@@ -123,24 +121,26 @@ cursor-byok/
 │   ├── desktop/
 │   │   ├── src/
 │   │   │   ├── features/ # 首页、模型、调用记录与设置
-│   │   │   ├── shell/    # 窗口框架、页面布局与广告外壳
+│   │   │   ├── shell/    # 窗口框架与页面布局
 │   │   │   ├── shared/   # UI、虚拟列表、状态、API 与平台能力
 │   │   │   ├── i18n/     # 本地化运行时与语言目录
 │   │   │   └── styles/   # 全局主题与排版令牌
 │   │   └── src-tauri/    # Tauri 桌面生命周期
-│   └── docs/          # Next.js 与 Fumadocs 中文/英文文档站
 ├── server/
 │   ├── src/
+│   │   ├── api/       # HTTP/Connect 接口与 Cursor 路由
+│   │   ├── bin/       # 可执行程序入口
 │   │   ├── cursor/    # Cursor 协议适配
 │   │   ├── run/       # 通用 Agent Runtime 与内部 Port
 │   │   ├── provider/  # 模型供应商适配
 │   │   ├── model/     # 聚合领域模型
 │   │   ├── store/     # SQLite Repository
 │   │   ├── control/   # 管理面 API
-│   │   ├── harness/   # Cursor 本地集成
+│   │   ├── plugin/    # 插件系统与内置插件
+│   │   ├── local_app/ # Cursor 本地集成
 │   │   └── search/    # Web 与 Semble 搜索接入
 │   ├── prompt/
-│   └── migrations/
+│   └── migrations/    # SQLite 迁移(单文件 0001_initial.sql)
 ├── crates/
 │   └── semble-core/   # 本地代码索引与搜索核心库
 ├── protocols/
@@ -148,6 +148,7 @@ cursor-byok/
 ├── support/                     # 仓库辅助设施
 │   ├── cursor-protocol-extractor/ # Cursor 协议提取与 Go 代码生成工具
 │   ├── cursor-capture/            # Cursor 协议抓取和调试工具
+│   ├── cursor-cli/                # 复用本地服务配置的 Cursor CLI 启动器
 │   └── benchmarks/                # 代码搜索和索引基准测试
 ├── images/            # README 展示图片
 ├── Cargo.toml         # Rust 工作区配置
@@ -167,7 +168,6 @@ cursor-byok/
 
 ```bash
 npm --prefix apps/desktop install
-npm --prefix apps/docs install
 ```
 
 ### 启动开发环境
@@ -184,14 +184,6 @@ make dev-web
 make dev-desktop
 ```
 
-启动文档站：
-
-```bash
-make dev-docs
-```
-
-文档站默认地址为 <http://localhost:3000>。
-
 ### 检查与构建
 
 运行完整检查：
@@ -205,12 +197,9 @@ make check
 ```bash
 make build-web       # 构建桌面前端
 make build-server    # 构建 Rust 本地服务
-make build-docs      # 构建文档站
 make build-desktop   # 构建 Tauri 桌面安装包
 make build-docker    # 构建 Docker 镜像
 ```
-
-文档内容位于 `apps/docs/content/docs` 和 `apps/docs/content/blog`。修改文档侧边栏时同步更新 `apps/docs/content/docs/meta.json`。
 
 ## 路线图
 
@@ -220,7 +209,6 @@ make build-docker    # 构建 Docker 镜像
 
 ## 社区与反馈
 
-- [中文使用指南](https://docs.leokun.cn/zh/docs)
 - [GitHub Issues](https://github.com/leookun/cursor-byok/issues)
 - [Telegram 社区](https://t.me/cursor_byok)
 - QQ 群：`1095916242`、`1094411438`、`1095918002`、`1094419321`
@@ -228,6 +216,10 @@ make build-docker    # 构建 Docker 镜像
 提交问题时，请附上操作系统、cursor-byok 版本、模型类型、请求协议、已脱敏的服务地址、错误信息和复现步骤。请勿公开 API Key 或其他凭据。
 
 ## 参与贡献
+
+### Cursor CLI 接管
+
+仓库提供可选的 [Windows/macOS CLI 启动器](./support/cursor-cli/README.md)，复用运行中的助手模型配置、动态端口和本地身份。CLI 设置独立保存，保留工具审批。它目前需要从源码目录手动运行，桌面安装程序不会自动安装；macOS 的真实供应商调用仍需在目标机器验证。
 
 欢迎提交 Issue 和 Pull Request。提交代码前请先阅读项目中的开发说明，并运行 `make check` 确认格式、测试和前端构建检查通过。
 

@@ -11,9 +11,9 @@ Use `@floating-ui/dom` for every interactive element positioned relative to a tr
 
 - Render overlays through `createPortal(..., document.body)` so layout and stacking contexts do not clip them.
 - Position with `computePosition` inside `autoUpdate`; clean up the function returned by `autoUpdate` when the overlay closes or unmounts.
-- Start from the closest existing control in `apps/desktop/src/components/ui`. Match its `placement`, `offset`, `flip`, `shift`, and `size` middleware unless the interaction requires a deliberate difference.
+- Start from the closest existing control in `apps/desktop/src/shared/ui`. Match its `placement`, `offset`, `flip`, `shift`, and `size` middleware unless the interaction requires a deliberate difference.
 - Store computed `left`, `top`, width, and available height in React state. Apply the state to the portal root; do not mutate element styles directly.
-- Use `size` when reference width or viewport height constrains the overlay. Lists that can grow must use `components/virtual/VirtualList.tsx`; keep fixed headers and footers outside the virtual viewport.
+- Use `size` when reference width or viewport height constrains the overlay. Lists that can grow must use `shared/virtual/VirtualList.tsx`; keep fixed headers and footers outside the virtual viewport.
 
 ## Interaction invariants
 

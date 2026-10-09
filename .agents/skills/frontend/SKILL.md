@@ -30,7 +30,7 @@ Build on the components and theme system already present in `apps/desktop`. Pres
 
 ## Page layout
 
-- Build every full-height page with `components/layout/PageLayout.tsx`; do not hand-roll page shells with grid rows.
+- Build every full-height page with `shell/layout/PageLayout.tsx`; do not hand-roll page shells with grid rows.
 - Put page-level commands and controls such as create, import, export, filtering, sorting, and view options in the shared page action region through `PageActions`. Keep only operations that target one concrete list item, such as edit and delete, inside that item's row. Do not add duplicate action bars or panel-header controls inside page content.
 - Never render a title region above a data table or flat data list. Use the page title for context, keep column labels in the table header, place page-level controls in `PageActions`, and wrap the table in a titleless `Card`. A hierarchy label that identifies parent data in a grouped parent-child view is not a table title.
 - Keep the main scroll viewport full-height and `position: relative`; place the page title and action region absolutely over it.
@@ -55,8 +55,8 @@ Build on the components and theme system already present in `apps/desktop`. Pres
 
 ## Scrolling and virtualization
 
-- Use `components/layout/VirtualPage.tsx` for vertically scrolling page content.
-- Use `components/virtual/VirtualList.tsx` for data collections and menus that can grow.
+- Use `shell/layout/VirtualPage.tsx` for vertically scrolling page content.
+- Use `shared/virtual/VirtualList.tsx` for data collections and menus that can grow.
 - Treat `ScrollArea` as the low-level primitive owned by the virtual scrolling implementation. Do not import `ScrollArea` directly in pages or layouts.
 - Use the global `scroll-shadow-top` and `scroll-shadow-bottom` masks for scroll-edge shadows. When a scroll content inset reserves an absolute overlay, source the top shadow distance from the same CSS variable as its `padding-top`.
 - Model non-list pages as a short sequence of measurable top-level virtual sections.
@@ -67,13 +67,13 @@ Build on the components and theme system already present in `apps/desktop`. Pres
 
 - Use `HashRouter` for Tauri compatibility.
 - Keep `/` as the statistics dashboard and expose every primary page through the persistent menu in the shared `AppLayout`.
-- Use top-level routes for primary pages: `/`, `/providers`, `/models`, `/calls`, and `/settings`.
+- Use top-level routes for primary pages: `/`, `/calls`, `/harness/cursor`, `/plugins`, and `/settings`; call details live at `/calls/:callId`.
 - Do not create separate Home and Settings shells or add a Home-switching control.
 - Keep route content independent of the window Header and Footer.
 
 ## Charts
 
-- Use ECharts through `components/charts/EChart.tsx`.
+- Use ECharts through `features/home/charts/EChart.tsx`.
 - Register only required ECharts Core charts, components, and renderers.
 - Keep chart components declarative: accept domain data and construct an option without fetching or persisting data.
 - Let `ResizeObserver` resize the chart with its layout container and dispose the instance on unmount.
