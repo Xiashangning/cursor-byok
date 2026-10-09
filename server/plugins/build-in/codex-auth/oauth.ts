@@ -1,4 +1,5 @@
 import type { JsonValue, PluginContext } from "cursor-byok:plugin";
+import { number, object, parseJsonObject, text } from "cursor-byok:json";
 import type { OAuth2AddMethod, OAuth2Begin, OAuth2Poll } from "cursor-byok:resource";
 import { type CredentialCandidate, credentialDraft } from "./resources.ts";
 
@@ -13,33 +14,6 @@ type Session = {
   deviceAuthId: string;
   userCode: string;
 };
-
-function object(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
-
-function text(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function number(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-function parseBody(body: string): Record<string, unknown> {
-  try {
-    return object(JSON.parse(body)) ?? {};
-  } catch {
-    return {};
-  }
-}
 
 function parseSession(value: JsonValue): Session {
   const session = object(value);
@@ -74,7 +48,7 @@ async function begin(context: PluginContext): Promise<OAuth2Begin> {
     headers: { accept: "application/json", "content-type": "application/json" },
     body: JSON.stringify({ client_id: CLIENT_ID }),
   });
-  const body = parseBody(response.body);
+  const body = parseJsonObject(response.body);
   if (response.status < 200 || response.status >= 300) {
     throw new Error(
       `Failed to request OpenAI Codex device code (HTTP ${response.status}): ${response.body}`,
@@ -115,7 +89,7 @@ async function exchangeAuthorizationCode(
       code_verifier: codeVerifier,
     }).toString(),
   });
-  const body = parseBody(response.body);
+  const body = parseJsonObject(response.body);
   const accessToken = text(body.access_token);
   if (!accessToken) {
     throw new Error(
@@ -139,7 +113,7 @@ async function poll(sessionValue: JsonValue, context: PluginContext): Promise<OA
       user_code: session.userCode,
     }),
   });
-  const body = parseBody(response.body);
+  const body = parseJsonObject(response.body);
   // 该端点用 403/404 表示"尚未完成授权"。
   if (response.status === 403 || response.status === 404) return { status: "pending" };
 

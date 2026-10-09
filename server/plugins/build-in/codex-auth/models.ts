@@ -1,18 +1,9 @@
 import type { JsonValue } from "cursor-byok:plugin";
+import { object, text } from "cursor-byok:json";
 import type { ModelDefinition, ModelSnapshot, ModelSupport } from "cursor-byok:model";
 import { accountData, accountHeaders } from "./resources.ts";
 
 const MODELS_URL = "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
-
-function object(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
-
-function text(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
 
 function positiveInteger(value: unknown): number | null {
   const parsed = typeof value === "number"

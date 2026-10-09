@@ -1,4 +1,5 @@
 import type { ModelDefinition, ModelSupport } from "cursor-byok:model";
+import { object, text } from "cursor-byok:json";
 import { accountData } from "./resources.ts";
 
 const LANGUAGE_MODELS_URL = "https://api.x.ai/v1/language-models";
@@ -17,16 +18,6 @@ export const FALLBACK_MODELS: ModelDefinition[] = [
     capabilities: { images: true },
   },
 ];
-
-function object(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
-
-function text(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
 
 function modalities(value: unknown): string[] {
   return Array.isArray(value)

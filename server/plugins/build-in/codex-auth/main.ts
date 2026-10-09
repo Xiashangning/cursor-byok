@@ -1,7 +1,14 @@
 import { defineProviderPlugin } from "cursor-byok:plugin";
 import { codexDeviceOAuth } from "./oauth.ts";
 import { codexProvider } from "./provider.ts";
-import { credentialImport, presentAccount, refreshAccount, RESOURCE_TYPE } from "./resources.ts";
+import {
+  consumeResetCardAction,
+  credentialImport,
+  listResetCardsAction,
+  presentAccount,
+  refreshAccount,
+  RESOURCE_TYPE,
+} from "./resources.ts";
 
 export default defineProviderPlugin({
   providers: [codexProvider],
@@ -11,6 +18,7 @@ export default defineProviderPlugin({
     add: [codexDeviceOAuth],
     import: credentialImport,
     present: presentAccount,
+    actions: [listResetCardsAction, consumeResetCardAction],
     refresh: refreshAccount,
   }],
 });

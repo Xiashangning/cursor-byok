@@ -2,11 +2,10 @@ import type { JsonValue, PluginContext } from "cursor-byok:plugin";
 import { number, object, parseJsonObject, text } from "cursor-byok:json";
 import type { OAuth2AddMethod, OAuth2Begin, OAuth2Poll } from "cursor-byok:resource";
 import { credentialDraft } from "./resources.ts";
+import { OAUTH_CLIENT_ID, OAUTH_TOKEN_URL } from "./token.ts";
 
-const CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
-const DEVICE_CODE_URL = "https://auth.x.ai/oauth2/device/code";
-const TOKEN_URL = "https://auth.x.ai/oauth2/token";
-const SCOPE = "openid profile email offline_access grok-cli:access api:access";
+// 与官方 Kimi CLI 相同的 Kimi Code 设备授权客户端。
+const DEVICE_CODE_URL = "https://auth.kimi.com/api/oauth/device_authorization";
 
 type Session = {
   deviceCode: string;
@@ -15,7 +14,7 @@ type Session = {
 function parseSession(value: JsonValue): Session {
   const session = object(value);
   const deviceCode = text(session?.deviceCode);
-  if (!deviceCode) throw new Error("Grok OAuth session is invalid");
+  if (!deviceCode) throw new Error("Kimi OAuth session is invalid");
   return { deviceCode };
 }
 
@@ -26,23 +25,23 @@ async function begin(context: PluginContext): Promise<OAuth2Begin> {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
     },
-    body: new URLSearchParams({ client_id: CLIENT_ID, scope: SCOPE }).toString(),
+    body: new URLSearchParams({ client_id: OAUTH_CLIENT_ID }).toString(),
   });
   const body = parseJsonObject(response.body);
   if (response.status < 200 || response.status >= 300) {
     throw new Error(
-      `Failed to request xAI device code (HTTP ${response.status}): ${response.body}`,
+      `Failed to request Kimi device code (HTTP ${response.status}): ${response.body}`,
     );
   }
   const deviceCode = text(body.device_code);
   const userCode = text(body.user_code);
-  const verificationUrl = text(body.verification_uri);
+  const verificationUrl = text(body.verification_uri) ?? text(body.verification_uri_complete);
   if (!deviceCode || !userCode || !verificationUrl) {
-    throw new Error("xAI device authorization response is incomplete");
+    throw new Error("Kimi device authorization response is incomplete");
   }
   const session: Session = { deviceCode };
   return {
-    session: session as unknown as JsonValue,
+    session,
     userCode,
     verificationUrl,
     ...(text(body.verification_uri_complete)
@@ -55,7 +54,7 @@ async function begin(context: PluginContext): Promise<OAuth2Begin> {
 
 async function poll(sessionValue: JsonValue, context: PluginContext): Promise<OAuth2Poll> {
   const session = parseSession(sessionValue);
-  const response = await context.network.fetch(TOKEN_URL, {
+  const response = await context.network.fetch(OAUTH_TOKEN_URL, {
     method: "POST",
     headers: {
       accept: "application/json",
@@ -63,7 +62,7 @@ async function poll(sessionValue: JsonValue, context: PluginContext): Promise<OA
     },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-      client_id: CLIENT_ID,
+      client_id: OAUTH_CLIENT_ID,
       device_code: session.deviceCode,
     }).toString(),
   });
@@ -71,7 +70,7 @@ async function poll(sessionValue: JsonValue, context: PluginContext): Promise<OA
   if (response.status >= 200 && response.status < 300) {
     const accessToken = text(body.access_token);
     if (!accessToken) {
-      return { status: "failed", message: "xAI token response is missing access_token" };
+      return { status: "failed", message: "Kimi token response is missing access_token" };
     }
     return {
       status: "completed",
@@ -101,21 +100,21 @@ async function poll(sessionValue: JsonValue, context: PluginContext): Promise<OA
         message: message ??
           (code
             ? `OAuth error: ${code}`
-            : `xAI device authorization failed (HTTP ${response.status})`),
+            : `Kimi device authorization failed (HTTP ${response.status})`),
       };
   }
 }
 
-export const grokDeviceOAuth: OAuth2AddMethod = {
+export const kimiDeviceOAuth: OAuth2AddMethod = {
   type: "oauth2.0",
-  id: "xai-device",
+  id: "kimi-device",
   displayName: {
-    "en-US": "Sign in with xAI",
-    "zh-CN": "使用 xAI 登录",
+    "en-US": "Sign in with Kimi",
+    "zh-CN": "使用 Kimi 登录",
   },
   description: {
-    "en-US": "Authorize this device with xAI, then add the resulting Grok account.",
-    "zh-CN": "在 xAI 完成设备授权后,自动添加对应的 Grok 账号。",
+    "en-US": "Authorize this device with your Kimi account, then add the resulting Kimi account.",
+    "zh-CN": "在 Kimi 完成设备授权后,自动添加对应的 Kimi 账号。",
   },
   begin,
   poll,

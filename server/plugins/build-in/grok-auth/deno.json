@@ -4,6 +4,8 @@
     "cursor-byok:provider": "../../../src/plugin/sdk/provider.ts",
     "cursor-byok:model": "../../../src/plugin/sdk/model.ts",
     "cursor-byok:resource": "../../../src/plugin/sdk/resource.ts",
+    "cursor-byok:json": "../../../src/plugin/sdk/json.ts",
+    "cursor-byok:credentials": "../../../src/plugin/sdk/credentials.ts",
     "cursor-byok:protocol/openai-chat": "../../../src/plugin/sdk/protocol/openai_chat.ts"
   },
   "fmt": {

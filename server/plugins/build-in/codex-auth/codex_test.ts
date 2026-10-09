@@ -1,88 +1,24 @@
-import type {
-  JsonValue,
-  NetworkEventStream,
-  NetworkResponse,
-  PluginContext,
-} from "cursor-byok:plugin";
-import type { LlmRequest, ModelEvent } from "cursor-byok:provider";
-import type { ResourceSnapshot } from "cursor-byok:resource";
+import type { JsonValue } from "cursor-byok:plugin";
+import type { ModelEvent } from "cursor-byok:provider";
+import { assert, assertEquals, context, jwt, request, snapshot, sse } from "../test_helpers.ts";
 import { codexDeviceOAuth } from "./oauth.ts";
 import { parseOfficialModels } from "./models.ts";
-import { buildResponsesBody } from "cursor-byok:protocol/openai-responses";
 import { codexProvider, isQuotaError } from "./provider.ts";
 import {
   accountIdentity,
+  consumeResetCardAction,
   credentialDraft,
+  listResetCardsAction,
   parseCodexUsage,
   parseCredentialFiles,
+  planTier,
   presentAccount,
   quotaState,
   RESOURCE_TYPE,
 } from "./resources.ts";
 
-function assert(condition: unknown, message = "assertion failed"): asserts condition {
-  if (!condition) throw new Error(message);
-}
-
-function assertEquals(actual: unknown, expected: unknown): void {
-  const left = JSON.stringify(actual);
-  const right = JSON.stringify(expected);
-  if (left !== right) throw new Error(`expected ${right}, received ${left}`);
-}
-
-function jwt(payload: Record<string, unknown>): string {
-  const encoded = btoa(JSON.stringify(payload)).replace(/=/g, "").replace(/\+/g, "-").replace(
-    /\//g,
-    "_",
-  );
-  return `header.${encoded}.signature`;
-}
-
-type RequestInit = { body?: string; headers?: Record<string, string> };
-type FetchHandler = (url: string, init?: RequestInit) => NetworkResponse;
-type StreamHandler = (url: string, init?: RequestInit) => NetworkEventStream;
-
-function context(handlers: { fetch?: FetchHandler; stream?: StreamHandler }): PluginContext {
-  return {
-    network: {
-      fetch: (url, init) => {
-        if (!handlers.fetch) throw new Error("fetch was not expected");
-        return Promise.resolve(handlers.fetch(url, init));
-      },
-      stream: (url, init) => {
-        if (!handlers.stream) throw new Error("stream was not expected");
-        return Promise.resolve(handlers.stream(url, init));
-      },
-    },
-    signal: new AbortController().signal,
-  };
-}
-
-function snapshot(privateData: JsonValue): ResourceSnapshot {
-  return {
-    id: "resource-1",
-    type: RESOURCE_TYPE,
-    key: "codex:acct-1",
-    privateData,
-    state: { status: "ready" },
-  };
-}
-
-async function* sse(lines: string[]): AsyncGenerator<string> {
-  for (const line of lines) yield line;
-}
-
-function request(): LlmRequest {
-  return {
-    instructions: "You are a coding assistant.",
-    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
-    tools: [],
-    reasoning: { enabled: true, effort: "medium" },
-    latency: "fast",
-    maxOutputTokens: 128_000,
-    cacheKey: "conversation-1",
-  };
-}
+const codexSnapshot = (privateData: JsonValue) =>
+  snapshot(RESOURCE_TYPE, "codex:acct-1", privateData, "resource-1");
 
 Deno.test("account identity prioritizes ChatGPT account ID and drafts keep tokens private-side", async () => {
   const token = jwt({
@@ -100,8 +36,11 @@ Deno.test("account identity prioritizes ChatGPT account ID and drafts keep token
     displayName: null,
   });
   assertEquals(draft.key, "codex:acct-1");
-  const view = presentAccount(snapshot(draft.privateData));
-  assert(!JSON.stringify(view).includes(token), "resource view exposed an access token");
+  const view = presentAccount(codexSnapshot(draft.privateData));
+  assert(
+    !JSON.stringify(view).includes(token),
+    "resource view exposed an access token",
+  );
   assertEquals(view.displayName, "person@example.com");
 });
 
@@ -122,6 +61,9 @@ Deno.test("credential import accepts Codex auth JSON files", () => {
   assertEquals(credentials, [{
     accessToken: "access-secret",
     refreshToken: "refresh-secret",
+    accountId: null,
+    idToken: jwt({ email: "person@example.com" }),
+    // 条目没有名字段时,展示名从 id_token 的 email 声明现算。
     displayName: "person@example.com",
   }]);
   assertEquals(warnings, ["broken.json: not valid JSON"]);
@@ -134,12 +76,167 @@ Deno.test("usage maps secondary to weekly and primary to five-hour quota", () =>
       primary_window: { used_percent: 80, reset_at: 1_800_000_000 },
       secondary_window: { used_percent: 25, reset_at: 1_900_000_000 },
     },
+    rate_limit_reset_credits: { available_count: 2 },
   }, 1_700_000_000_000);
-  assertEquals(quota.planLabel, "ChatGPT Plus");
+  assertEquals(quota.planType, "plus");
   assertEquals(quota.weekly?.remainingPercent, 75);
   assertEquals(quota.fiveHour?.remainingPercent, 20);
   assertEquals(quota.weekly?.resetAtMs, 1_900_000_000_000);
+  assertEquals(quota.resetCreditsAvailable, 2);
   assertEquals(quotaState(quota, 1_700_000_000_000), { status: "ready" });
+});
+
+Deno.test("usage derives monthly from a long limit_window", () => {
+  // 工作区订阅:primary 是 5 小时窗口,secondary 反而是月度窗口。
+  const byWindow = parseCodexUsage({
+    rate_limit: {
+      primary_window: { used_percent: 40, reset_at: 1_800_000_000, limit_window_seconds: 18_000 },
+      secondary_window: {
+        used_percent: 10,
+        reset_at: 2_000_000_000,
+        limit_window_seconds: 2_592_000,
+      },
+    },
+  }, 1_700_000_000_000);
+  assertEquals(byWindow.fiveHour?.remainingPercent, 60);
+  assertEquals(byWindow.weekly, null);
+  assertEquals(byWindow.monthly?.remainingPercent, 90);
+
+  // 只有周窗口时不产出 monthly。
+  const weeklyOnly = parseCodexUsage({
+    rate_limit: {
+      primary_window: { used_percent: 5, reset_at: 1_900_000_000, limit_window_seconds: 604_800 },
+    },
+  }, 1_700_000_000_000);
+  assertEquals(weeklyOnly.weekly?.remainingPercent, 95);
+  assertEquals(weeklyOnly.monthly, null);
+});
+
+Deno.test("planTier renames only the non-trivial plan enums", () => {
+  assertEquals(planTier("team"), "BUSINESS");
+  assertEquals(planTier("promax"), "PRO MAX");
+  assertEquals(planTier("prolite"), "PRO");
+  assertEquals(planTier("plus"), "PLUS");
+  assertEquals(planTier(null), null);
+});
+
+Deno.test("reset card action lists safe card metadata and optional expiry", async () => {
+  const result = await listResetCardsAction.run(
+    codexSnapshot({
+      accessToken: "access-secret",
+      accountId: "acct-1",
+      refreshToken: null,
+      displayName: "person@example.com",
+      quota: null,
+    }),
+    null,
+    context({
+      fetch: (url, init) => {
+        assertEquals(
+          url,
+          "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+        );
+        assertEquals(init?.headers?.["ChatGPT-Account-Id"], "acct-1");
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({
+            available_count: 1,
+            credits: [{
+              id: "credit-1",
+              reset_type: "codex_rate_limits",
+              status: "available",
+              granted_at: "2026-06-12T01:33:14Z",
+              expires_at: "2026-07-12T01:33:14Z",
+              title: "One free rate limit reset",
+            }],
+          }),
+        };
+      },
+    }),
+  );
+  assertEquals(result.cards, [{
+    id: "credit-1",
+    title: "One free rate limit reset",
+    status: "available",
+    grantedAtMs: Date.parse("2026-06-12T01:33:14Z"),
+    expiresAtMs: Date.parse("2026-07-12T01:33:14Z"),
+    fields: [{
+      id: "reset-type",
+      label: { "en-US": "Reset type", "zh-CN": "重置类型" },
+      value: "codex_rate_limits",
+    }],
+  }]);
+});
+
+Deno.test("reset card action consumes a selected card and refreshes quota state", async () => {
+  let requestNumber = 0;
+  const result = await consumeResetCardAction.run(
+    codexSnapshot({
+      accessToken: "access-secret",
+      accountId: "acct-1",
+      refreshToken: null,
+      displayName: "person@example.com",
+      quota: null,
+    }),
+    { cardId: "credit-1" },
+    context({
+      fetch: (url, init) => {
+        requestNumber += 1;
+        if (requestNumber === 1 || requestNumber === 4) {
+          assertEquals(
+            url,
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+          );
+          return {
+            status: 200,
+            headers: {},
+            body: JSON.stringify(
+              requestNumber === 1
+                ? {
+                  available_count: 1,
+                  credits: [{ id: "credit-1", status: "available" }],
+                }
+                : { available_count: 0, credits: [] },
+            ),
+          };
+        }
+        if (requestNumber === 2) {
+          assertEquals(
+            url,
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+          );
+          assertEquals(JSON.parse(init?.body ?? "{}"), {
+            credit_id: "credit-1",
+            redeem_request_id: JSON.parse(init?.body ?? "{}").redeem_request_id,
+          });
+          return {
+            status: 200,
+            headers: {},
+            body: JSON.stringify({ code: "reset" }),
+          };
+        }
+        assertEquals(url, "https://chatgpt.com/backend-api/wham/usage");
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({
+            rate_limit_reset_credits: { available_count: 0 },
+          }),
+        };
+      },
+    }),
+  );
+  assertEquals(requestNumber, 4);
+  assertEquals(result.cards, []);
+  const quota = (result.patch?.privateData as Record<string, unknown>)
+    .quota as Record<
+      string,
+      unknown
+    >;
+  assertEquals(quota.resetCreditsAvailable, 0);
+  assertEquals(quota.weekly, null);
+  assertEquals(quota.fiveHour, null);
 });
 
 Deno.test("exhausted quota projects a cooling state until the latest reset", () => {
@@ -190,7 +287,10 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
     fetch: (url, init) => {
       requestNumber += 1;
       if (requestNumber === 1) {
-        assertEquals(url, "https://auth.openai.com/api/accounts/deviceauth/usercode");
+        assertEquals(
+          url,
+          "https://auth.openai.com/api/accounts/deviceauth/usercode",
+        );
         return {
           status: 200,
           headers: {},
@@ -203,7 +303,10 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
         };
       }
       if (requestNumber === 2) {
-        assertEquals(url, "https://auth.openai.com/api/accounts/deviceauth/token");
+        assertEquals(
+          url,
+          "https://auth.openai.com/api/accounts/deviceauth/token",
+        );
         return {
           status: 200,
           headers: {},
@@ -219,7 +322,10 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
       return {
         status: 200,
         headers: {},
-        body: JSON.stringify({ access_token: accessToken, refresh_token: "refresh-secret" }),
+        body: JSON.stringify({
+          access_token: accessToken,
+          refresh_token: "refresh-secret",
+        }),
       };
     },
   });
@@ -229,13 +335,18 @@ Deno.test("device OAuth begins with a host-held session and completes with a res
   assertEquals(begun.pollIntervalMs, 5000);
 
   const polled = await codexDeviceOAuth.poll(begun.session, flowContext);
-  assert(polled.status === "completed", `expected completed, received ${polled.status}`);
+  assert(
+    polled.status === "completed",
+    `expected completed, received ${polled.status}`,
+  );
   assertEquals(polled.resources[0].key, "codex:acct-oauth");
   assertEquals(requestNumber, 3);
 });
 
 Deno.test("invoke streams normalized events from the Codex Responses API", async () => {
-  const token = jwt({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" } });
+  const token = jwt({
+    "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" },
+  });
   const draft = await credentialDraft({
     accessToken: token,
     refreshToken: null,
@@ -251,8 +362,8 @@ Deno.test("invoke streams normalized events from the Codex Responses API", async
         displayName: "GPT Test",
         privateData: { reasoningEfforts: ["medium"] },
       },
-      resource: snapshot(draft.privateData),
-      request: request(),
+      resource: codexSnapshot(draft.privateData),
+      request: request(128_000),
     },
     { emit: (event) => events.push(event) },
     context({
@@ -279,7 +390,10 @@ Deno.test("invoke streams normalized events from the Codex Responses API", async
   assertEquals(body.reasoning, { summary: "auto", effort: "medium" });
   assertEquals(body.instructions, "You are a coding assistant.");
   assertEquals(body.include, ["reasoning.encrypted_content"]);
-  assert(!("max_output_tokens" in body), "Codex endpoint rejects max_output_tokens");
+  assert(
+    !("max_output_tokens" in body),
+    "Codex endpoint rejects max_output_tokens",
+  );
   assertEquals(body.service_tier, "priority");
   assertEquals(body.prompt_cache_key, "conversation-1");
   // 缓存亲和头与 prompt_cache_key 同源。
@@ -306,45 +420,10 @@ Deno.test("invoke streams normalized events from the Codex Responses API", async
   ]);
 });
 
-Deno.test("reasoning replay projects response items to valid input items", () => {
-  const replayRequest = request();
-  replayRequest.messages = [{
-    role: "assistant",
-    text: "",
-    thinking: "",
-    replayState: {
-      providerKind: "openai_responses",
-      value: {
-        items: [{
-          type: "reasoning",
-          id: "item-1",
-          status: "completed",
-          summary: [{ type: "summary_text", text: "why" }],
-          content: [],
-          encrypted_content: "opaque",
-          output_only: true,
-        }],
-      },
-    },
-    toolCalls: [],
-  }];
-
-  const body = buildResponsesBody({
-    url: "https://example.com/responses",
-    model: "gpt-test",
-    request: replayRequest,
-  });
-  assertEquals(body.input, [{
-    type: "reasoning",
-    id: "item-1",
-    summary: [{ type: "summary_text", text: "why" }],
-    content: [],
-    encrypted_content: "opaque",
-  }]);
-});
-
 Deno.test("invoke streams incremental tool calls and replays reasoning items", async () => {
-  const token = jwt({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" } });
+  const token = jwt({
+    "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" },
+  });
   const draft = await credentialDraft({
     accessToken: token,
     refreshToken: null,
@@ -354,8 +433,8 @@ Deno.test("invoke streams incremental tool calls and replays reasoning items", a
   const result = await codexProvider.invoke(
     {
       model: { id: "gpt-test", displayName: "GPT Test" },
-      resource: snapshot(draft.privateData),
-      request: request(),
+      resource: codexSnapshot(draft.privateData),
+      request: request(128_000),
     },
     { emit: (event) => events.push(event) },
     context({
@@ -391,7 +470,9 @@ Deno.test("invoke streams incremental tool calls and replays reasoning items", a
 Deno.test("invoke maps quota failures to a cooling resource error", async () => {
   assert(!isQuotaError("429 rate_limit_reached"));
   assert(isQuotaError("429 usage_limit_reached: 5-hour limit"));
-  const token = jwt({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" } });
+  const token = jwt({
+    "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" },
+  });
   const draft = await credentialDraft({
     accessToken: token,
     refreshToken: null,
@@ -400,22 +481,31 @@ Deno.test("invoke maps quota failures to a cooling resource error", async () => 
   const result = await codexProvider.invoke(
     {
       model: { id: "gpt-test", displayName: "GPT Test" },
-      resource: snapshot(draft.privateData),
-      request: request(),
+      resource: codexSnapshot(draft.privateData),
+      request: request(128_000),
     },
     { emit: () => {} },
     context({
       stream: () => ({
         status: 429,
         headers: {},
-        lines: sse(['{"detail":"usage_limit_reached","reset_after_seconds":600}']),
+        lines: sse([
+          '{"detail":"usage_limit_reached","reset_after_seconds":600}',
+        ]),
       }),
     }),
   );
-  assert(result.status === "resource-error", `expected resource-error, received ${result.status}`);
-  assert(result.patch.state?.status === "cooling", "quota failure should cool the resource");
   assert(
-    result.patch.state.retryAtMs !== undefined && result.patch.state.retryAtMs > Date.now(),
+    result.status === "resource-error",
+    `expected resource-error, received ${result.status}`,
+  );
+  assert(
+    result.patch.state?.status === "cooling",
+    "quota failure should cool the resource",
+  );
+  assert(
+    result.patch.state.retryAtMs !== undefined &&
+      result.patch.state.retryAtMs > Date.now(),
     "cooling should carry the parsed reset time",
   );
 });

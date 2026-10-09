@@ -1,4 +1,10 @@
 import type { JsonValue, PluginContext } from "cursor-byok:plugin";
+import type { CredentialCandidate } from "cursor-byok:credentials";
+import {
+  jwtAccountIdentity,
+  parseCredentialFiles as parseCredentialFilesShared,
+} from "cursor-byok:credentials";
+import { clampPercent, jwtDisplayName, number, object, text, timestampMs } from "cursor-byok:json";
 import type {
   ResourceDraft,
   ResourceImportFile,
@@ -17,8 +23,10 @@ const CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const ONE_HOUR_MS = 60 * 60 * 1000;
 
 export type AccountQuota = {
-  planLabel: string | null;
-  usedPercent: number | null;
+  /** 由 monthlyLimit(美分)阈值推导的档位;无法推导时为 null,不显示徽章。 */
+  tier: string | null;
+  /** 计费周期;按量账号或周期未知时为 null。 */
+  period: "weekly" | "monthly" | null;
   remainingPercent: number | null;
   resetAtMs: number | null;
   limitReached: boolean;
@@ -33,68 +41,10 @@ export type AccountData = {
   quota: AccountQuota | null;
 };
 
-export type CredentialCandidate = {
-  accessToken: string;
-  refreshToken: string | null;
-  displayName: string | null;
-};
-
-function object(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
-
-function text(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function number(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  const encoded = token.split(".")[1];
-  if (!encoded) return null;
-  try {
-    const normalized = encoded.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-    const bytes = Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
-    return object(JSON.parse(new TextDecoder().decode(bytes)));
-  } catch {
-    return null;
-  }
-}
-
-function claim(payload: Record<string, unknown> | null, key: string): string | null {
-  return payload ? text(payload[key]) : null;
-}
-
-async function tokenFingerprint(token: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
-  return Array.from(
-    new Uint8Array(digest).slice(0, 8),
-    (byte) => byte.toString(16).padStart(2, "0"),
-  ).join("");
-}
-
-export async function accountIdentity(
+export function accountIdentity(
   accessToken: string,
 ): Promise<{ key: string; displayName: string }> {
-  const payload = decodeJwtPayload(accessToken);
-  const identity = claim(payload, "sub") ??
-    claim(payload, "email") ??
-    await tokenFingerprint(accessToken);
-  const displayName = claim(payload, "email") ??
-    claim(payload, "preferred_username") ??
-    claim(payload, "name") ??
-    identity;
-  return { key: `grok:${identity}`, displayName };
+  return jwtAccountIdentity(accessToken, "grok");
 }
 
 export async function credentialDraft(credential: CredentialCandidate): Promise<ResourceDraft> {
@@ -120,46 +70,60 @@ export function accountData(resource: ResourceSnapshot): AccountData {
   };
 }
 
-function clampPercent(value: number): number {
-  return Math.max(0, Math.min(100, value));
+/** 金额字段容错解析:{"val": N}、数值或数值字符串三种包装。 */
+function moneyValue(value: unknown): number | null {
+  const wrapped = object(value);
+  return number(wrapped ? wrapped.val : value);
 }
 
-function resetAtMs(value: unknown): number | null {
-  const numeric = number(value);
-  if (numeric !== null) return numeric > 10_000_000_000 ? numeric : numeric * 1000;
-  if (typeof value === "string") {
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
+/** monthlyLimit(美分)→ 官方档位徽章:$150 SuperGrok,$1500 SuperGrok Heavy。 */
+export function planFromMonthlyLimit(limitCents: number | null): string | null {
+  if (limitCents === null) return null;
+  const rounded = Math.round(limitCents);
+  if (rounded === 150_000) return "SUPERGROK HEAVY";
+  if (rounded === 15_000) return "SUPERGROK";
   return null;
 }
 
-/** 解析 Grok CLI 计费接口的积分响应;creditUsagePercent 表示已用占比。 */
+/**
+ * 解析 Grok CLI 计费接口(?format=credits)响应;字段均为 config 下的 camelCase,
+ * 形状与 sub2api 的 BillingConfig 一致:creditUsagePercent 是已用占比,
+ * monthlyLimit/used 是美分,prepaid/on-demand 是美元。
+ */
 export function parseGrokUsage(body: unknown, nowMs = Date.now()): AccountQuota {
-  const root = object(body) ?? {};
-  const config = object(root.config) ?? root;
-  let used = number(config.creditUsagePercent ?? config.credit_usage_percent);
+  const config = object(object(body)?.config) ?? {};
+  const currentPeriod = object(config.currentPeriod);
+  const periodName = text(currentPeriod?.type)?.toLowerCase() ?? "";
+  let used = number(config.creditUsagePercent);
   if (used === null) {
-    const onDemandUsed = number(config.onDemandUsed ?? config.on_demand_used);
-    const onDemandCap = number(config.onDemandCap ?? config.on_demand_cap);
+    // 按量账号:on-demand 用量/上限换算。
+    const onDemandUsed = moneyValue(config.onDemandUsed);
+    const onDemandCap = moneyValue(config.onDemandCap);
     if (onDemandUsed !== null && onDemandCap !== null && onDemandCap > 0) {
       used = (onDemandUsed / onDemandCap) * 100;
     }
   }
-  // 存在计费周期但没有用量字段时视为未使用。
-  if (used === null && (config.currentPeriod ?? config.current_period) !== undefined) {
-    used = 0;
+  if (used === null) {
+    // 月度预付账号:used/monthlyLimit 均为美分。
+    const limit = moneyValue(config.monthlyLimit);
+    const monthlyUsed = moneyValue(config.used);
+    if (limit !== null && limit > 0 && monthlyUsed !== null) {
+      used = (Math.min(monthlyUsed, limit) / limit) * 100;
+    }
   }
+  // 存在计费周期但没有用量字段时视为未使用。
+  if (used === null && currentPeriod !== null) used = 0;
   const remaining = used === null ? null : clampPercent(100 - used);
-  const period = object(config.currentPeriod ?? config.current_period);
   return {
-    planLabel: text(
-      config.subscriptionTierDisplay ?? config.subscription_tier_display ??
-        config.subscriptionTier ?? config.product,
-    ),
-    usedPercent: used === null ? null : clampPercent(used),
+    tier: planFromMonthlyLimit(moneyValue(config.monthlyLimit)),
+    period: periodName.includes("weekly")
+      ? "weekly"
+      : periodName.includes("monthly")
+      ? "monthly"
+      : null,
+    // 窗口重置只取 currentPeriod.end;billingPeriodEnd 是月度边界,不能回退。
+    resetAtMs: timestampMs(currentPeriod?.end),
     remainingPercent: remaining,
-    resetAtMs: resetAtMs(period?.end ?? config.billingPeriodEnd ?? config.billing_period_end),
     limitReached: remaining !== null && remaining <= 0,
     updatedAtMs: nowMs,
   };
@@ -178,11 +142,10 @@ export function quotaState(quota: AccountQuota | null, nowMs = Date.now()): Reso
 /** 额度耗尽时的资源补丁:标记积分耗尽并进入冷却,重置时间未知时回退 1 小时。 */
 export function quotaExhaustedPatch(data: AccountData, nowMs = Date.now()): ResourcePatch {
   const quota: AccountQuota = {
-    planLabel: data.quota?.planLabel ?? null,
-    usedPercent: 100,
+    tier: data.quota?.tier ?? null,
+    period: data.quota?.period ?? null,
     remainingPercent: 0,
-    resetAtMs: data.quota?.resetAtMs !== undefined && data.quota?.resetAtMs !== null &&
-        data.quota.resetAtMs > nowMs
+    resetAtMs: data.quota?.resetAtMs != null && data.quota.resetAtMs > nowMs
       ? data.quota.resetAtMs
       : null,
     limitReached: true,
@@ -198,16 +161,10 @@ export function accountHeaders(data: AccountData): Record<string, string> {
   return {
     accept: "application/json",
     authorization: `Bearer ${data.accessToken}`,
-    // Grok CLI 计费接口要求该头标识客户端来源。
+    // Grok CLI 计费接口要求这些头标识客户端来源;版本号与 https://x.ai/cli/stable 保持同步。
     "x-xai-token-auth": "xai-grok-cli",
+    "x-grok-client-version": "1.0.46",
   };
-}
-
-function jwtDisplayName(token: string | null): string | null {
-  if (!token) return null;
-  const payload = decodeJwtPayload(token);
-  return claim(payload, "email") ?? claim(payload, "preferred_username") ??
-    claim(payload, "name");
 }
 
 export function presentAccount(resource: ResourceSnapshot): ResourceView {
@@ -215,9 +172,14 @@ export function presentAccount(resource: ResourceSnapshot): ResourceView {
   const metrics: ResourceMetric[] = [];
   const quota = data.quota;
   if (quota && quota.remainingPercent !== null) {
+    const [id, en, zh] = quota.period === "weekly"
+      ? ["weekly", "Weekly credits", "周额度"]
+      : quota.period === "monthly"
+      ? ["monthly", "Monthly credits", "月额度"]
+      : ["credits", "Credits", "积分额度"];
     metrics.push({
-      id: "credits",
-      label: { "en-US": "Credits", "zh-CN": "积分额度" },
+      id,
+      label: { "en-US": en, "zh-CN": zh },
       unit: "percent",
       value: quota.remainingPercent,
       ...(quota.resetAtMs !== null ? { resetAtMs: quota.resetAtMs } : {}),
@@ -226,7 +188,7 @@ export function presentAccount(resource: ResourceSnapshot): ResourceView {
   return {
     // 旧记录可能存的是账号 ID;展示时优先从 token 现算邮箱。
     displayName: jwtDisplayName(data.accessToken) ?? data.displayName,
-    ...(quota?.planLabel ? { description: quota.planLabel } : {}),
+    ...(quota?.tier ? { tier: quota.tier } : {}),
     ...(metrics.length > 0 ? { metrics } : {}),
   };
 }
@@ -261,61 +223,11 @@ export async function refreshAccount(
   };
 }
 
-function firstText(source: Record<string, unknown>, keys: string[]): string | null {
-  for (const key of keys) {
-    const value = text(source[key]);
-    if (value) return value;
-  }
-  return null;
-}
-
-function collectCredentials(value: unknown, output: CredentialCandidate[]): void {
-  if (Array.isArray(value)) {
-    for (const item of value) collectCredentials(item, output);
-    return;
-  }
-  const item = object(value);
-  if (!item || item.disabled === true) return;
-  for (const key of ["accounts", "credentials", "items"]) {
-    if (Array.isArray(item[key])) {
-      collectCredentials(item[key], output);
-      return;
-    }
-  }
-  const tokens = object(item.tokens) ?? item;
-  const accessToken = firstText(tokens, ["access_token", "accessToken", "token", "key"]) ??
-    firstText(item, ["access_token", "accessToken", "token", "key", "XAI_API_KEY"]);
-  if (!accessToken) return;
-  const refreshToken = firstText(tokens, ["refresh_token", "refreshToken"]) ??
-    firstText(item, ["refresh_token", "refreshToken"]);
-  const displayName = firstText(item, ["email", "display_name", "displayName", "name"]) ??
-    firstText(tokens, ["email", "display_name", "displayName", "name"]);
-  output.push({ accessToken, refreshToken, displayName });
-}
-
 export function parseCredentialFiles(files: ResourceImportFile[]): {
   credentials: CredentialCandidate[];
   warnings: string[];
 } {
-  const credentials: CredentialCandidate[] = [];
-  const warnings: string[] = [];
-  for (const file of files) {
-    let content: unknown;
-    try {
-      content = JSON.parse(file.content);
-    } catch {
-      warnings.push(`${file.name}: not valid JSON`);
-      continue;
-    }
-    const found: CredentialCandidate[] = [];
-    collectCredentials(content, found);
-    if (found.length === 0) {
-      warnings.push(`${file.name}: no Grok access token found`);
-      continue;
-    }
-    credentials.push(...found);
-  }
-  return { credentials, warnings };
+  return parseCredentialFilesShared(files, "Grok", "XAI_API_KEY");
 }
 
 export const credentialImport: ResourceImportSupport = {

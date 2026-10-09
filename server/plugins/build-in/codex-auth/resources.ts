@@ -1,31 +1,52 @@
 import type { JsonValue, PluginContext } from "cursor-byok:plugin";
+import type { CredentialCandidate } from "cursor-byok:credentials";
+import { parseCredentialFiles as parseCredentialFilesShared } from "cursor-byok:credentials";
+import {
+  clampPercent,
+  decodeJwtPayload,
+  jwtClaim,
+  number,
+  object,
+  text,
+  timestampMs,
+  tokenFingerprint,
+} from "cursor-byok:json";
 import type {
+  QuotaWindow,
+  ResourceAction,
+  ResourceActionCard,
+  ResourceActionResult,
   ResourceDraft,
   ResourceImportFile,
   ResourceImportResult,
   ResourceImportSupport,
-  ResourceMetric,
   ResourcePatch,
   ResourceSnapshot,
   ResourceState,
   ResourceView,
 } from "cursor-byok:resource";
+import { quotaWindowMetrics } from "cursor-byok:resource";
 
 export const RESOURCE_TYPE = "chatgpt-account";
 
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const RESET_CREDITS_CONSUME_URL = `${RESET_CREDITS_URL}/consume`;
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 
-export type QuotaWindow = {
-  usedPercent: number | null;
-  remainingPercent: number | null;
-  resetAtMs: number | null;
-};
+export const LIST_RESET_CARDS_ACTION_ID = "list-reset-cards";
+export const CONSUME_RESET_CARD_ACTION_ID = "consume-reset-card";
+
+export type { CredentialCandidate, QuotaWindow };
 
 export type AccountQuota = {
-  planLabel: string | null;
+  /** 官方 plan_type 枚举原始值(如 plus/business);presentAccount 据此现算档位徽章。 */
+  planType: string | null;
   weekly: QuotaWindow | null;
   fiveHour: QuotaWindow | null;
+  /** 超过一周的长窗口归为月度(如部分工作区订阅);接口不提供时为 null。 */
+  monthly: QuotaWindow | null;
+  resetCreditsAvailable: number | null;
   limitReached: boolean;
   updatedAtMs: number;
 };
@@ -34,64 +55,15 @@ export type AccountQuota = {
 export type AccountData = {
   accessToken: string;
   refreshToken: string | null;
+  accountId: string | null;
   displayName: string;
   quota: AccountQuota | null;
 };
 
-export type CredentialCandidate = {
-  accessToken: string;
-  refreshToken: string | null;
-  displayName: string | null;
-};
-
-function object(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
-
-function text(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function number(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  const encoded = token.split(".")[1];
-  if (!encoded) return null;
-  try {
-    const normalized = encoded.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-    const bytes = Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
-    return object(JSON.parse(new TextDecoder().decode(bytes)));
-  } catch {
-    return null;
-  }
-}
-
-function claim(payload: Record<string, unknown> | null, key: string): string | null {
-  return payload ? text(payload[key]) : null;
-}
-
 export function chatGptAccountId(accessToken: string): string | null {
   const payload = decodeJwtPayload(accessToken);
   const auth = object(payload?.["https://api.openai.com/auth"]);
-  return text(auth?.chatgpt_account_id) ?? claim(payload, "chatgpt_account_id");
-}
-
-async function tokenFingerprint(token: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
-  return Array.from(
-    new Uint8Array(digest).slice(0, 8),
-    (byte) => byte.toString(16).padStart(2, "0"),
-  ).join("");
+  return text(auth?.chatgpt_account_id) ?? jwtClaim(payload, "chatgpt_account_id");
 }
 
 /** ChatGPT access token 的邮箱通常在 OpenAI 的 profile 声明里,而不是顶层 email。 */
@@ -102,25 +74,27 @@ function profileEmail(payload: Record<string, unknown> | null): string | null {
 
 export async function accountIdentity(
   accessToken: string,
+  accountId?: string | null,
 ): Promise<{ key: string; displayName: string }> {
   const payload = decodeJwtPayload(accessToken);
-  const identity = chatGptAccountId(accessToken) ??
-    claim(payload, "sub") ??
-    claim(payload, "email") ??
+  const identity = accountId ?? chatGptAccountId(accessToken) ??
+    jwtClaim(payload, "sub") ??
+    jwtClaim(payload, "email") ??
     await tokenFingerprint(accessToken);
-  const displayName = claim(payload, "email") ??
+  const displayName = jwtClaim(payload, "email") ??
     profileEmail(payload) ??
-    claim(payload, "preferred_username") ??
-    claim(payload, "name") ??
+    jwtClaim(payload, "preferred_username") ??
+    jwtClaim(payload, "name") ??
     identity;
   return { key: `codex:${identity}`, displayName };
 }
 
 export async function credentialDraft(credential: CredentialCandidate): Promise<ResourceDraft> {
-  const identity = await accountIdentity(credential.accessToken);
+  const identity = await accountIdentity(credential.accessToken, credential.accountId);
   const data: AccountData = {
     accessToken: credential.accessToken,
     refreshToken: credential.refreshToken,
+    accountId: credential.accountId ?? chatGptAccountId(credential.accessToken),
     displayName: credential.displayName ?? identity.displayName,
     quota: null,
   };
@@ -134,6 +108,7 @@ export function accountData(resource: ResourceSnapshot): AccountData {
   return {
     accessToken,
     refreshToken: text(data?.refreshToken),
+    accountId: text(data?.accountId) ?? chatGptAccountId(accessToken),
     displayName: text(data?.displayName) ?? "ChatGPT account",
     quota: (data?.quota ?? null) as AccountQuota | null,
   };
@@ -145,72 +120,87 @@ export function accountHeaders(data: AccountData): Record<string, string> {
     originator: "codex_cli_rs",
     authorization: `Bearer ${data.accessToken}`,
   };
-  const accountId = chatGptAccountId(data.accessToken);
+  const accountId = data.accountId ?? chatGptAccountId(data.accessToken);
   if (accountId) headers["ChatGPT-Account-Id"] = accountId;
   return headers;
 }
 
-function clampPercent(value: number): number {
-  return Math.max(0, Math.min(100, value));
-}
-
 function resetAtMs(window: Record<string, unknown>, nowMs: number): number | null {
-  const resetAt = window.reset_at ?? window.resetAt;
-  const numeric = number(resetAt);
-  if (numeric !== null) return numeric > 10_000_000_000 ? numeric : numeric * 1000;
-  if (typeof resetAt === "string") {
-    const parsed = Date.parse(resetAt);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  const afterSeconds = number(window.reset_after_seconds ?? window.resetAfterSeconds);
+  const explicit = timestampMs(window.reset_at);
+  if (explicit !== null) return explicit;
+  const afterSeconds = number(window.reset_after_seconds);
   return afterSeconds === null ? null : nowMs + afterSeconds * 1000;
 }
 
 function quotaWindow(value: unknown, nowMs: number): QuotaWindow | null {
   const window = object(value);
   if (!window) return null;
-  const used = number(window.used_percent ?? window.usedPercent);
-  const remaining = used === null
-    ? number(window.remaining_percent ?? window.remainingPercent)
-    : clampPercent(100 - used);
+  const used = number(window.used_percent);
+  const remaining = used === null ? number(window.remaining_percent) : clampPercent(100 - used);
   return {
-    usedPercent: used === null
-      ? (remaining === null ? null : clampPercent(100 - remaining))
-      : clampPercent(used),
     remainingPercent: remaining === null ? null : clampPercent(remaining),
     resetAtMs: resetAtMs(window, nowMs),
   };
 }
 
-function planLabel(value: unknown): string | null {
-  const plan = text(value);
-  if (!plan) return null;
-  const labels: Record<string, string> = {
-    plus: "ChatGPT Plus",
-    pro: "ChatGPT Pro",
-    team: "ChatGPT Team",
-    business: "ChatGPT Business",
-    enterprise: "ChatGPT Enterprise",
-    free: "ChatGPT Free",
-    go: "ChatGPT Go",
-  };
-  return labels[plan.toLowerCase()] ?? plan;
+const FIVE_HOURS_S = FIVE_HOURS_MS / 1000;
+const WEEK_S = 7 * 24 * 60 * 60;
+
+/** 按官方 limit_window_seconds 判定窗口类型;长度未知时回退到 primary/secondary 位置。 */
+function windowKind(
+  window: Record<string, unknown>,
+  fallback: "five-hour" | "weekly",
+): "five-hour" | "weekly" | "monthly" {
+  const seconds = number(window.limit_window_seconds);
+  if (seconds !== null) {
+    if (seconds <= FIVE_HOURS_S) return "five-hour";
+    if (seconds <= WEEK_S) return "weekly";
+    return "monthly";
+  }
+  return fallback;
 }
 
 export function parseCodexUsage(body: unknown, nowMs = Date.now()): AccountQuota {
   const root = object(body) ?? {};
-  const rateLimit = object(root.rate_limit ?? root.rateLimit) ?? root;
-  const primary = rateLimit.primary_window ?? rateLimit.primaryWindow;
-  const secondary = rateLimit.secondary_window ?? rateLimit.secondaryWindow;
-  const weekly = quotaWindow(secondary ?? primary, nowMs);
-  const fiveHour = secondary === undefined || secondary === null
-    ? null
-    : quotaWindow(primary, nowMs);
-  const explicitLimit = rateLimit.limit_reached ?? rateLimit.limitReached;
+  // 上游字段均为 snake_case(与 codex CLI / sub2api 的结构体一致)。
+  const rateLimit = object(root.rate_limit) ?? {};
+  const primaryValue = rateLimit.primary_window;
+  const secondaryValue = rateLimit.secondary_window;
+  const primaryObject = object(primaryValue);
+  const secondaryObject = object(secondaryValue);
+  let fiveHour: QuotaWindow | null = null;
+  let weekly: QuotaWindow | null = null;
+  let monthly: QuotaWindow | null = null;
+  if (secondaryObject !== null) {
+    // 双窗口:按窗口长度归类,而不是按位置猜。
+    const primaryKind = windowKind(primaryObject ?? {}, "five-hour");
+    const secondaryKind = windowKind(secondaryObject, "weekly");
+    const primaryWindow = quotaWindow(primaryValue, nowMs);
+    const secondaryWindow = quotaWindow(secondaryValue, nowMs);
+    if (primaryKind === "five-hour") fiveHour = primaryWindow;
+    else if (primaryKind === "weekly") weekly = primaryWindow;
+    else monthly = primaryWindow;
+    if (secondaryKind === "five-hour") fiveHour = fiveHour ?? secondaryWindow;
+    else if (secondaryKind === "weekly") weekly = weekly ?? secondaryWindow;
+    else monthly = monthly ?? secondaryWindow;
+  } else if (primaryObject !== null) {
+    const kind = windowKind(primaryObject, "weekly");
+    const window = quotaWindow(primaryValue, nowMs);
+    if (kind === "five-hour") fiveHour = window;
+    else if (kind === "weekly") weekly = window;
+    else monthly = window;
+  }
+  const explicitLimit = rateLimit.limit_reached;
+  const resetCredits = object(root.rate_limit_reset_credits);
+  const resetCreditsAvailable = number(resetCredits?.available_count);
   return {
-    planLabel: planLabel(root.plan_type ?? root.planType),
+    planType: text(root.plan_type),
     weekly,
     fiveHour,
+    monthly,
+    resetCreditsAvailable: resetCreditsAvailable === null
+      ? null
+      : Math.max(0, Math.floor(resetCreditsAvailable)),
     limitReached: typeof explicitLimit === "boolean" ? explicitLimit : [weekly, fiveHour].some(
       (window) => window?.remainingPercent !== null && window?.remainingPercent === 0,
     ),
@@ -228,6 +218,7 @@ export function quotaCoolingUntil(quota: AccountQuota, nowMs = Date.now()): numb
   const resets = [
     windowCoolingUntil(quota.weekly, nowMs),
     windowCoolingUntil(quota.fiveHour, nowMs),
+    windowCoolingUntil(quota.monthly, nowMs),
   ].filter((value): value is number => value !== null);
   if (resets.length > 0) return Math.max(...resets);
   return quota.limitReached ? nowMs + FIVE_HOURS_MS : null;
@@ -264,13 +255,14 @@ export function quotaExhaustedPatch(
   nowMs = Date.now(),
 ): ResourcePatch {
   const quota: AccountQuota = {
-    planLabel: data.quota?.planLabel ?? null,
+    planType: data.quota?.planType ?? null,
     weekly: data.quota?.weekly ?? null,
     fiveHour: {
-      usedPercent: 100,
       remainingPercent: 0,
       resetAtMs: resetFromError(error, nowMs),
     },
+    monthly: data.quota?.monthly ?? null,
+    resetCreditsAvailable: data.quota?.resetCreditsAvailable ?? null,
     limitReached: true,
     updatedAtMs: nowMs,
   };
@@ -280,33 +272,171 @@ export function quotaExhaustedPatch(
   };
 }
 
+async function fetchResetCredits(
+  data: AccountData,
+  context: PluginContext,
+): Promise<{ cards: ResourceActionCard[]; availableCount: number }> {
+  const accountId = data.accountId ?? chatGptAccountId(data.accessToken);
+  if (!accountId) throw new Error("ChatGPT account is missing its account ID");
+  const response = await context.network.fetch(RESET_CREDITS_URL, {
+    method: "GET",
+    headers: accountHeaders(data),
+  });
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(
+      `Codex reset card lookup failed (HTTP ${response.status}): ${response.body}`,
+    );
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(response.body);
+  } catch {
+    throw new Error("Codex reset card lookup returned invalid JSON");
+  }
+  const root = object(body) ?? {};
+  const rawCredits = Array.isArray(root.credits) ? root.credits : [];
+  const cards = rawCredits.flatMap((value, index): ResourceActionCard[] => {
+    const credit = object(value);
+    const id = text(credit?.id);
+    if (!id) return [];
+    const resetType = text(credit?.reset_type ?? credit?.resetType);
+    const grantedAt = timestampMs(credit?.granted_at ?? credit?.grantedAt);
+    const expiresAt = timestampMs(credit?.expires_at ?? credit?.expiresAt);
+    return [{
+      id,
+      title: text(credit?.title) ?? resetType ?? `Codex reset card ${index + 1}`,
+      ...(text(credit?.status) ? { status: text(credit?.status)! } : {}),
+      ...(grantedAt !== null ? { grantedAtMs: grantedAt } : {}),
+      ...(expiresAt !== null ? { expiresAtMs: expiresAt } : {}),
+      fields: resetType
+        ? [{
+          id: "reset-type",
+          label: { "en-US": "Reset type", "zh-CN": "重置类型" },
+          value: resetType,
+        }]
+        : [],
+    }];
+  });
+  const availableCount = number(root.available_count ?? root.availableCount);
+  return {
+    cards,
+    availableCount: availableCount === null
+      ? cards.filter((card) => card.status === "available").length
+      : Math.max(0, Math.floor(availableCount)),
+  };
+}
+
+function actionDescription(availableCount: number): ResourceActionResult["description"] {
+  return {
+    "en-US": `${availableCount} reset card${availableCount === 1 ? "" : "s"} available`,
+    "zh-CN": `可用重置卡 ${availableCount} 张`,
+  };
+}
+
+async function listResetCards(
+  resource: ResourceSnapshot,
+  _input: JsonValue,
+  context: PluginContext,
+): Promise<ResourceActionResult> {
+  const result = await fetchResetCredits(accountData(resource), context);
+  return {
+    title: { "en-US": "Codex reset cards", "zh-CN": "Codex 重置卡" },
+    description: actionDescription(result.availableCount),
+    cards: result.cards,
+  };
+}
+
+async function consumeResetCard(
+  resource: ResourceSnapshot,
+  input: JsonValue,
+  context: PluginContext,
+): Promise<ResourceActionResult> {
+  const inputObject = object(input);
+  const creditId = text(inputObject?.creditId ?? inputObject?.cardId);
+  if (!creditId) throw new Error("A reset card ID is required");
+
+  const data = accountData(resource);
+  const available = await fetchResetCredits(data, context);
+  const card = available.cards.find((item) => item.id === creditId && item.status === "available");
+  if (!card) throw new Error("The selected reset card is not available");
+
+  const response = await context.network.fetch(RESET_CREDITS_CONSUME_URL, {
+    method: "POST",
+    headers: { ...accountHeaders(data), "content-type": "application/json" },
+    body: JSON.stringify({ credit_id: creditId, redeem_request_id: crypto.randomUUID() }),
+  });
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(
+      `Codex reset card consumption failed (HTTP ${response.status}): ${response.body}`,
+    );
+  }
+
+  const patch = await refreshAccount(resource, context);
+  const refreshedResource: ResourceSnapshot = {
+    ...resource,
+    ...(patch.privateData ? { privateData: patch.privateData } : {}),
+  };
+  const refreshed = await fetchResetCredits(accountData(refreshedResource), context);
+  return {
+    title: { "en-US": "Codex reset card used", "zh-CN": "Codex 重置卡已使用" },
+    description: actionDescription(refreshed.availableCount),
+    cards: refreshed.cards,
+    patch,
+  };
+}
+
+export const listResetCardsAction: ResourceAction = {
+  id: LIST_RESET_CARDS_ACTION_ID,
+  displayName: { "en-US": "View reset cards", "zh-CN": "查看重置卡" },
+  description: {
+    "en-US": "List available Codex reset cards.",
+    "zh-CN": "查看当前账号的 Codex 重置卡。",
+  },
+  target: "resource",
+  run: listResetCards,
+};
+
+export const consumeResetCardAction: ResourceAction = {
+  id: CONSUME_RESET_CARD_ACTION_ID,
+  displayName: { "en-US": "Use reset card", "zh-CN": "使用重置卡" },
+  description: {
+    "en-US": "Redeem one available Codex reset card.",
+    "zh-CN": "消耗一张可用的 Codex 重置卡。",
+  },
+  target: "card",
+  destructive: true,
+  run: consumeResetCard,
+};
+
+/** 官方 plan_type 枚举 → 桌面档位徽章文案(大写)。仅列出非简单大写的重命名,其余由 fallback 大写。 */
+export function planTier(value: unknown): string | null {
+  const plan = text(value)?.toLowerCase();
+  if (!plan) return null;
+  const renames: Record<string, string> = {
+    team: "BUSINESS", // team 已更名 business,旧值仍按 BUSINESS 显示
+    promax: "PRO MAX",
+    prolite: "PRO",
+  };
+  return renames[plan] ?? plan.toUpperCase();
+}
+
 export function presentAccount(resource: ResourceSnapshot): ResourceView {
   const data = accountData(resource);
-  const metrics: ResourceMetric[] = [];
-  const weekly = data.quota?.weekly;
-  if (weekly && weekly.remainingPercent !== null) {
+  const metrics = quotaWindowMetrics(data.quota ?? {});
+  const resetCreditsAvailable = data.quota?.resetCreditsAvailable;
+  if (resetCreditsAvailable !== null && resetCreditsAvailable !== undefined) {
     metrics.push({
-      id: "weekly",
-      label: { "en-US": "Weekly quota", "zh-CN": "周额度" },
-      unit: "percent",
-      value: weekly.remainingPercent,
-      ...(weekly.resetAtMs !== null ? { resetAtMs: weekly.resetAtMs } : {}),
+      id: "reset-credits",
+      label: { "en-US": "Reset cards", "zh-CN": "重置卡" },
+      unit: "count",
+      value: resetCreditsAvailable,
     });
   }
-  const fiveHour = data.quota?.fiveHour;
-  if (fiveHour && fiveHour.remainingPercent !== null) {
-    metrics.push({
-      id: "five-hour",
-      label: { "en-US": "5-hour window", "zh-CN": "5 小时窗口" },
-      unit: "percent",
-      value: fiveHour.remainingPercent,
-      ...(fiveHour.resetAtMs !== null ? { resetAtMs: fiveHour.resetAtMs } : {}),
-    });
-  }
+  const tier = planTier(data.quota?.planType);
   return {
     // 旧记录可能存的是账号 ID;展示时优先从 token 现算邮箱。
     displayName: jwtDisplayName(data.accessToken) ?? data.displayName,
-    ...(data.quota?.planLabel ? { description: data.quota.planLabel } : {}),
+    ...(tier ? { tier } : {}),
     ...(metrics.length > 0 ? { metrics } : {}),
   };
 }
@@ -341,71 +471,23 @@ export async function refreshAccount(
   };
 }
 
-function firstText(source: Record<string, unknown>, keys: string[]): string | null {
-  for (const key of keys) {
-    const value = text(source[key]);
-    if (value) return value;
-  }
-  return null;
-}
-
 function jwtDisplayName(token: string | null): string | null {
   if (!token) return null;
   const payload = decodeJwtPayload(token);
-  return claim(payload, "email") ?? profileEmail(payload) ??
-    claim(payload, "preferred_username") ?? claim(payload, "name");
-}
-
-function collectCredentials(value: unknown, output: CredentialCandidate[]): void {
-  if (Array.isArray(value)) {
-    for (const item of value) collectCredentials(item, output);
-    return;
-  }
-  const item = object(value);
-  if (!item || item.disabled === true) return;
-  for (const key of ["accounts", "credentials", "items"]) {
-    if (Array.isArray(item[key])) {
-      collectCredentials(item[key], output);
-      return;
-    }
-  }
-  const tokens = object(item.tokens) ?? item;
-  const accessToken = firstText(tokens, ["access_token", "accessToken", "token", "key"]) ??
-    firstText(item, ["access_token", "accessToken", "token", "key", "OPENAI_API_KEY"]);
-  if (!accessToken) return;
-  const refreshToken = firstText(tokens, ["refresh_token", "refreshToken"]) ??
-    firstText(item, ["refresh_token", "refreshToken"]);
-  const idToken = firstText(tokens, ["id_token", "idToken"]) ??
-    firstText(item, ["id_token", "idToken"]);
-  const displayName = firstText(item, ["email", "display_name", "displayName", "name"]) ??
-    firstText(tokens, ["email", "display_name", "displayName", "name"]) ??
-    jwtDisplayName(idToken);
-  output.push({ accessToken, refreshToken, displayName });
+  return jwtClaim(payload, "email") ?? profileEmail(payload) ??
+    jwtClaim(payload, "preferred_username") ?? jwtClaim(payload, "name");
 }
 
 export function parseCredentialFiles(files: ResourceImportFile[]): {
   credentials: CredentialCandidate[];
   warnings: string[];
 } {
-  const credentials: CredentialCandidate[] = [];
-  const warnings: string[] = [];
-  for (const file of files) {
-    let content: unknown;
-    try {
-      content = JSON.parse(file.content);
-    } catch {
-      warnings.push(`${file.name}: not valid JSON`);
-      continue;
-    }
-    const found: CredentialCandidate[] = [];
-    collectCredentials(content, found);
-    if (found.length === 0) {
-      warnings.push(`${file.name}: no ChatGPT access token found`);
-      continue;
-    }
-    credentials.push(...found);
+  const result = parseCredentialFilesShared(files, "ChatGPT", "OPENAI_API_KEY");
+  // ChatGPT 的展示名常在 id_token 的 OpenAI profile 声明里,共享收集器读不到。
+  for (const credential of result.credentials) {
+    credential.displayName = credential.displayName ?? jwtDisplayName(credential.idToken ?? null);
   }
-  return { credentials, warnings };
+  return result;
 }
 
 export const credentialImport: ResourceImportSupport = {
