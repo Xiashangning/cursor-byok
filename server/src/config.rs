@@ -6,10 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use crate::{Error, Result};
 
-const DATA_DIR_NAME: &str = ".cursor-byok-v3";
+const DATA_DIR_NAME: &str = ".cursor-byok";
 const DATABASE_FILE_NAME: &str = "cursor-byok.db";
-const V0049_DATA_DIR_NAME: &str = ".cursor-local-assistant-v2";
-const V0049_CONFIG_FILE_NAME: &str = "config.yaml";
 const DEFAULT_PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -25,14 +23,6 @@ fn managed_data_dir_in(home_dir: &std::path::Path) -> Result<PathBuf> {
     #[cfg(unix)]
     fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))?;
     Ok(data_dir)
-}
-
-pub fn v0049_config_path() -> Result<PathBuf> {
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| Error::Config("cannot resolve user home directory".into()))?;
-    Ok(home_dir
-        .join(V0049_DATA_DIR_NAME)
-        .join(V0049_CONFIG_FILE_NAME))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +51,8 @@ pub struct Config {
     pub provider_stream_idle_timeout: Duration,
     pub console: Option<ConsoleSource>,
     pub use_persisted_ports: bool,
+    /// CURSOR_ACCESS_TOKEN 设置的访问令牌;未设置时由控制层生成并持久化。
+    pub access_token: Option<String>,
     /// 面向用户的应用版本;桌面壳会覆盖为自身版本,用于插件 minAppVersion 门控。
     pub app_version: String,
 }
@@ -73,10 +65,11 @@ pub enum ConsoleSource {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let listen_addr = env::var("CURSOR_LISTEN_ADDR")
+        let listen_addr: SocketAddr = env::var("CURSOR_LISTEN_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:3000".into())
             .parse()
             .map_err(|error| Error::Config(format!("invalid CURSOR_LISTEN_ADDR: {error}")))?;
+        let access_token = env::var("CURSOR_ACCESS_TOKEN").ok();
         let request_timeout = match env::var("CURSOR_PROVIDER_TIMEOUT_SECONDS") {
             Ok(value) => Duration::from_secs(value.parse().map_err(|error| {
                 Error::Config(format!("invalid CURSOR_PROVIDER_TIMEOUT_SECONDS: {error}"))
@@ -114,6 +107,7 @@ impl Config {
             provider_stream_idle_timeout: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT,
             console,
             use_persisted_ports: false,
+            access_token,
             app_version: env!("CARGO_PKG_VERSION").into(),
         })
     }
@@ -128,6 +122,7 @@ impl Config {
             provider_stream_idle_timeout: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT,
             console: None,
             use_persisted_ports: true,
+            access_token: None,
             app_version: env!("CARGO_PKG_VERSION").into(),
         })
     }

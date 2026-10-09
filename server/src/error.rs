@@ -17,6 +17,10 @@ pub enum Error {
     Provider(String),
     #[error("provider error: {message}")]
     ProviderStatus { status: StatusCode, message: String },
+    #[error("provider refusal: {0}")]
+    ProviderRefusal(String),
+    #[error("request body too large: {0}")]
+    RequestTooLarge(String),
     #[error("store error: {0}")]
     Store(String),
     #[error("run was cancelled")]
@@ -50,9 +54,11 @@ impl IntoResponse for Error {
                 StatusCode::BAD_REQUEST
             }
             Self::RunNotFound(_) => StatusCode::NOT_FOUND,
-            Self::Provider(_) | Self::ProviderStatus { .. } | Self::Http(_) => {
-                StatusCode::BAD_GATEWAY
-            }
+            Self::RequestTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Provider(_)
+            | Self::ProviderStatus { .. }
+            | Self::ProviderRefusal(_)
+            | Self::Http(_) => StatusCode::BAD_GATEWAY,
             Self::Cancelled => StatusCode::CONFLICT,
             Self::Store(_)
             | Self::Database(_)
@@ -68,6 +74,7 @@ impl IntoResponse for Error {
             StatusCode::NOT_FOUND => "not_found",
             StatusCode::CONFLICT => "aborted",
             StatusCode::BAD_GATEWAY => "unavailable",
+            StatusCode::PAYLOAD_TOO_LARGE => "resource_exhausted",
             _ => "internal",
         };
         (

@@ -12,7 +12,11 @@ fn main() {
         protoc_bin_vendored::protoc_bin_path().expect("vendored protoc"),
     );
 
+    // 详细记录用描述符集把捕获到的 protobuf 消息渲染成 JSON,避免运行期依赖 proto 源码。
+    let descriptors = PathBuf::from(env::var("OUT_DIR").expect("build output directory"))
+        .join("cursor_protocol_descriptors.bin");
     prost_build::Config::new()
+        .file_descriptor_set_path(&descriptors)
         .compile_protos(
             &protos,
             &[
@@ -47,6 +51,7 @@ fn main() {
             "aiserver Bidi wire schema changed: missing {required}"
         );
     }
+
     // The extracted aiserver file currently contains unrelated duplicate message names, so
     // compiling that entire package would generate invalid Rust. `cursor/proto.rs` defines only
     // the validated Bidi and ErrorDetails wire subsets; agent_v1.proto remains fully generated.

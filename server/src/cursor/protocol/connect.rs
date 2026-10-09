@@ -110,31 +110,58 @@ pub fn proto_bytes(body: Vec<u8>) -> Response<Body> {
     response
 }
 
+/// 单帧 unary 体的判定,decode_unary 与转发方共用同一口径:
+/// 首字节非 END_STREAM 标志且声明长度恰好等于剩余字节数。
+pub fn is_framed_unary(body: &[u8]) -> bool {
+    body.len() >= 5
+        && body[0] & END_STREAM_FLAG == 0
+        && u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize == body.len() - 5
+}
+
 pub fn decode_unary<M: Message + Default>(body: &[u8]) -> Result<M> {
-    if body.len() >= 5 {
-        let flags = body[0];
-        let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-        if flags & END_STREAM_FLAG == 0 && length == body.len() - 5 {
-            return Ok(M::decode(&body[5..])?);
-        }
+    if is_framed_unary(body) {
+        return Ok(M::decode(&body[5..])?);
     }
     Ok(M::decode(body)?)
 }
 
-pub fn decode_frames(mut body: &[u8]) -> Result<Vec<(u8, Bytes)>> {
-    let mut frames = Vec::new();
-    while !body.is_empty() {
-        if body.len() < 5 {
-            return Err(Error::Protocol("truncated Connect envelope".into()));
+/// Incremental Connect envelopes: HTTP chunks may split or combine frames.
+#[derive(Default)]
+pub struct FrameDecoder {
+    pending: BytesMut,
+}
+
+impl FrameDecoder {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<(u8, Bytes)>> {
+        self.pending.extend_from_slice(chunk);
+        let mut frames = Vec::new();
+        while self.pending.len() >= 5 {
+            let length = u32::from_be_bytes(self.pending[1..5].try_into().unwrap()) as usize;
+            if length > 64 * 1024 * 1024 {
+                self.pending.clear();
+                return Err(Error::Protocol("Connect frame exceeds 64 MiB".into()));
+            }
+            if self.pending.len() < length + 5 {
+                break;
+            }
+            let frame = self.pending.split_to(length + 5).freeze();
+            frames.push((frame[0], frame.slice(5..)));
         }
-        let flags = body[0];
-        let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-        body = &body[5..];
-        if body.len() < length {
-            return Err(Error::Protocol("truncated Connect payload".into()));
-        }
-        frames.push((flags, Bytes::copy_from_slice(&body[..length])));
-        body = &body[length..];
+        Ok(frames)
     }
+
+    pub fn finish(&self) -> Result<()> {
+        if self.pending.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Protocol("truncated Connect envelope".into()))
+        }
+    }
+}
+
+pub fn decode_frames(body: &[u8]) -> Result<Vec<(u8, Bytes)>> {
+    let mut decoder = FrameDecoder::default();
+    let frames = decoder.push(body)?;
+    decoder.finish()?;
     Ok(frames)
 }

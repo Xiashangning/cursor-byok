@@ -98,6 +98,7 @@ pub mod aiserver {
             #[repr(i32)]
             pub enum Error {
                 Unspecified = 0,
+                BadModelName = 5,
                 CustomMessage = 29,
                 ProviderError = 57,
                 Internal = 59,

@@ -6,52 +6,52 @@ import "google/protobuf/empty.proto";
 
 option go_package = "github.com/leookun/cursor-byok/cursor-proto/gen/anyrun/v1;anyrunv1";
 
-// Copied from: local:anyrun.v1.AllowedDomain (var: kt)
+// Copied from: local:anyrun.v1.AllowedDomain (var: mt)
 message AllowedDomain {
   string domain = 1;
 }
 
-// Copied from: local:anyrun.v1.AllowedTcpDestination (var: wt)
+// Copied from: local:anyrun.v1.AllowedTcpDestination (var: ct)
 message AllowedTcpDestination {
   string cidr = 1;
   uint32 port = 2;
 }
 
-// Copied from: local:anyrun.v1.AntiAffinityTags (var: it)
+// Copied from: local:anyrun.v1.AntiAffinityTags (var: ze)
 message AntiAffinityTags {
   repeated string tags = 1;
 }
 
-// Copied from: local:anyrun.v1.AnygressLocalPodDenyRules (var: st)
+// Copied from: local:anyrun.v1.AnygressLocalPodDenyRules (var: Ke)
 message AnygressLocalPodDenyRules {
   uint32 version = 1;
   string pod_id = 2;
   AnygressPerPodDenyRules deny_rules = 3;
 }
 
-// Copied from: local:anyrun.v1.AnygressPerPodDenyRules (var: rt)
+// Copied from: local:anyrun.v1.AnygressPerPodDenyRules (var: Ye)
 message AnygressPerPodDenyRules {
   map<string, AnygressPodDenyRuleList> denies = 1;
 }
 
-// Copied from: local:anyrun.v1.AnygressPodDenyRule (var: tt)
+// Copied from: local:anyrun.v1.AnygressPodDenyRule (var: He)
 message AnygressPodDenyRule {
   string verb = 1;
   string path = 2;
 }
 
-// Copied from: local:anyrun.v1.AnygressPodDenyRuleList (var: nt)
+// Copied from: local:anyrun.v1.AnygressPodDenyRuleList (var: Ve)
 message AnygressPodDenyRuleList {
   repeated AnygressPodDenyRule rules = 1;
 }
 
-// Copied from: local:anyrun.v1.AttachProcessRequest (var: q)
+// Copied from: local:anyrun.v1.AttachProcessRequest (var: J)
 message AttachProcessRequest {
   int64 pid = 1;
   optional string last_event_id = 2;
 }
 
-// Copied from: local:anyrun.v1.BlobStorageFormat (var: A)
+// Copied from: local:anyrun.v1.BlobStorageFormat (var: f)
 enum BlobStorageFormat {
   BLOB_STORAGE_FORMAT_LEGACY_UNSPECIFIED = 0;
   BLOB_STORAGE_FORMAT_V1 = 1;
@@ -59,24 +59,22 @@ enum BlobStorageFormat {
   BLOB_STORAGE_FORMAT_V2 = 3;
   BLOB_STORAGE_FORMAT_V2_LAYERED = 4;
   BLOB_STORAGE_FORMAT_V3 = 5;
-  BLOB_STORAGE_FORMAT_VM_SNAPSHOT_V2 = 6;
-  BLOB_STORAGE_FORMAT_V4 = 7;
 }
 
-// Copied from: local:anyrun.v1.Build (var: ct)
+// Copied from: local:anyrun.v1.Build (var: et)
 message Build {
   string dockerfile = 1;
   string context = 2;
 }
 
-// Copied from: local:anyrun.v1.BuildStatusLine (var: xau)
+// Copied from: local:anyrun.v1.BuildStatusLine (var: _vu)
 message BuildStatusLine {
   uint32 stream_id = 1;
   string timestamp = 2;
   string content = 3;
 }
 
-// Copied from: local:anyrun.v1.BuildStepStarted (var: Eau)
+// Copied from: local:anyrun.v1.BuildStepStarted (var: bvu)
 message BuildStepStarted {
   uint32 stream_id = 1;
   uint32 step = 2;
@@ -84,60 +82,36 @@ message BuildStepStarted {
   string command = 4;
 }
 
-// Copied from: local:anyrun.v1.CaptureErrorTag (var: u)
-enum CaptureErrorTag {
-  CAPTURE_ERROR_TAG_UNSPECIFIED = 0;
-  CAPTURE_ERROR_TAG_INVALID_IMAGE_USER = 1;
-}
-
-// Copied from: local:anyrun.v1.CaptureErrorType (var: l)
-enum CaptureErrorType {
-  CAPTURE_ERROR_TYPE_UNSPECIFIED = 0;
-  CAPTURE_ERROR_TYPE_SYSTEM = 1;
-  CAPTURE_ERROR_TYPE_USER = 2;
-}
-
-// Copied from: local:anyrun.v1.CaptureFailureDetails (var: Fe)
-message CaptureFailureDetails {
-  CaptureErrorType error_type = 1;
-  CaptureErrorTag error_tag = 2;
-  bool is_client_error = 4;
-  oneof details {
-    InvalidImageUserFailure invalid_image_user = 3;
-  }
-}
-
-// Copied from: local:anyrun.v1.CloneCompleted (var: Lau)
+// Copied from: local:anyrun.v1.CloneCompleted (var: Tvu)
 message CloneCompleted {
   ClonePurpose purpose = 1;
 }
 
-// Copied from: local:anyrun.v1.ClonePurpose (var: Pkn)
+// Copied from: local:anyrun.v1.ClonePurpose (var: ybn)
 enum ClonePurpose {
   CLONE_PURPOSE_UNSPECIFIED = 0;
   CLONE_PURPOSE_DOCKER_BUILD = 1;
   CLONE_PURPOSE_WORKSPACE_SETUP = 2;
 }
 
-// Copied from: local:anyrun.v1.CloneStarted (var: Pau)
+// Copied from: local:anyrun.v1.CloneStarted (var: xvu)
 message CloneStarted {
   ClonePurpose purpose = 1;
 }
 
-// Copied from: local:anyrun.v1.ContainerRuntime (var: g)
+// Copied from: local:anyrun.v1.ContainerRuntime (var: d)
 enum ContainerRuntime {
   CONTAINER_RUNTIME_DOCKERD_UNSPECIFIED = 0;
   CONTAINER_RUNTIME_ISOD_RUNC = 1;
-  CONTAINER_RUNTIME_WINDOWS_GUEST = 2;
 }
 
-// Copied from: local:anyrun.v1.ContainerWaitFailure (var: Gau)
+// Copied from: local:anyrun.v1.ContainerWaitFailure (var: Uvu)
 message ContainerWaitFailure {
   int64 exit_code = 1;
   string message = 2;
 }
 
-// Copied from: local:anyrun.v1.CreateProcessRequest (var: M)
+// Copied from: local:anyrun.v1.CreateProcessRequest (var: v)
 message CreateProcessRequest {
   repeated string command = 1;
   string user = 2;
@@ -145,23 +119,22 @@ message CreateProcessRequest {
   map<string, string> env = 4;
   optional string idempotency_key = 5;
   optional ProcessSupervision supervision = 6;
-  optional ProcessSupervision durable_supervision = 7;
 }
 
-// Copied from: local:anyrun.v1.CreateProcessResponse (var: L)
+// Copied from: local:anyrun.v1.CreateProcessResponse (var: B)
 message CreateProcessResponse {
   int64 pid = 1;
   bool reused_existing_pid = 2;
   optional int64 process_pid = 3;
 }
 
-// Copied from: local:anyrun.v1.DaemonCommandHandlerPersistentState (var: jt)
+// Copied from: local:anyrun.v1.DaemonCommandHandlerPersistentState (var: Lt)
 message DaemonCommandHandlerPersistentState {
   int64 vpid = 1;
   optional string last_event_id = 2;
 }
 
-// Copied from: local:anyrun.v1.DaemonPod (var: Tn)
+// Copied from: local:anyrun.v1.DaemonPod (var: nn)
 message DaemonPod {
   PodStatus status = 2;
   optional uint32 internal_proxy_port = 3;
@@ -172,7 +145,7 @@ message DaemonPod {
   optional uint64 started_from_checkpoint_creation_timestamp = 7;
 }
 
-// Copied from: local:anyrun.v1.DefaultPortConfig (var: Ue)
+// Copied from: local:anyrun.v1.DefaultPortConfig (var: Ce)
 message DefaultPortConfig {
   oneof authentication {
     google.protobuf.Empty open = 3;
@@ -184,9 +157,9 @@ message DefaultPortConfig {
   }
 }
 
-// Copied from: local:anyrun.v1.DevContainerConfig (var: mt)
+// Copied from: local:anyrun.v1.DevContainerConfig (var: $e)
 message DevContainerConfig {
-  // Copied from: local:anyrun.v1.DevContainerConfig.RegistryReferenceAlias (var: y)
+  // Copied from: local:anyrun.v1.DevContainerConfig.RegistryReferenceAlias (var: g)
   enum RegistryReferenceAlias {
     REGISTRY_REFERENCE_ALIAS_UNSPECIFIED = 0;
     REGISTRY_REFERENCE_ALIAS_BUILDER = 1;
@@ -238,7 +211,7 @@ message DevContainerConfig {
   }
 }
 
-// Copied from: local:anyrun.v1.DevContainerEnv (var: at)
+// Copied from: local:anyrun.v1.DevContainerEnv (var: je)
 message DevContainerEnv {
   string name = 1;
   optional string value_hash = 4;
@@ -248,7 +221,7 @@ message DevContainerEnv {
   }
 }
 
-// Copied from: local:anyrun.v1.DevContainerExecCommand (var: xe)
+// Copied from: local:anyrun.v1.DevContainerExecCommand (var: Ne)
 message DevContainerExecCommand {
   string name = 1;
   optional string user = 2;
@@ -260,10 +233,9 @@ message DevContainerExecCommand {
   bool depends_on_git_checkout = 8;
   optional ProcessSupervision supervision = 9;
   bool ignore_failure_for_install_health = 10;
-  optional ProcessSupervision durable_supervision = 11;
 }
 
-// Copied from: local:anyrun.v1.DevContainerSpec (var: ot)
+// Copied from: local:anyrun.v1.DevContainerSpec (var: We)
 message DevContainerSpec {
   string name = 5;
   optional string platform = 23;
@@ -288,13 +260,9 @@ message DevContainerSpec {
   optional EgressPolicy egress_policy = 26;
   optional AnygressPerPodDenyRules anygress_per_pod_deny_rules = 28;
   optional AntiAffinityTags anti_affinity_tags = 32;
-  optional bool enable_lazy_v3_squashfs_snapshot_load = 34;
-  optional V4RootArchiveOptions v4_root_archive_options = 35;
-  optional bool enable_lazy_v4_load = 36;
-  optional bool enable_writable_ublk_load = 37;
 }
 
-// Copied from: local:anyrun.v1.DirectoryEntry (var: oe)
+// Copied from: local:anyrun.v1.DirectoryEntry (var: j)
 message DirectoryEntry {
   string name = 1;
   string path = 2;
@@ -303,20 +271,20 @@ message DirectoryEntry {
   int64 modified_at_unix_ms = 5;
 }
 
-// Copied from: local:anyrun.v1.DiskUsage (var: Ve)
+// Copied from: local:anyrun.v1.DiskUsage (var: Me)
 message DiskUsage {
   uint64 bytes_used = 1;
   uint64 bytes_total = 2;
   optional double busy_percentage = 3;
 }
 
-// Copied from: local:anyrun.v1.DockerArchiveImage (var: ut)
+// Copied from: local:anyrun.v1.DockerArchiveImage (var: Ze)
 message DockerArchiveImage {
   string url = 1;
   string registry_reference = 2;
 }
 
-// Copied from: local:anyrun.v1.DockerBuildConfig (var: ft)
+// Copied from: local:anyrun.v1.DockerBuildConfig (var: rt)
 message DockerBuildConfig {
   string dockerfile = 1;
   string context = 2;
@@ -327,17 +295,17 @@ message DockerBuildConfig {
   repeated string cache_from_refs = 7;
 }
 
-// Copied from: local:anyrun.v1.DockerBuildFailure (var: Kau)
+// Copied from: local:anyrun.v1.DockerBuildFailure (var: jvu)
 message DockerBuildFailure {
   int64 exit_code = 1;
 }
 
-// Copied from: local:anyrun.v1.DockerBuildResult (var: At)
+// Copied from: local:anyrun.v1.DockerBuildResult (var: it)
 message DockerBuildResult {
   DockerImageRef image = 1;
 }
 
-// Copied from: local:anyrun.v1.DockerBuildSecretEntry (var: pt)
+// Copied from: local:anyrun.v1.DockerBuildSecretEntry (var: nt)
 message DockerBuildSecretEntry {
   string name = 1;
   optional string value_hash = 4;
@@ -347,7 +315,7 @@ message DockerBuildSecretEntry {
   }
 }
 
-// Copied from: local:anyrun.v1.DockerContainerPersistentState (var: Wt)
+// Copied from: local:anyrun.v1.DockerContainerPersistentState (var: bt)
 message DockerContainerPersistentState {
   string id = 1;
   string name = 2;
@@ -358,7 +326,7 @@ message DockerContainerPersistentState {
   optional string isod_container_name = 8;
 }
 
-// Copied from: local:anyrun.v1.DockerDevContainerPersistentState (var: Kt)
+// Copied from: local:anyrun.v1.DockerDevContainerPersistentState (var: Pt)
 message DockerDevContainerPersistentState {
   string name = 1;
   DockerContainerPersistentState container = 2;
@@ -370,10 +338,9 @@ message DockerDevContainerPersistentState {
   uint32 daemon_port = 8;
   WorkspaceConfig workspace = 9;
   bool v2_hydrated = 10;
-  optional string pod_daemon_auth_token = 11;
 }
 
-// Copied from: local:anyrun.v1.DockerImageBuildEvent (var: _t)
+// Copied from: local:anyrun.v1.DockerImageBuildEvent (var: at)
 message DockerImageBuildEvent {
   uint64 creation_timestamp = 1;
   oneof payload {
@@ -389,23 +356,21 @@ message DockerImageBuildEvent {
   }
 }
 
-// Copied from: local:anyrun.v1.DockerImageRef (var: ht)
+// Copied from: local:anyrun.v1.DockerImageRef (var: ot)
 message DockerImageRef {
   string registry_reference = 1;
 }
 
-// Copied from: local:anyrun.v1.DrainingReason (var: m)
+// Copied from: local:anyrun.v1.DrainingReason (var: l)
 enum DrainingReason {
   DRAINING_REASON_UNSPECIFIED = 0;
   DRAINING_REASON_CAPACITY = 1;
   DRAINING_REASON_UPGRADE = 2;
   DRAINING_REASON_MANUAL = 3;
   DRAINING_REASON_HEALTH = 4;
-  DRAINING_REASON_RETIREMENT = 5;
-  DRAINING_REASON_COMPACTION = 6;
 }
 
-// Copied from: local:anyrun.v1.EgressPolicy (var: Tt)
+// Copied from: local:anyrun.v1.EgressPolicy (var: lt)
 message EgressPolicy {
   repeated ScmConfig scm = 3;
   bool use_scm_egress_config = 4;
@@ -415,7 +380,7 @@ message EgressPolicy {
   }
 }
 
-// Copied from: local:anyrun.v1.EgressRestricted (var: yt)
+// Copied from: local:anyrun.v1.EgressRestricted (var: ut)
 message EgressRestricted {
   repeated AllowedDomain allowed_domains = 1;
   repeated AllowedTcpDestination allowed_tcp_destinations = 2;
@@ -429,26 +394,16 @@ enum EntryType {
   ENTRY_TYPE_SYMLINK = 3;
 }
 
-// Copied from: local:anyrun.v1.EnvironmentBuildBootInfo (var: SLs)
+// Copied from: local:anyrun.v1.EnvironmentBuildBootInfo (var: fTs)
 message EnvironmentBuildBootInfo {
-  optional string build_id = 1;
+  string build_id = 1;
   string snapshot_id = 2;
   WorkspaceGitSetupMode workspace_git_setup_mode = 3;
   WarmForkMode warm_fork_mode = 4;
   bool fast_forward_default_branch = 5;
-  EnvironmentBuildResolution resolution = 6;
-  bool default_image_fallback = 7;
 }
 
-// Copied from: local:anyrun.v1.EnvironmentBuildResolution (var: O3t)
-enum EnvironmentBuildResolution {
-  ENVIRONMENT_BUILD_RESOLUTION_UNSPECIFIED = 0;
-  ENVIRONMENT_BUILD_RESOLUTION_RESOLVED = 1;
-  ENVIRONMENT_BUILD_RESOLUTION_NO_FINISHED_BUILDS = 2;
-  ENVIRONMENT_BUILD_RESOLUTION_NO_HEALTHY_BUILDS = 3;
-}
-
-// Copied from: local:anyrun.v1.ExternalSnapshot (var: lt)
+// Copied from: local:anyrun.v1.ExternalSnapshot (var: Xe)
 message ExternalSnapshot {
   string snapshot_id = 1;
   string presigned_url = 2;
@@ -457,41 +412,40 @@ message ExternalSnapshot {
   optional string node_machine_type = 5;
   optional string cpu_baseline_id = 6;
   optional SnapshotUsageStats usage_stats = 7;
-  optional V4RootArchiveOptions v4_root_archive_options = 8;
 }
 
-// Copied from: local:anyrun.v1.FeatureExitCode (var: _Ls)
+// Copied from: local:anyrun.v1.FeatureExitCode (var: mTs)
 message FeatureExitCode {
   string feature_id = 1;
   int64 exit_code = 2;
 }
 
-// Copied from: local:anyrun.v1.FeatureOutput (var: Lkn)
+// Copied from: local:anyrun.v1.FeatureOutput (var: wbn)
 message FeatureOutput {
   string feature_id = 1;
   string output = 2;
 }
 
-// Copied from: local:anyrun.v1.FirecrackerVersion (var: h)
+// Copied from: local:anyrun.v1.FirecrackerVersion (var: p)
 enum FirecrackerVersion {
   FIRECRACKER_VERSION_UNSPECIFIED = 0;
   FIRECRACKER_VERSION_V1_12_1 = 1;
   FIRECRACKER_VERSION_V1_16_1 = 2;
 }
 
-// Copied from: local:anyrun.v1.GetProcessStatusRequest (var: Q)
+// Copied from: local:anyrun.v1.GetProcessStatusRequest (var: b)
 message GetProcessStatusRequest {
   int64 pid = 1;
 }
 
-// Copied from: local:anyrun.v1.GetProcessStatusResponse (var: G)
+// Copied from: local:anyrun.v1.GetProcessStatusResponse (var: M)
 message GetProcessStatusResponse {
-  // Copied from: local:anyrun.v1.GetProcessStatusResponse.Completed (var: V)
+  // Copied from: local:anyrun.v1.GetProcessStatusResponse.Completed (var: F)
   message Completed {
     int32 exit_code = 1;
   }
 
-  // Copied from: local:anyrun.v1.GetProcessStatusResponse.Running (var: H)
+  // Copied from: local:anyrun.v1.GetProcessStatusResponse.Running (var: L)
   message Running {
   }
 
@@ -501,12 +455,12 @@ message GetProcessStatusResponse {
   }
 }
 
-// Copied from: local:anyrun.v1.GitCheckoutFailure (var: Yau)
+// Copied from: local:anyrun.v1.GitCheckoutFailure (var: Hvu)
 message GitCheckoutFailure {
   int64 exit_code = 1;
 }
 
-// Copied from: local:anyrun.v1.GitCloneFailure (var: Qau)
+// Copied from: local:anyrun.v1.GitCloneFailure (var: Wvu)
 message GitCloneFailure {
   int64 exit_code = 1;
   GitCloneFailureCategory category = 2;
@@ -515,7 +469,7 @@ message GitCloneFailure {
   optional int32 http_status = 5;
 }
 
-// Copied from: local:anyrun.v1.GitCloneFailureCategory (var: Uau)
+// Copied from: local:anyrun.v1.GitCloneFailureCategory (var: Mvu)
 enum GitCloneFailureCategory {
   GIT_CLONE_FAILURE_CATEGORY_UNSPECIFIED = 0;
   GIT_CLONE_FAILURE_CATEGORY_IP_ALLOW_LIST = 1;
@@ -528,7 +482,7 @@ enum GitCloneFailureCategory {
   GIT_CLONE_FAILURE_CATEGORY_UPSTREAM_BAD_GATEWAY = 8;
 }
 
-// Copied from: local:anyrun.v1.GitRepoSourceReference (var: We)
+// Copied from: local:anyrun.v1.GitRepoSourceReference (var: qe)
 message GitRepoSourceReference {
   string cache_uri = 1;
   string checkout_uri = 2;
@@ -538,7 +492,7 @@ message GitRepoSourceReference {
   optional string mtls_key_pem = 7;
 }
 
-// Copied from: local:anyrun.v1.HttpHealthCheck (var: $)
+// Copied from: local:anyrun.v1.HttpHealthCheck (var: G)
 message HttpHealthCheck {
   string url = 1;
   string method = 2;
@@ -550,13 +504,13 @@ message HttpHealthCheck {
   uint32 unhealthy_threshold = 8;
 }
 
-// Copied from: local:anyrun.v1.HydrationProgress (var: kau)
+// Copied from: local:anyrun.v1.HydrationProgress (var: fvu)
 message HydrationProgress {
   uint64 transferred = 1;
   uint64 total = 2;
 }
 
-// Copied from: local:anyrun.v1.ImageMetadata (var: qe)
+// Copied from: local:anyrun.v1.ImageMetadata (var: Be)
 message ImageMetadata {
   optional string user = 1;
   map<string, string> env = 2;
@@ -564,13 +518,13 @@ message ImageMetadata {
   optional string arch = 4;
 }
 
-// Copied from: local:anyrun.v1.ImagePullCompleted (var: Dau)
+// Copied from: local:anyrun.v1.ImagePullCompleted (var: Cvu)
 message ImagePullCompleted {
   string image_name = 1;
   string pull_id = 2;
 }
 
-// Copied from: local:anyrun.v1.ImagePullFailure (var: Zau)
+// Copied from: local:anyrun.v1.ImagePullFailure (var: zvu)
 message ImagePullFailure {
   ImagePullFailureCategory category = 1;
   bool retryable = 2;
@@ -578,7 +532,7 @@ message ImagePullFailure {
   optional string repository = 4;
 }
 
-// Copied from: local:anyrun.v1.ImagePullFailureCategory (var: $au)
+// Copied from: local:anyrun.v1.ImagePullFailureCategory (var: Pvu)
 enum ImagePullFailureCategory {
   IMAGE_PULL_FAILURE_CATEGORY_UNSPECIFIED = 0;
   IMAGE_PULL_FAILURE_CATEGORY_DENIED = 1;
@@ -588,7 +542,7 @@ enum ImagePullFailureCategory {
   IMAGE_PULL_FAILURE_CATEGORY_UPSTREAM = 5;
 }
 
-// Copied from: local:anyrun.v1.ImagePullLayerUpdate (var: Iau)
+// Copied from: local:anyrun.v1.ImagePullLayerUpdate (var: Svu)
 message ImagePullLayerUpdate {
   string image_name = 1;
   string pull_id = 2;
@@ -605,26 +559,26 @@ message ImagePullLayerUpdate {
   }
 }
 
-// Copied from: local:anyrun.v1.ImagePullStarted (var: Aau)
+// Copied from: local:anyrun.v1.ImagePullStarted (var: wvu)
 message ImagePullStarted {
   string image_name = 1;
   string pull_id = 2;
 }
 
-// Copied from: local:anyrun.v1.ImagePullStatusUpdate (var: Rau)
+// Copied from: local:anyrun.v1.ImagePullStatusUpdate (var: kvu)
 message ImagePullStatusUpdate {
   string image_name = 1;
   string pull_id = 2;
   string status = 3;
 }
 
-// Copied from: local:anyrun.v1.InlineBuild (var: dt)
+// Copied from: local:anyrun.v1.InlineBuild (var: tt)
 message InlineBuild {
   string dockerfile_contents = 1;
   string context = 2;
 }
 
-// Copied from: local:anyrun.v1.InstallCommand (var: Mau)
+// Copied from: local:anyrun.v1.InstallCommand (var: Evu)
 message InstallCommand {
   string name = 1;
   string command = 2;
@@ -633,23 +587,18 @@ message InstallCommand {
   bool failure_tolerant = 5;
 }
 
-// Copied from: local:anyrun.v1.InstallCommandFailure (var: qau)
+// Copied from: local:anyrun.v1.InstallCommandFailure (var: $vu)
 message InstallCommandFailure {
   bool is_system = 1;
 }
 
-// Copied from: local:anyrun.v1.InternalBuildMessage (var: Tau)
+// Copied from: local:anyrun.v1.InternalBuildMessage (var: yvu)
 message InternalBuildMessage {
   uint32 stream_id = 1;
   string content = 2;
 }
 
-// Copied from: local:anyrun.v1.InvalidImageUserFailure (var: De)
-message InvalidImageUserFailure {
-  string user = 1;
-}
-
-// Copied from: local:anyrun.v1.IsoDevContainerMetadata (var: qt)
+// Copied from: local:anyrun.v1.IsoDevContainerMetadata (var: Et)
 message IsoDevContainerMetadata {
   string name = 1;
   DockerDevContainerPersistentState persistent_state = 2;
@@ -657,14 +606,14 @@ message IsoDevContainerMetadata {
   repeated PersistedDriveDescriptor drive_descriptors = 4;
 }
 
-// Copied from: local:anyrun.v1.IsoEnvBalloonConfig (var: Vt)
+// Copied from: local:anyrun.v1.IsoEnvBalloonConfig (var: Nt)
 message IsoEnvBalloonConfig {
   uint32 amount_mib = 1;
   bool deflate_on_oom = 2;
   optional uint32 stats_polling_interval_s = 3;
 }
 
-// Copied from: local:anyrun.v1.IsoEnvConfig (var: Yt)
+// Copied from: local:anyrun.v1.IsoEnvConfig (var: Rt)
 message IsoEnvConfig {
   uint32 vcpu_count = 1;
   uint32 mem_size_mib = 2;
@@ -675,7 +624,7 @@ message IsoEnvConfig {
   FirecrackerVersion firecracker_version = 7;
 }
 
-// Copied from: local:anyrun.v1.IsoEnvExtraDriveConfig (var: Ht)
+// Copied from: local:anyrun.v1.IsoEnvExtraDriveConfig (var: Ct)
 message IsoEnvExtraDriveConfig {
   IsoEnvExtraDrivePurpose purpose = 1;
   uint32 size_mib = 3;
@@ -684,19 +633,19 @@ message IsoEnvExtraDriveConfig {
   string guest_mount_path = 6;
 }
 
-// Copied from: local:anyrun.v1.IsoEnvExtraDrivePurpose (var: E)
+// Copied from: local:anyrun.v1.IsoEnvExtraDrivePurpose (var: A)
 enum IsoEnvExtraDrivePurpose {
   ISO_ENV_EXTRA_DRIVE_PURPOSE_UNSPECIFIED = 0;
   ISO_ENV_EXTRA_DRIVE_PURPOSE_CHECKPOINT_SCRATCH = 1;
 }
 
-// Copied from: local:anyrun.v1.LifecycleProcessExited (var: _au)
+// Copied from: local:anyrun.v1.LifecycleProcessExited (var: hvu)
 message LifecycleProcessExited {
   int32 exit_code = 1;
   string command_name = 2;
 }
 
-// Copied from: local:anyrun.v1.LifecycleProcessRestarted (var: bau)
+// Copied from: local:anyrun.v1.LifecycleProcessRestarted (var: dvu)
 message LifecycleProcessRestarted {
   uint32 attempt = 1;
   int32 previous_exit_code = 2;
@@ -704,45 +653,45 @@ message LifecycleProcessRestarted {
   string command_name = 4;
 }
 
-// Copied from: local:anyrun.v1.ListDirectoryRequest (var: re)
+// Copied from: local:anyrun.v1.ListDirectoryRequest (var: W)
 message ListDirectoryRequest {
   string path = 1;
   bool include_hidden = 2;
 }
 
-// Copied from: local:anyrun.v1.ListDirectoryResponse (var: se)
+// Copied from: local:anyrun.v1.ListDirectoryResponse (var: z)
 message ListDirectoryResponse {
   repeated DirectoryEntry entries = 1;
 }
 
-// Copied from: local:anyrun.v1.ListProcessesRequest (var: Y)
+// Copied from: local:anyrun.v1.ListProcessesRequest (var: q)
 message ListProcessesRequest {
 }
 
-// Copied from: local:anyrun.v1.ListProcessesResponse (var: W)
+// Copied from: local:anyrun.v1.ListProcessesResponse (var: O)
 message ListProcessesResponse {
   repeated ListedProcess processes = 1;
 }
 
-// Copied from: local:anyrun.v1.ListedProcess (var: K)
+// Copied from: local:anyrun.v1.ListedProcess (var: D)
 message ListedProcess {
   int64 pid = 1;
   GetProcessStatusResponse status = 2;
 }
 
-// Copied from: local:anyrun.v1.LocalDirectoryReference (var: je)
+// Copied from: local:anyrun.v1.LocalDirectoryReference (var: Oe)
 message LocalDirectoryReference {
   string path = 1;
 }
 
-// Copied from: local:anyrun.v1.MemoryUsage (var: Ye)
+// Copied from: local:anyrun.v1.MemoryUsage (var: Le)
 message MemoryUsage {
   uint64 bytes_used = 1;
   uint64 bytes_total = 2;
   uint64 collected_at_timestamp = 3;
 }
 
-// Copied from: local:anyrun.v1.MultiSourceEntry (var: Ze)
+// Copied from: local:anyrun.v1.MultiSourceEntry (var: Qe)
 message MultiSourceEntry {
   string relative_path = 1;
   oneof source {
@@ -754,21 +703,21 @@ message MultiSourceEntry {
   }
 }
 
-// Copied from: local:anyrun.v1.MultiSourceReference (var: et)
+// Copied from: local:anyrun.v1.MultiSourceReference (var: Ge)
 message MultiSourceReference {
   repeated MultiSourceEntry sources = 1;
 }
 
-// Copied from: local:anyrun.v1.NetworkInfo (var: Xt)
+// Copied from: local:anyrun.v1.NetworkInfo (var: Ft)
 message NetworkInfo {
   string ip_address = 1;
 }
 
-// Copied from: local:anyrun.v1.NoopSourceReference (var: $e)
+// Copied from: local:anyrun.v1.NoopSourceReference (var: xe)
 message NoopSourceReference {
 }
 
-// Copied from: local:anyrun.v1.PersistedDevContainerConfig (var: Lt)
+// Copied from: local:anyrun.v1.PersistedDevContainerConfig (var: wt)
 message PersistedDevContainerConfig {
   repeated DevContainerExecCommand prepare_commands = 10;
   repeated DevContainerExecCommand install_commands = 11;
@@ -784,9 +733,6 @@ message PersistedDevContainerConfig {
   optional bool blob_client_resilience_enabled = 26;
   ContainerRuntime container_runtime = 27;
   FirecrackerVersion firecracker_version = 28;
-  optional bool enable_lazy_v3_squashfs_snapshot_load = 29;
-  optional bool enable_lazy_v4_load = 30;
-  optional bool enable_writable_ublk_load = 31;
   oneof image {
     string registry_reference = 5;
     Build build = 6;
@@ -809,28 +755,27 @@ message PersistedDevContainerConfig {
   }
 }
 
-// Copied from: local:anyrun.v1.PersistedDriveDescriptor (var: Ft)
+// Copied from: local:anyrun.v1.PersistedDriveDescriptor (var: St)
 message PersistedDriveDescriptor {
   oneof descriptor {
     PersistedFileDriveDescriptor file_v1 = 1;
     PersistedLazySquashfsDriveDescriptor lazy_squashfs_v1 = 2;
-    PersistedWritableUblkDriveDescriptor writable_ublk_v1 = 3;
   }
 }
 
-// Copied from: local:anyrun.v1.PersistedEnvVar (var: Mt)
+// Copied from: local:anyrun.v1.PersistedEnvVar (var: kt)
 message PersistedEnvVar {
   string name = 1;
   string value = 2;
 }
 
-// Copied from: local:anyrun.v1.PersistedExternalSnapshot (var: bt)
+// Copied from: local:anyrun.v1.PersistedExternalSnapshot (var: yt)
 message PersistedExternalSnapshot {
   string snapshot_id = 1;
   optional string cpu_baseline_id = 2;
 }
 
-// Copied from: local:anyrun.v1.PersistedFileDriveDescriptor (var: Dt)
+// Copied from: local:anyrun.v1.PersistedFileDriveDescriptor (var: It)
 message PersistedFileDriveDescriptor {
   string artifact_reference = 1;
   string drive_id = 2;
@@ -839,48 +784,46 @@ message PersistedFileDriveDescriptor {
   optional uint32 size_mib = 5;
 }
 
-// Copied from: local:anyrun.v1.PersistedGitRepoSource (var: vt)
+// Copied from: local:anyrun.v1.PersistedGitRepoSource (var: pt)
 message PersistedGitRepoSource {
   string cache_uri = 1;
   bytes commit_hash = 2;
 }
 
-// Copied from: local:anyrun.v1.PersistedLazyCheckpointSource (var: xt)
+// Copied from: local:anyrun.v1.PersistedLazyCheckpointSource (var: Jt)
 message PersistedLazyCheckpointSource {
   string tenant_id = 1;
   string checkpoint_id = 2;
 }
 
-// Copied from: local:anyrun.v1.PersistedLazySnapshotSource (var: Ut)
+// Copied from: local:anyrun.v1.PersistedLazySnapshotSource (var: Bt)
 message PersistedLazySnapshotSource {
   string tenant_id = 1;
   string snapshot_id = 2;
 }
 
-// Copied from: local:anyrun.v1.PersistedLazySquashfsDriveDescriptor (var: Ot)
+// Copied from: local:anyrun.v1.PersistedLazySquashfsDriveDescriptor (var: vt)
 message PersistedLazySquashfsDriveDescriptor {
   string drive_id = 1;
   string guest_path = 2;
   uint64 chunk_size = 4;
-  optional BlobStorageFormat blob_storage_format = 6;
-  optional V4RootArchiveOptions v4_root_archive_options = 7;
   oneof source {
     PersistedLazySnapshotSource snapshot = 3;
     PersistedLazyCheckpointSource checkpoint = 5;
   }
 }
 
-// Copied from: local:anyrun.v1.PersistedLocalRepoSource (var: Jt)
+// Copied from: local:anyrun.v1.PersistedLocalRepoSource (var: gt)
 message PersistedLocalRepoSource {
   string path = 1;
 }
 
-// Copied from: local:anyrun.v1.PersistedMultiSource (var: Pt)
+// Copied from: local:anyrun.v1.PersistedMultiSource (var: Tt)
 message PersistedMultiSource {
   repeated PersistedMultiSourceEntry sources = 1;
 }
 
-// Copied from: local:anyrun.v1.PersistedMultiSourceEntry (var: Rt)
+// Copied from: local:anyrun.v1.PersistedMultiSourceEntry (var: _t)
 message PersistedMultiSourceEntry {
   string relative_path = 1;
   oneof source {
@@ -892,39 +835,21 @@ message PersistedMultiSourceEntry {
   }
 }
 
-// Copied from: local:anyrun.v1.PersistedNoopSource (var: Nt)
+// Copied from: local:anyrun.v1.PersistedNoopSource (var: At)
 message PersistedNoopSource {
 }
 
-// Copied from: local:anyrun.v1.PersistedTarGzipUrlSource (var: Ct)
+// Copied from: local:anyrun.v1.PersistedTarGzipUrlSource (var: ht)
 message PersistedTarGzipUrlSource {
   string name = 1;
 }
 
-// Copied from: local:anyrun.v1.PersistedTarRepoSource (var: Bt)
+// Copied from: local:anyrun.v1.PersistedTarRepoSource (var: ft)
 message PersistedTarRepoSource {
   string name = 1;
 }
 
-// Copied from: local:anyrun.v1.PersistedWritableUblkDriveDescriptor (var: Gt)
-message PersistedWritableUblkDriveDescriptor {
-  string drive_id = 1;
-  string guest_path = 2;
-  WritableFilesystem filesystem = 5;
-  string overlay_artifact_reference = 6;
-  uint64 device_size_bytes = 7;
-  oneof source {
-    PersistedLazySnapshotSource snapshot = 3;
-    PersistedLazyCheckpointSource checkpoint = 4;
-    PersistedZeroBlockSource zero = 8;
-  }
-}
-
-// Copied from: local:anyrun.v1.PersistedZeroBlockSource (var: Qt)
-message PersistedZeroBlockSource {
-}
-
-// Copied from: local:anyrun.v1.Pod (var: rn)
+// Copied from: local:anyrun.v1.Pod (var: xt)
 message Pod {
   string tenant_id = 1;
   string pod_id = 2;
@@ -957,17 +882,15 @@ message Pod {
   optional uint64 started_from_checkpoint_creation_timestamp = 29;
   optional AntiAffinityTags anti_affinity_tags = 31;
   optional bool collect_metrics = 32;
-  repeated PodMeshLink mesh_links = 34;
-  ContainerRuntime container_runtime = 35;
 }
 
-// Copied from: local:anyrun.v1.PodCollection (var: sn)
+// Copied from: local:anyrun.v1.PodCollection (var: Qt)
 message PodCollection {
   repeated Pod items = 1;
   optional string next_cursor = 2;
 }
 
-// Copied from: local:anyrun.v1.PodCreatingPhase (var: Bau)
+// Copied from: local:anyrun.v1.PodCreatingPhase (var: Rvu)
 enum PodCreatingPhase {
   POD_CREATING_PHASE_UNSPECIFIED = 0;
   POD_CREATING_PHASE_CLONE = 1;
@@ -975,15 +898,14 @@ enum PodCreatingPhase {
   POD_CREATING_PHASE_POST_CREATE = 3;
   POD_CREATING_PHASE_UPDATE_CONTENT = 4;
   POD_CREATING_PHASE_POST_START = 5;
-  POD_CREATING_PHASE_QUEUED = 6;
 }
 
-// Copied from: local:anyrun.v1.PodCreatingStatus (var: jau)
+// Copied from: local:anyrun.v1.PodCreatingStatus (var: Lvu)
 message PodCreatingStatus {
   PodCreatingPhase phase = 1;
 }
 
-// Copied from: local:anyrun.v1.PodDiskUsage (var: U)
+// Copied from: local:anyrun.v1.PodDiskUsage (var: R)
 message PodDiskUsage {
   string device = 1;
   uint64 usage_bytes = 2;
@@ -991,12 +913,12 @@ message PodDiskUsage {
   string path = 4;
 }
 
-// Copied from: local:anyrun.v1.PodErrorEvent (var: Cau)
+// Copied from: local:anyrun.v1.PodErrorEvent (var: vvu)
 message PodErrorEvent {
   string error_message = 1;
 }
 
-// Copied from: local:anyrun.v1.PodEvent (var: rDi)
+// Copied from: local:anyrun.v1.PodEvent (var: x1i)
 message PodEvent {
   uint64 creation_timestamp = 49;
   oneof payload {
@@ -1058,13 +980,13 @@ message PodEvent {
   }
 }
 
-// Copied from: local:anyrun.v1.PodFailedStatus (var: Hau)
+// Copied from: local:anyrun.v1.PodFailedStatus (var: Ovu)
 message PodFailedStatus {
   string reason = 1;
   optional PodFailureDetails failure_details = 2;
 }
 
-// Copied from: local:anyrun.v1.PodFailureDetails (var: Vau)
+// Copied from: local:anyrun.v1.PodFailureDetails (var: Bvu)
 message PodFailureDetails {
   oneof details {
     InstallCommandFailure install_command_failure = 1;
@@ -1076,34 +998,19 @@ message PodFailureDetails {
   }
 }
 
-// Copied from: local:anyrun.v1.PodFilter (var: an)
+// Copied from: local:anyrun.v1.PodFilter (var: Ht)
 message PodFilter {
   optional string pod_id = 1;
   map<string, string> labels = 2;
 }
 
-// Copied from: local:anyrun.v1.PodIdentity (var: vau)
+// Copied from: local:anyrun.v1.PodIdentity (var: uvu)
 message PodIdentity {
   string tenant_id = 1;
   string pod_id = 2;
 }
 
-// Copied from: local:anyrun.v1.PodMemoryBreakdown (var: O)
-message PodMemoryBreakdown {
-  uint64 all_process_rss_bytes = 1;
-  uint64 process_rss_count = 2;
-  optional uint64 cgroup_anon_bytes = 3;
-  optional uint64 cgroup_file_bytes = 4;
-  optional uint64 cgroup_kernel_bytes = 5;
-}
-
-// Copied from: local:anyrun.v1.PodMeshLink (var: nn)
-message PodMeshLink {
-  string target_pod_id = 1;
-  string virtual_ip = 2;
-}
-
-// Copied from: local:anyrun.v1.PodMetricsSample (var: D)
+// Copied from: local:anyrun.v1.PodMetricsSample (var: N)
 message PodMetricsSample {
   uint64 cpu_usage_mcores = 1;
   uint64 cpu_limit_mcores = 2;
@@ -1127,29 +1034,27 @@ message PodMetricsSample {
   repeated PodDiskUsage disk_usage_by_device = 21;
   uint64 event_stream_subscribers_fell_behind_total = 22;
   double cpu_psi_some_avg10 = 23;
-  PodMemoryBreakdown memory_breakdown = 24;
 }
 
-// Copied from: local:anyrun.v1.PodPorts (var: Zt)
+// Copied from: local:anyrun.v1.PodPorts (var: Dt)
 message PodPorts {
   repeated PortDefinition ports = 1;
   optional DefaultPortConfig default_port_config = 2;
 }
 
-// Copied from: local:anyrun.v1.PodRunningStatus (var: Wau)
+// Copied from: local:anyrun.v1.PodRunningStatus (var: Nvu)
 message PodRunningStatus {
   optional uint64 missed_heartbeat_deadline = 1;
 }
 
-// Copied from: local:anyrun.v1.PodStartCacheSource (var: S)
+// Copied from: local:anyrun.v1.PodStartCacheSource (var: _)
 enum PodStartCacheSource {
   POD_START_CACHE_SOURCE_UNSPECIFIED = 0;
   POD_START_CACHE_SOURCE_NODE_LOCAL_FIRECRACKER_SNAPSHOT = 1;
   POD_START_CACHE_SOURCE_REMOTE_ROOTAR_CHECKPOINT = 2;
-  POD_START_CACHE_SOURCE_NODE_LOCAL_CLOUD_HYPERVISOR_SNAPSHOT = 3;
 }
 
-// Copied from: local:anyrun.v1.PodStatus (var: wLs)
+// Copied from: local:anyrun.v1.PodStatus (var: vTs)
 message PodStatus {
   oneof status {
     PodCreatingStatus creating = 1;
@@ -1159,13 +1064,13 @@ message PodStatus {
   }
 }
 
-// Copied from: local:anyrun.v1.PodTerminatedStatus (var: zau)
+// Copied from: local:anyrun.v1.PodTerminatedStatus (var: Fvu)
 message PodTerminatedStatus {
   string reason = 1;
   optional uint32 exit_code = 2;
 }
 
-// Copied from: local:anyrun.v1.PodUpdate (var: on)
+// Copied from: local:anyrun.v1.PodUpdate (var: Gt)
 message PodUpdate {
   optional string event_id = 1;
   oneof update {
@@ -1176,7 +1081,7 @@ message PodUpdate {
   }
 }
 
-// Copied from: local:anyrun.v1.PortDefinition (var: Oe)
+// Copied from: local:anyrun.v1.PortDefinition (var: Je)
 message PortDefinition {
   string name = 1;
   uint32 port = 2;
@@ -1190,7 +1095,7 @@ message PortDefinition {
   }
 }
 
-// Copied from: local:anyrun.v1.PortState (var: en)
+// Copied from: local:anyrun.v1.PortState (var: Ot)
 message PortState {
   string port_name = 1;
   uint32 container_port = 2;
@@ -1205,7 +1110,7 @@ message PortState {
   }
 }
 
-// Copied from: local:anyrun.v1.PrivateWorkerWaitReason (var: bBe)
+// Copied from: local:anyrun.v1.PrivateWorkerWaitReason (var: yFe)
 enum PrivateWorkerWaitReason {
   PRIVATE_WORKER_WAIT_REASON_UNSPECIFIED = 0;
   PRIVATE_WORKER_WAIT_REASON_NO_CONNECTED_WORKERS = 1;
@@ -1215,7 +1120,7 @@ enum PrivateWorkerWaitReason {
   PRIVATE_WORKER_WAIT_REASON_ALL_BUSY = 5;
 }
 
-// Copied from: local:anyrun.v1.ProcessEvent (var: z)
+// Copied from: local:anyrun.v1.ProcessEvent (var: U)
 message ProcessEvent {
   string event_id = 1;
   oneof data {
@@ -1226,60 +1131,59 @@ message ProcessEvent {
   }
 }
 
-// Copied from: local:anyrun.v1.ProcessExited (var: te)
+// Copied from: local:anyrun.v1.ProcessExited (var: Y)
 message ProcessExited {
   int32 exit_code = 1;
 }
 
-// Copied from: local:anyrun.v1.ProcessRestarted (var: ne)
+// Copied from: local:anyrun.v1.ProcessRestarted (var: K)
 message ProcessRestarted {
   uint32 attempt = 1;
   int32 previous_exit_code = 2;
   RestartReason reason = 3;
 }
 
-// Copied from: local:anyrun.v1.ProcessSupervision (var: j)
+// Copied from: local:anyrun.v1.ProcessSupervision (var: x)
 message ProcessSupervision {
   RestartPolicy restart_policy = 1;
   optional RestartBackoff backoff = 2;
   optional HttpHealthCheck health_check = 3;
-  optional string exclusive_group = 4;
 }
 
-// Copied from: local:anyrun.v1.ProgressDetail (var: yLs)
+// Copied from: local:anyrun.v1.ProgressDetail (var: gTs)
 message ProgressDetail {
   uint64 current = 1;
   uint64 total = 2;
 }
 
-// Copied from: local:anyrun.v1.ReadBinaryFileRequest (var: me)
+// Copied from: local:anyrun.v1.ReadBinaryFileRequest (var: te)
 message ReadBinaryFileRequest {
   string path = 1;
 }
 
-// Copied from: local:anyrun.v1.ReadBinaryFileResponse (var: ce)
+// Copied from: local:anyrun.v1.ReadBinaryFileResponse (var: ne)
 message ReadBinaryFileResponse {
   bytes content = 1;
 }
 
-// Copied from: local:anyrun.v1.ReadTextFileRequest (var: ie)
+// Copied from: local:anyrun.v1.ReadTextFileRequest (var: X)
 message ReadTextFileRequest {
   string path = 1;
 }
 
-// Copied from: local:anyrun.v1.ReadTextFileResponse (var: ae)
+// Copied from: local:anyrun.v1.ReadTextFileResponse (var: Z)
 message ReadTextFileResponse {
   string content = 1;
 }
 
-// Copied from: local:anyrun.v1.RegistryCredentials (var: gt)
+// Copied from: local:anyrun.v1.RegistryCredentials (var: st)
 message RegistryCredentials {
   string registry_url = 1;
   string username = 2;
   string password = 3;
 }
 
-// Copied from: local:anyrun.v1.ResourceLimits (var: Ge)
+// Copied from: local:anyrun.v1.ResourceLimits (var: Pe)
 message ResourceLimits {
   optional uint64 cpu_mcores = 1;
   optional uint64 memory_mb = 2;
@@ -1287,7 +1191,7 @@ message ResourceLimits {
   optional uint64 swap_mb = 4;
 }
 
-// Copied from: local:anyrun.v1.ResourceRequests (var: Qe)
+// Copied from: local:anyrun.v1.ResourceRequests (var: Re)
 message ResourceRequests {
   uint64 cpu_mcores = 1;
   uint64 memory_mb = 2;
@@ -1295,7 +1199,7 @@ message ResourceRequests {
   uint64 gpu_count = 4;
 }
 
-// Copied from: local:anyrun.v1.RestartBackoff (var: X)
+// Copied from: local:anyrun.v1.RestartBackoff (var: Q)
 message RestartBackoff {
   uint32 initial_ms = 1;
   uint32 max_ms = 2;
@@ -1311,42 +1215,21 @@ enum RestartPolicy {
   RESTART_POLICY_ALWAYS = 3;
 }
 
-// Copied from: local:anyrun.v1.RestartReason (var: gau)
+// Copied from: local:anyrun.v1.RestartReason (var: cvu)
 enum RestartReason {
   RESTART_REASON_UNSPECIFIED = 0;
   RESTART_REASON_PROCESS_EXITED = 1;
   RESTART_REASON_HEALTH_CHECK_FAILED = 2;
 }
 
-// Copied from: local:anyrun.v1.RootArchiveCompressionAlgorithm (var: T)
-enum RootArchiveCompressionAlgorithm {
-  ROOT_ARCHIVE_COMPRESSION_ALGORITHM_NONE = 0;
-  ROOT_ARCHIVE_COMPRESSION_ALGORITHM_ZSTD = 1;
-}
-
-// Copied from: local:anyrun.v1.RootArchiveFormat (var: _)
-enum RootArchiveFormat {
-  ROOT_ARCHIVE_FORMAT_UNSPECIFIED = 0;
-  ROOT_ARCHIVE_FORMAT_EXT4 = 1;
-  ROOT_ARCHIVE_FORMAT_SQUASHFS = 2;
-  ROOT_ARCHIVE_FORMAT_EROFS = 3;
-}
-
-// Copied from: local:anyrun.v1.RootArchivePayloadSummary (var: St)
-message RootArchivePayloadSummary {
-  uint64 logical_payload_length = 1;
-  RootArchiveCompressionAlgorithm compression_algorithm = 2;
-  uint64 compression_block_size = 3;
-}
-
-// Copied from: local:anyrun.v1.RuntimeStatePersistentState (var: zt)
+// Copied from: local:anyrun.v1.RuntimeStatePersistentState (var: Mt)
 message RuntimeStatePersistentState {
   map<string, DaemonCommandHandlerPersistentState> command_handlers = 1;
 }
 
-// Copied from: local:anyrun.v1.ScmConfig (var: Et)
+// Copied from: local:anyrun.v1.ScmConfig (var: dt)
 message ScmConfig {
-  // Copied from: local:anyrun.v1.ScmConfig.AuthMethod (var: k)
+  // Copied from: local:anyrun.v1.ScmConfig.AuthMethod (var: h)
   enum AuthMethod {
     AUTH_METHOD_UNSPECIFIED = 0;
     AUTH_METHOD_BASIC = 1;
@@ -1359,7 +1242,7 @@ message ScmConfig {
   AuthMethod auth_method = 4;
 }
 
-// Copied from: local:anyrun.v1.Snapshot (var: yn)
+// Copied from: local:anyrun.v1.Snapshot (var: rn)
 message Snapshot {
   string snapshot_id = 1;
   uint32 resource_version = 2;
@@ -1382,38 +1265,22 @@ message Snapshot {
   optional string cpu_baseline_id = 19;
   optional SnapshotUsageStats usage_stats = 20;
   optional uint64 object_size_bytes = 21;
-  optional V4RootArchiveOptions v4_root_archive_options = 22;
-  optional string failure_reason = 23;
-  optional CaptureFailureDetails failure_details = 24;
 }
 
-// Copied from: local:anyrun.v1.SnapshotCategory (var: C)
-enum SnapshotCategory {
-  SNAPSHOT_CATEGORY_EXPLICIT_FORMAT = 0;
-  SNAPSHOT_CATEGORY_FULL_VM = 1;
-}
-
-// Copied from: local:anyrun.v1.SnapshotCollection (var: kn)
+// Copied from: local:anyrun.v1.SnapshotCollection (var: sn)
 message SnapshotCollection {
   repeated Snapshot items = 1;
   optional string next_cursor = 2;
 }
 
-// Copied from: local:anyrun.v1.SnapshotDriveArtifactFile (var: Sn)
-message SnapshotDriveArtifactFile {
-  string artifact_reference = 1;
-  repeated SnapshotFileChunk file_chunks = 2;
-  uint64 file_size = 3;
-}
-
-// Copied from: local:anyrun.v1.SnapshotExtraDriveFile (var: En)
+// Copied from: local:anyrun.v1.SnapshotExtraDriveFile (var: an)
 message SnapshotExtraDriveFile {
   string drive_id = 1;
   repeated SnapshotFileChunk file_chunks = 2;
   uint64 file_size = 3;
 }
 
-// Copied from: local:anyrun.v1.SnapshotFileChunk (var: wn)
+// Copied from: local:anyrun.v1.SnapshotFileChunk (var: on)
 message SnapshotFileChunk {
   uint64 blob_begin = 1;
   uint64 blob_end = 2;
@@ -1422,41 +1289,15 @@ message SnapshotFileChunk {
   string hash = 5;
 }
 
-// Copied from: local:anyrun.v1.SnapshotMemoryCell (var: vn)
-message SnapshotMemoryCell {
-  uint64 blob_begin = 1;
-  uint64 blob_end = 2;
-}
-
-// Copied from: local:anyrun.v1.SnapshotMemoryCellAttributes (var: Bn)
-message SnapshotMemoryCellAttributes {
-  uint64 chunk_index = 1;
-  optional bytes hash = 2;
-}
-
-// Copied from: local:anyrun.v1.SnapshotMemoryHashAlgorithm (var: N)
-enum SnapshotMemoryHashAlgorithm {
-  SNAPSHOT_MEMORY_HASH_ALGORITHM_UNSPECIFIED = 0;
-  SNAPSHOT_MEMORY_HASH_ALGORITHM_SHA256 = 1;
-  SNAPSHOT_MEMORY_HASH_ALGORITHM_BLAKE3 = 2;
-}
-
-// Copied from: local:anyrun.v1.SnapshotMemoryPrefetchHint (var: Jn)
-message SnapshotMemoryPrefetchHint {
-  uint32 version = 1;
-  bytes payload = 2;
-}
-
-// Copied from: local:anyrun.v1.SnapshotState (var: kLs)
+// Copied from: local:anyrun.v1.SnapshotState (var: bTs)
 enum SnapshotState {
   SNAPSHOT_STATE_UNSPECIFIED = 0;
   SNAPSHOT_STATE_CREATING = 1;
   SNAPSHOT_STATE_READY = 2;
   SNAPSHOT_STATE_FAILED = 3;
-  SNAPSHOT_STATE_FINALIZING = 4;
 }
 
-// Copied from: local:anyrun.v1.SnapshotUsageStats (var: He)
+// Copied from: local:anyrun.v1.SnapshotUsageStats (var: be)
 message SnapshotUsageStats {
   uint64 max_memory_bytes = 1;
   uint64 avg_cpu_mcores = 2;
@@ -1466,7 +1307,7 @@ message SnapshotUsageStats {
   uint32 cache_adjusted_sample_count = 6;
 }
 
-// Copied from: local:anyrun.v1.SnapshotVmSnapshotV1Metadata (var: In)
+// Copied from: local:anyrun.v1.SnapshotVmSnapshotV1Metadata (var: ln)
 message SnapshotVmSnapshotV1Metadata {
   repeated SnapshotFileChunk rootfs_file_chunks = 1;
   uint64 rootfs_file_size = 2;
@@ -1475,32 +1316,14 @@ message SnapshotVmSnapshotV1Metadata {
   SnapshotFileChunk kernel_file_chunk = 5;
   IsoDevContainerMetadata dev_container_metadata = 6;
   repeated SnapshotExtraDriveFile extra_drive_files = 7;
-  repeated SnapshotDriveArtifactFile drive_artifact_files = 8;
 }
 
-// Copied from: local:anyrun.v1.SnapshotVmSnapshotV2Metadata (var: Cn)
-message SnapshotVmSnapshotV2Metadata {
-  repeated SnapshotFileChunk rootfs_file_chunks = 1;
-  uint64 rootfs_file_size = 2;
-  repeated SnapshotMemoryCell memory_cells = 3;
-  uint64 memory_file_size = 4;
-  uint64 memory_cell_size = 5;
-  SnapshotFileChunk state_file_chunk = 6;
-  SnapshotFileChunk kernel_file_chunk = 7;
-  IsoDevContainerMetadata dev_container_metadata = 8;
-  repeated SnapshotExtraDriveFile extra_drive_files = 9;
-  optional SnapshotMemoryPrefetchHint memory_prefetch_hint = 10;
-  SnapshotMemoryHashAlgorithm memory_hash_algorithm = 11;
-  repeated SnapshotMemoryCellAttributes memory_cell_attrs = 12;
-  repeated SnapshotDriveArtifactFile drive_artifact_files = 13;
-}
-
-// Copied from: local:anyrun.v1.SpanEnded (var: Sau)
+// Copied from: local:anyrun.v1.SpanEnded (var: mvu)
 message SpanEnded {
   string span_id = 1;
 }
 
-// Copied from: local:anyrun.v1.SpanStarted (var: yau)
+// Copied from: local:anyrun.v1.SpanStarted (var: pvu)
 message SpanStarted {
   string span_id = 1;
   string name = 2;
@@ -1508,33 +1331,33 @@ message SpanStarted {
   optional string href = 5;
 }
 
-// Copied from: local:anyrun.v1.StderrData (var: ee)
+// Copied from: local:anyrun.v1.StderrData (var: V)
 message StderrData {
   bytes data = 1;
 }
 
-// Copied from: local:anyrun.v1.StdoutData (var: Z)
+// Copied from: local:anyrun.v1.StdoutData (var: H)
 message StdoutData {
   bytes data = 1;
 }
 
-// Copied from: local:anyrun.v1.StreamMetricsRequest (var: F)
+// Copied from: local:anyrun.v1.StreamMetricsRequest (var: C)
 message StreamMetricsRequest {
 }
 
-// Copied from: local:anyrun.v1.TarGzipUrlSourceReference (var: Xe)
+// Copied from: local:anyrun.v1.TarGzipUrlSourceReference (var: Ue)
 message TarGzipUrlSourceReference {
   string name = 1;
   string url = 2;
 }
 
-// Copied from: local:anyrun.v1.TarRepoSourceReference (var: ze)
+// Copied from: local:anyrun.v1.TarRepoSourceReference (var: De)
 message TarRepoSourceReference {
   string name = 1;
   bytes tar_archive = 2;
 }
 
-// Copied from: local:anyrun.v1.TopProcess (var: x)
+// Copied from: local:anyrun.v1.TopProcess (var: P)
 message TopProcess {
   int64 pid = 1;
   int64 ppid = 2;
@@ -1546,7 +1369,7 @@ message TopProcess {
   uint64 cpu_ticks_delta = 8;
 }
 
-// Copied from: local:anyrun.v1.UploadPriority (var: c)
+// Copied from: local:anyrun.v1.UploadPriority (var: u)
 enum UploadPriority {
   UPLOAD_PRIORITY_UNSPECIFIED = 0;
   UPLOAD_PRIORITY_P0 = 1;
@@ -1554,30 +1377,22 @@ enum UploadPriority {
   UPLOAD_PRIORITY_P2 = 3;
 }
 
-// Copied from: local:anyrun.v1.V4RootArchiveOptions (var: It)
-message V4RootArchiveOptions {
-  RootArchiveFormat format = 1;
-  optional RootArchivePayloadSummary payload_summary = 2;
-}
-
-// Copied from: local:anyrun.v1.WaitingForWorkerStatus (var: wau)
+// Copied from: local:anyrun.v1.WaitingForWorkerStatus (var: gvu)
 message WaitingForWorkerStatus {
   int32 retry_count = 1;
   int32 max_retries = 2;
   PrivateWorkerWaitReason wait_reason = 3;
 }
 
-// Copied from: local:anyrun.v1.WarmForkMode (var: Oau)
+// Copied from: local:anyrun.v1.WarmForkMode (var: Ivu)
 enum WarmForkMode {
   WARM_FORK_MODE_UNSPECIFIED = 0;
   WARM_FORK_MODE_NONE = 1;
   WARM_FORK_MODE_FORKED = 2;
   WARM_FORK_MODE_COLD_FALLBACK = 3;
-  WARM_FORK_MODE_LAZY_LOAD = 4;
-  WARM_FORK_MODE_COLD_FALLBACK_LAZY_LOAD = 5;
 }
 
-// Copied from: local:anyrun.v1.WorkspaceConfig (var: $t)
+// Copied from: local:anyrun.v1.WorkspaceConfig (var: qt)
 message WorkspaceConfig {
   oneof config {
     string absolute = 1;
@@ -1585,37 +1400,29 @@ message WorkspaceConfig {
   }
 }
 
-// Copied from: local:anyrun.v1.WorkspaceGitSetupMode (var: Nau)
+// Copied from: local:anyrun.v1.WorkspaceGitSetupMode (var: Avu)
 enum WorkspaceGitSetupMode {
   WORKSPACE_GIT_SETUP_MODE_UNSPECIFIED = 0;
   WORKSPACE_GIT_SETUP_MODE_REUSE = 1;
   WORKSPACE_GIT_SETUP_MODE_REUSE_THEN_CHECKOUT = 2;
-  WORKSPACE_GIT_SETUP_MODE_NO_REPO = 3;
 }
 
-// Copied from: local:anyrun.v1.WritableFilesystem (var: w)
-enum WritableFilesystem {
-  WRITABLE_FILESYSTEM_UNSPECIFIED = 0;
-  WRITABLE_FILESYSTEM_EXT4 = 1;
-}
-
-// Copied from: local:anyrun.v1.WriteBinaryFileRequest (var: de)
+// Copied from: local:anyrun.v1.WriteBinaryFileRequest (var: re)
 message WriteBinaryFileRequest {
   string path = 1;
   bytes content = 2;
 }
 
-// Copied from: local:anyrun.v1.WriteBinaryFileResponse (var: pe)
+// Copied from: local:anyrun.v1.WriteBinaryFileResponse (var: se)
 message WriteBinaryFileResponse {
 }
 
-// Copied from: local:anyrun.v1.WriteTextFileRequest (var: le)
+// Copied from: local:anyrun.v1.WriteTextFileRequest (var: $)
 message WriteTextFileRequest {
   string path = 1;
   string content = 2;
 }
 
-// Copied from: local:anyrun.v1.WriteTextFileResponse (var: ue)
+// Copied from: local:anyrun.v1.WriteTextFileResponse (var: ee)
 message WriteTextFileResponse {
 }
-
