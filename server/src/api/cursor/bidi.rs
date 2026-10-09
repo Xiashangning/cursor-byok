@@ -10,6 +10,7 @@ use crate::{
         },
         transport::{TransportParent, TransportRegistry},
     },
+    model::{ModelDirectory, Resolution},
     Error, Result,
 };
 
@@ -17,9 +18,187 @@ pub struct DecodedAppend {
     pub request_id: String,
     pub seqno: i64,
     pub message: agent::AgentClientMessage,
+    /// resolve_model_selection 是否改写了消息内容。官方上游转发据此决定
+    /// 重编码还是原样转发原始字节:prost 往返会丢弃本仓库 proto 之外的字段,
+    /// 未改写的消息必须原样转发。
+    pub rewritten: bool,
+    /// 客户端实际使用的载荷表示。重编码必须回到同一表示:hex 请求得到 hex
+    /// 重编码,binary 请求得到 binary 重编码,不混用。
+    pub encoding: AppendEncoding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendEncoding {
+    Hex,
+    Binary,
 }
 
 impl DecodedAppend {
+    /// 统一目录在入口将本地选择拆为基础 ID 和独立参数；官方选择保留原值。
+    /// 续接子会话沿用已保存的结构化选择，不重新解释其来源。
+    pub async fn resolve_model_selection(
+        &mut self,
+        registry: &TransportRegistry,
+    ) -> Result<Option<crate::model::ModelSelection>> {
+        let Some(agent::agent_client_message::Message::RunRequest(request)) =
+            self.message.message.as_mut()
+        else {
+            return Ok(None);
+        };
+        let store = registry.store();
+        let directory = ModelDirectory::configured(store, registry.plugins())
+            .await
+            .map_err(|error| Error::Protocol(error.to_string()))?;
+        let saved = if request.subagent_type_name.is_some() {
+            match request.conversation_id.as_deref() {
+                Some(id) => {
+                    store
+                        .conversation_model_selection(&crate::model::ConversationId::new(id))
+                        .await?
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if request.requested_model.is_none() {
+            if let Some(details) = &request.model_details {
+                request.requested_model = Some(agent::RequestedModel {
+                    model_id: details.model_id.clone(),
+                    ..Default::default()
+                });
+            }
+        }
+        for model in request
+            .requested_model
+            .iter_mut()
+            .filter(|_| saved.is_none())
+            .chain(
+                request
+                    .subagent_model_overrides
+                    .iter_mut()
+                    .filter_map(|selection| match selection.selection.as_mut() {
+                        Some(agent::subagent_model_override::Selection::Model(model)) => {
+                            Some(model)
+                        }
+                        _ => None,
+                    }),
+            )
+        {
+            match directory.resolve(&model.model_id) {
+                Resolution::Matched { id, parts } => {
+                    if id != model.model_id {
+                        model.model_id = id;
+                        self.rewritten = true;
+                    }
+                    if let Some(parts) = parts {
+                        self.rewritten = true;
+                        // 子代理回程:已保存/烘焙的三个已知 id 定向覆盖,其余参数保留。
+                        if request.subagent_type_name.is_some() {
+                            model.parameters.retain(|parameter| {
+                                !matches!(
+                                    parameter.id.as_str(),
+                                    "context" | "reasoning" | "effort" | "fast"
+                                )
+                            });
+                        }
+                        let mut parameters =
+                            vec![("context", parts.context), ("fast", parts.fast.to_string())];
+                        if let Some(effort) = parts.effort {
+                            parameters.push(("reasoning", effort));
+                        }
+                        for (id, value) in parameters {
+                            if !model
+                                .parameters
+                                .iter()
+                                .any(|parameter| parameter.id == id && !parameter.value.is_empty())
+                            {
+                                model.parameters.push(
+                                    agent::requested_model::ModelParameterValue {
+                                        id: id.into(),
+                                        value,
+                                    },
+                                );
+                            }
+                        }
+                        drop_placeholder_duplicates(&mut model.parameters);
+                    }
+                }
+                Resolution::Ambiguous { candidates } => {
+                    return Err(Error::Config(format!(
+                        "model '{}' is ambiguous; use one of the model IDs: {}",
+                        model.model_id,
+                        candidates.join(", ")
+                    )))
+                }
+                Resolution::NotFound => {}
+            }
+        }
+        if let Some(details) = request.model_details.as_mut() {
+            if let Resolution::Matched { id, .. } = directory.resolve(&details.model_id) {
+                if id != details.model_id {
+                    details.model_id = id;
+                    self.rewritten = true;
+                }
+            }
+        }
+        let selection = if let Some(saved) = saved {
+            self.rewritten = true;
+            if let Some(model) = request.requested_model.as_mut() {
+                model.model_id = saved.id().to_owned();
+                // 续接参数以已保存的选择为准,但只做定向覆盖:官方模型的参数原样
+                // 透传给 Cursor,context/reasoning(含 effort 别名)/fast 之外的
+                // 客户端参数(如 thinking)必须保留,不能按白名单过滤掉。
+                model.parameters.retain(|parameter| {
+                    !matches!(
+                        parameter.id.as_str(),
+                        "context" | "reasoning" | "effort" | "fast"
+                    )
+                });
+                let parameters = saved.parameters();
+                for (id, value) in [
+                    ("context", parameters.context.clone()),
+                    ("reasoning", parameters.reasoning.clone()),
+                    ("fast", parameters.fast.map(|value| value.to_string())),
+                ] {
+                    if let Some(value) = value {
+                        model
+                            .parameters
+                            .push(agent::requested_model::ModelParameterValue {
+                                id: id.into(),
+                                value,
+                            });
+                    }
+                }
+                drop_placeholder_duplicates(&mut model.parameters);
+            }
+            Some(saved)
+        } else if let Some(model) = request.requested_model.as_ref() {
+            let mut selection = crate::model::ModelSelection::resolve(&directory, &model.model_id)?;
+            for parameter in &model.parameters {
+                if parameter.value.trim().is_empty() {
+                    continue;
+                }
+                match parameter.id.as_str() {
+                    "context" => selection.parameters_mut().context = Some(parameter.value.clone()),
+                    "reasoning" | "effort" => {
+                        selection.parameters_mut().reasoning =
+                            Some(parameter.value.trim().to_ascii_lowercase())
+                    }
+                    "fast" => {
+                        selection.parameters_mut().fast =
+                            Some(crate::cursor::compile::parse_bool(parameter)?)
+                    }
+                    _ => {}
+                }
+            }
+            Some(selection)
+        } else {
+            None
+        };
+        Ok(selection)
+    }
+
     pub fn model_id(&self) -> Option<&str> {
         let agent::agent_client_message::Message::RunRequest(request) =
             self.message.message.as_ref()?
@@ -153,6 +332,18 @@ fn history_image_count(history: &agent::ConversationHistory) -> usize {
         .sum()
 }
 
+/// 去掉同 id 空值占位的重复条目。Cursor 回程在未赋值轴上携带空值参数,
+/// 续接/变体改写反复追加会造成同 id 空值条目累积(下游消费方跳过空值,
+/// 无功能后果,仅协议噪声)。每个 id 的空值占位至多保留一条;非空值条目
+/// 全部保留,优先级不变。
+fn drop_placeholder_duplicates(parameters: &mut Vec<agent::requested_model::ModelParameterValue>) {
+    let mut seen = std::collections::HashSet::new();
+    parameters.retain(|parameter| {
+        parameter.value.is_empty() && seen.insert(parameter.id.clone())
+            || !parameter.value.is_empty()
+    });
+}
+
 pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
     let request_id = request
         .request_id
@@ -160,22 +351,35 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
         .map(|id| id.request_id.as_str())
         .filter(|id| !id.is_empty())
         .ok_or_else(|| Error::Protocol("BidiAppend request_id is required".into()))?;
-    if !request.data_binary.is_empty() {
-        return Err(Error::Protocol(
-            "BidiAppend data_binary is not part of the captured protocol".into(),
-        ));
-    }
-    if request.data.is_empty() {
-        return Err(Error::Protocol(
-            "BidiAppend contains no AgentClientMessage".into(),
-        ));
-    }
-    let payload = hex::decode(&request.data)
-        .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
+    // 双载荷歧义:客户端 statsig 开关切换的过渡窗口可能同时带 hex 与 binary。
+    // 两种表示语义相同,无法判定以哪个为准,明确拒绝而不是静默取其一。
+    let has_hex = !request.data.is_empty();
+    let has_binary = !request.data_binary.is_empty();
+    let encoding = match (has_hex, has_binary) {
+        (true, true) => {
+            return Err(Error::Protocol(
+                "BidiAppend carries both data and data_binary; send exactly one".into(),
+            ))
+        }
+        (true, false) => AppendEncoding::Hex,
+        (false, true) => AppendEncoding::Binary,
+        (false, false) => {
+            return Err(Error::Protocol(
+                "BidiAppend contains no AgentClientMessage".into(),
+            ))
+        }
+    };
+    let payload = match encoding {
+        AppendEncoding::Hex => hex::decode(&request.data)
+            .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?,
+        AppendEncoding::Binary => request.data_binary.clone(),
+    };
     Ok(DecodedAppend {
         request_id: request_id.into(),
         seqno: request.append_seqno,
         message: agent::AgentClientMessage::decode(payload.as_slice())?,
+        rewritten: false,
+        encoding,
     })
 }
 
@@ -208,4 +412,297 @@ pub async fn append(
         })
         .await?;
     Ok(ai::BidiAppendResponse {})
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::provider::{FinishReason, ModelEvent, Provider, ProviderStream};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct NoopProvider;
+    impl Provider for NoopProvider {
+        fn stream(
+            &self,
+            _invocation: crate::model::ModelInvocation,
+            _cancellation: CancellationToken,
+        ) -> ProviderStream {
+            Box::pin(async_stream::try_stream! {
+                yield ModelEvent::Done(FinishReason::Stop);
+            })
+        }
+    }
+
+    fn registry(store: crate::store::Store) -> TransportRegistry {
+        TransportRegistry::new(
+            store,
+            Arc::new(NoopProvider),
+            crate::cursor::prompting::PromptCompiler::new(
+                crate::cursor::prompting::PromptAssets::embedded().unwrap(),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn resolves_all_explicit_selections_but_preserves_inheritance_and_parameters() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        let model = store.create_model(&serde_json::from_value(serde_json::json!({
+            "display_name": "BYOK model", "type": "openai", "base_url": "https://example.invalid",
+            "api_key": "test", "tooltip_data": "test", "model_id": "provider-model"
+        })).unwrap()).await.unwrap();
+        let selection = agent::RequestedModel {
+            model_id: "provider-model".into(),
+            parameters: vec![agent::requested_model::ModelParameterValue {
+                id: "effort".into(),
+                value: "high".into(),
+            }],
+            ..Default::default()
+        };
+        let mut decoded = DecodedAppend {
+            request_id: "selections".into(),
+            seqno: 0,
+            rewritten: false,
+            encoding: AppendEncoding::Hex,
+            message: agent::AgentClientMessage {
+                message: Some(agent::agent_client_message::Message::RunRequest(
+                    agent::AgentRunRequest {
+                        requested_model: Some(selection.clone()),
+                        model_details: Some(agent::ModelDetails {
+                            model_id: "BYOK Model".into(),
+                            ..Default::default()
+                        }),
+                        subagent_model_overrides: vec![
+                            agent::SubagentModelOverride {
+                                subagent_type: "generalPurpose".into(),
+                                selection: Some(agent::subagent_model_override::Selection::Model(
+                                    selection.clone(),
+                                )),
+                            },
+                            agent::SubagentModelOverride {
+                                subagent_type: "explore".into(),
+                                selection: Some(
+                                    agent::subagent_model_override::Selection::Inherit(true),
+                                ),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                )),
+            },
+        };
+        decoded
+            .resolve_model_selection(&registry(store))
+            .await
+            .unwrap();
+        let Some(agent::agent_client_message::Message::RunRequest(run)) = decoded.message.message
+        else {
+            unreachable!()
+        };
+        let requested = run.requested_model.unwrap();
+        assert_eq!(requested.model_id, model.model_hash);
+        assert_eq!(requested.parameters, selection.parameters);
+        assert_eq!(run.model_details.unwrap().model_id, model.model_hash);
+        let Some(agent::subagent_model_override::Selection::Model(child)) =
+            &run.subagent_model_overrides[0].selection
+        else {
+            unreachable!()
+        };
+        assert_eq!(child.model_id, model.model_hash);
+        assert_eq!(child.parameters, selection.parameters);
+        assert_eq!(
+            run.subagent_model_overrides[1].selection,
+            Some(agent::subagent_model_override::Selection::Inherit(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_subagent_selection_controls_routing_without_reinterpreting_official_names() {
+        let store = crate::store::Store::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let model = store.create_model(&serde_json::from_value(serde_json::json!({
+            "display_name":"Hosted name", "type":"openai", "base_url":"https://example.invalid", "api_key":"test", "tooltip_data":"test", "model_id":"upstream-name"
+        })).unwrap()).await.unwrap();
+        let id = crate::model::ConversationId::new("saved-child");
+        store.ensure_conversation(&id).await.unwrap();
+        let registry = registry(store.clone());
+        for saved in [
+            crate::model::ModelSelection::Official {
+                model: "Hosted name".into(),
+                parameters: Default::default(),
+            },
+            crate::model::ModelSelection::Local {
+                id: model.model_hash.clone(),
+                parameters: crate::model::SelectionParameters {
+                    context: Some("1m".into()),
+                    reasoning: Some("low".into()),
+                    fast: Some(true),
+                },
+            },
+        ] {
+            store
+                .set_conversation_model_selection(&id, Some(&saved))
+                .await
+                .unwrap();
+            let mut decoded = DecodedAppend {
+                request_id: "resumed".into(),
+                seqno: 0,
+                rewritten: false,
+                encoding: AppendEncoding::Hex,
+                message: agent::AgentClientMessage {
+                    message: Some(agent::agent_client_message::Message::RunRequest(
+                        agent::AgentRunRequest {
+                            conversation_id: Some(id.to_string()),
+                            subagent_type_name: Some("generalPurpose".into()),
+                            requested_model: Some(agent::RequestedModel {
+                                model_id: "stale-client-value".into(),
+                                parameters: vec![
+                                    agent::requested_model::ModelParameterValue {
+                                        id: "thinking".into(),
+                                        value: "true".into(),
+                                    },
+                                    agent::requested_model::ModelParameterValue {
+                                        id: "effort".into(),
+                                        value: "stale".into(),
+                                    },
+                                ],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            };
+            assert_eq!(
+                decoded.resolve_model_selection(&registry).await.unwrap(),
+                Some(saved.clone())
+            );
+            assert_eq!(decoded.model_id(), Some(saved.id()));
+            // 续接按保存的选择定向覆盖三个已知 id;未知参数(如 thinking)
+            // 原样保留,官方回程不做白名单过滤;effort 别名被 reasoning 覆盖掉。
+            assert!(decoded.rewritten);
+            let Some(agent::agent_client_message::Message::RunRequest(run)) =
+                decoded.message.message.as_ref()
+            else {
+                unreachable!()
+            };
+            let parameters = &run.requested_model.as_ref().unwrap().parameters;
+            assert!(
+                parameters
+                    .iter()
+                    .any(|parameter| parameter.id == "thinking" && parameter.value == "true"),
+                "unknown parameters must survive continuation: {parameters:?}"
+            );
+            assert!(
+                !parameters.iter().any(|parameter| parameter.id == "effort"),
+                "the effort alias is replaced by reasoning: {parameters:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selection_parameters_normalize_reasoning_and_reject_invalid_fast() {
+        let store = crate::store::Store::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let registry = registry(store);
+        for (fast, valid) in [("true", true), ("false", true), ("invalid", false)] {
+            let mut decoded = DecodedAppend {
+                request_id: "parameters".into(),
+                seqno: 0,
+                rewritten: false,
+                encoding: AppendEncoding::Hex,
+                message: agent::AgentClientMessage {
+                    message: Some(agent::agent_client_message::Message::RunRequest(
+                        agent::AgentRunRequest {
+                            requested_model: Some(agent::RequestedModel {
+                                model_id: "official-model".into(),
+                                parameters: [("reasoning", " HIGH "), ("fast", fast)]
+                                    .into_iter()
+                                    .map(|(id, value)| {
+                                        agent::requested_model::ModelParameterValue {
+                                            id: id.into(),
+                                            value: value.into(),
+                                        }
+                                    })
+                                    .collect(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            };
+            let result = decoded.resolve_model_selection(&registry).await;
+            assert!(
+                !decoded.rewritten,
+                "an unmatched official model is not rewritten"
+            );
+            if valid {
+                let selection = result.unwrap().unwrap();
+                assert_eq!(selection.parameters().reasoning.as_deref(), Some("high"));
+                assert_eq!(selection.parameters().fast, Some(fast == "true"));
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid Cursor boolean"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_hits_normalize_to_base_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        let model = store.create_model(&serde_json::from_value(serde_json::json!({
+            "display_name": "BYOK model", "type": "openai", "base_url": "https://example.invalid",
+            "api_key": "test", "tooltip_data": "test", "model_id": "provider-model"
+        })).unwrap()).await.unwrap();
+        let mut decoded = DecodedAppend {
+            request_id: "name-hit".into(),
+            seqno: 0,
+            rewritten: false,
+            encoding: AppendEncoding::Hex,
+            message: agent::AgentClientMessage {
+                message: Some(agent::agent_client_message::Message::RunRequest(
+                    agent::AgentRunRequest {
+                        requested_model: Some(agent::RequestedModel {
+                            model_id: "BYOK Model".into(),
+                            ..Default::default()
+                        }),
+                        model_details: Some(agent::ModelDetails {
+                            model_id: format!("{}-1m-low", model.model_hash),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+            },
+        };
+        decoded
+            .resolve_model_selection(&registry(store))
+            .await
+            .unwrap();
+        let Some(agent::agent_client_message::Message::RunRequest(run)) = decoded.message.message
+        else {
+            unreachable!()
+        };
+        // 名称与变体输入均在 API 边界拆为基础 ID 和参数。
+        assert!(decoded.rewritten);
+        assert_eq!(run.requested_model.unwrap().model_id, model.model_hash);
+        assert_eq!(run.model_details.unwrap().model_id, model.model_hash);
+    }
 }

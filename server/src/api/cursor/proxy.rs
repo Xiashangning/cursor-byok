@@ -10,6 +10,7 @@ use axum::{
 use crate::Result;
 
 const CURSOR_UPSTREAM: &str = "https://api2.cursor.sh";
+const BUFFERED_REQUEST_LIMIT: usize = 64 * 1024 * 1024;
 pub const UPSTREAM_URL_HEADER: &str = "x-server-upstream-url";
 
 #[derive(Clone)]
@@ -46,6 +47,11 @@ impl BufferedResponse {
 }
 
 impl CursorProxy {
+    /// 测试缝:注入指定上游地址(集成测试用本地捕获上游验证转发字节)。
+    pub fn for_test(clients: crate::network::NetworkClients, upstream: String) -> Self {
+        Self { clients, upstream }
+    }
+
     pub fn cursor(clients: crate::network::NetworkClients) -> Self {
         Self {
             clients,
@@ -94,6 +100,16 @@ async fn forward_request(
     headers.remove(UPSTREAM_URL_HEADER);
     headers.remove(header::HOST);
     remove_hop_by_hop_headers(&mut headers);
+    // Inspect Connect trailers without altering streamed bytes. Negotiate uncompressed
+    // envelopes; HTTP chunk boundaries remain independent of Connect frame boundaries.
+    headers.insert(
+        "connect-accept-encoding",
+        axum::http::HeaderValue::from_static("identity"),
+    );
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        axum::http::HeaderValue::from_static("identity"),
+    );
 
     let client = proxy.client().await?;
     let upstream = client
@@ -156,7 +172,7 @@ pub async fn forward_buffered(
         header::ACCEPT_ENCODING,
         axum::http::HeaderValue::from_static("identity"),
     );
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, BUFFERED_REQUEST_LIMIT)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     let upstream = proxy

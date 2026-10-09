@@ -3,6 +3,6 @@
 pub mod bidi;
 mod handlers;
 pub mod proxy;
-mod run_sse;
+pub mod run_sse;
 
-pub use handlers::router;
+pub use handlers::{router, router_with_proxy};
